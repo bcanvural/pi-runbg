@@ -23,29 +23,40 @@
  *     / 2000 lines per call and the full file is available via `read`.
  */
 
-import { randomBytes } from "node:crypto";
 import { constants as osConstants } from "node:os";
-import {
-	DEFAULT_MAX_BYTES,
-	DEFAULT_MAX_LINES,
-	type ExtensionAPI,
-	type ExtensionContext,
-	formatSize,
-	truncateTail,
-	type TruncationResult,
-} from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type, type TUnsafe } from "typebox";
 
+import type { CollectResult } from "./collect.ts";
 import { CompletionCoordinator, type OnExitPolicy, sanitizeMeta } from "./completion.ts";
-import { type LongWaitOutcome, startRateLimitedStream, waitForExitOrDeadline } from "./long-wait.ts";
 import { formatElapsed } from "./format-time.ts";
-import { nowUtcIso, parseYieldUntil } from "./time.ts";
+import { type LongWaitOutcome, startRateLimitedStream, waitForExitOrDeadline } from "./long-wait.ts";
 import { sleep } from "./notify.ts";
-import { isPtyAvailable, getPtyLoadError } from "./pty.ts";
-import { renderExecCommandCall, renderResult, renderSetOnExitCall, renderWriteStdinCall } from "./render.ts";
+import { sanitizeOutputText } from "./output-safety.ts";
+import { getPtyLoadError, isPtyAvailable } from "./pty.ts";
+import {
+	renderExecCommandCall,
+	renderKillSessionCall,
+	renderKillSessionResult,
+	renderListSessionsCall,
+	renderListSessionsResult,
+	renderProcessResult,
+	renderSetOnExitCall,
+	renderSetOnExitResult,
+	renderWriteStdinCall,
+} from "./render.ts";
 import { ExecSession } from "./session.ts";
 import { SessionStore } from "./session-store.ts";
 import { buildShellCommand, IS_WINDOWS, resolveDefaultShell, resolveWindowsShell } from "./shell.ts";
+import { nowUtcIso, parseYieldUntil } from "./time.ts";
+import {
+	finalizeKillResult,
+	finalizeProcessResult,
+	renderKillResultText,
+	renderProcessResultText,
+	type FinalizeProcessInput,
+	type ProcessResultDetails,
+} from "./tool-result.ts";
 import { unescapeChars } from "./unescape.ts";
 
 // ---------------- Constants (mirror codex) ----------------
@@ -142,17 +153,11 @@ function normalizeSignal(raw: string | undefined): NodeJS.Signals {
 	return name as NodeJS.Signals;
 }
 
-function generateChunkId(): string {
-	return randomBytes(3).toString("hex");
-}
-
-function approxTokenCount(bytes: Uint8Array): number {
-	// Mirror codex's rough `approx_token_count` behaviour: 4 bytes ≈ 1 token.
-	return Math.ceil(bytes.length / 4);
-}
-
 const textDecoder = new TextDecoder("utf-8", { fatal: false });
 const textEncoder = new TextEncoder();
+
+type ResponseShape = ProcessResultDetails;
+type FinalizeInput = Omit<FinalizeProcessInput, "operation">;
 
 function decode(bytes: Uint8Array): string {
 	return textDecoder.decode(bytes);
@@ -160,88 +165,6 @@ function decode(bytes: Uint8Array): string {
 
 function encode(str: string): Uint8Array {
 	return textEncoder.encode(str);
-}
-
-/**
- * Format the pi-bash style "[Showing lines X-Y of Z. Full output: <path>]" footer
- * that appears below truncated output.
- */
-function truncationMarker(t: TruncationResult, logPath: string | undefined): string | null {
-	if (!t.truncated) return null;
-	const full = logPath ? `. Full output: ${logPath}` : "";
-	if (t.lastLinePartial) {
-		return `[Showing last ${formatSize(t.outputBytes)} of final line (line ${t.totalLines} is larger than the ${formatSize(DEFAULT_MAX_BYTES)} limit)${full}]`;
-	}
-	const startLine = t.totalLines - t.outputLines + 1;
-	const endLine = t.totalLines;
-	if (t.truncatedBy === "lines") {
-		return `[Showing lines ${startLine}-${endLine} of ${t.totalLines}${full}]`;
-	}
-	return `[Showing lines ${startLine}-${endLine} of ${t.totalLines} (${formatSize(DEFAULT_MAX_BYTES)} limit)${full}]`;
-}
-
-/** Human-friendly rendering of the tool response. */
-interface ResponseShape {
-	chunk_id: string;
-	wall_time_seconds: number;
-	output: string;
-	original_token_count?: number;
-	session_id?: number;
-	exit_code?: number;
-	signal?: string;
-	failure_message?: string;
-	tty?: boolean;
-	log_path?: string;
-	cwd?: string;
-	command?: string;
-	yield_time_ms?: number;
-	truncation?: TruncationResult;
-	/** Middle bytes dropped by the in-memory retention cap (a marker is spliced into `output`). */
-	omitted_bytes?: number;
-	/** Cumulative bytes this session has produced since spawn (progress/stall detection). */
-	output_bytes_total?: number;
-	// Long-wait / completion-notification metadata:
-	wait_mode?: "relative" | "absolute";
-	wait_status?: "completed" | "relative_deadline_reached" | "absolute_deadline_reached" | "cancelled";
-	yield_until?: string;
-	effective_wait_ms?: number;
-	on_exit?: OnExitPolicy;
-	completion_notification?: "armed";
-	completion_delivery?: "direct";
-	on_exit_wake?: "consumed";
-	tool_time_utc?: string;
-}
-
-function renderResponseText(shape: ResponseShape): string {
-	const lines: string[] = [];
-	const prefix = shape.session_id !== undefined ? "still running" : "exited";
-	lines.push(`[${prefix}]`);
-	if (shape.session_id !== undefined) lines.push(`session_id: ${shape.session_id}`);
-	if (shape.exit_code !== undefined) lines.push(`exit_code: ${shape.exit_code}`);
-	if (shape.signal) lines.push(`signal: ${shape.signal}`);
-	if (shape.failure_message) lines.push(`failure: ${shape.failure_message}`);
-	if (shape.wait_mode) lines.push(`wait_mode: ${shape.wait_mode}`);
-	if (shape.wait_status) lines.push(`wait_status: ${shape.wait_status}`);
-	if (shape.yield_until) lines.push(`yield_until: ${shape.yield_until}`);
-	if (shape.effective_wait_ms !== undefined) lines.push(`effective_wait_ms: ${shape.effective_wait_ms}`);
-	if (shape.on_exit) lines.push(`on_exit: ${shape.on_exit}`);
-	if (shape.completion_notification) lines.push(`completion_notification: ${shape.completion_notification}`);
-	if (shape.completion_delivery) lines.push(`completion_delivery: ${shape.completion_delivery}`);
-	if (shape.on_exit_wake) lines.push(`on_exit_wake: ${shape.on_exit_wake}`);
-	if (shape.tool_time_utc) lines.push(`tool_time_utc: ${shape.tool_time_utc}`);
-	if (shape.log_path) lines.push(`log_path: ${shape.log_path}`);
-	if (shape.cwd) lines.push(`cwd: ${shape.cwd}`);
-	lines.push(`wall_time_seconds: ${shape.wall_time_seconds.toFixed(3)}`);
-	lines.push(`chunk_id: ${shape.chunk_id}`);
-	if (shape.original_token_count !== undefined) lines.push(`original_token_count: ${shape.original_token_count}`);
-	if (shape.output_bytes_total !== undefined) lines.push(`output_bytes_total: ${shape.output_bytes_total}`);
-	if (shape.omitted_bytes) lines.push(`omitted_bytes: ${shape.omitted_bytes}`);
-	if (shape.tty !== undefined) lines.push(`tty: ${shape.tty}`);
-	const header = lines.join("\n");
-	const body = shape.output || "(no output)";
-	const marker = shape.truncation ? truncationMarker(shape.truncation, shape.log_path) : null;
-	const footer = marker ? `\n\n${marker}` : "";
-	return `${header}\n---\n${body}${footer}`;
 }
 
 // ---------------- Extension ----------------
@@ -316,6 +239,8 @@ async function runExecCommand(
 	onUpdate: ((partial: { content: [{ type: "text"; text: string }]; details: unknown }) => void) | undefined,
 	cwd: string,
 ): Promise<ResponseShape> {
+	const finalizeResponse = (input: FinalizeInput): ResponseShape =>
+		finalizeProcessResult({ ...input, operation: "exec_command" });
 	if (ctx.shuttingDown) {
 		throw new Error("unified-exec: session is shutting down; not starting new commands.");
 	}
@@ -527,6 +452,8 @@ async function runWriteStdin(
 	onUpdate: ((partial: { content: [{ type: "text"; text: string }]; details: unknown }) => void) | undefined,
 	toolCallId: string,
 ): Promise<ResponseShape> {
+	const finalizeResponse = (input: FinalizeInput): ResponseShape =>
+		finalizeProcessResult({ ...input, operation: "write_stdin" });
 	const session = ctx.store.get(args.session_id);
 	if (!session) {
 		throw new Error(`unknown session_id: ${args.session_id}`);
@@ -700,6 +627,8 @@ async function runAbsoluteWait(
 	onUpdate: ((partial: { content: [{ type: "text"; text: string }]; details: unknown }) => void) | undefined,
 	toolCallId: string,
 ): Promise<ResponseShape> {
+	const finalizeResponse = (input: FinalizeInput): ResponseShape =>
+		finalizeProcessResult({ ...input, operation: "write_stdin" });
 	const startMs = Date.now();
 	// Parse/validate the wall-clock instant and compute the remaining duration
 	// ONCE; the wait below runs purely on the monotonic clock.
@@ -826,7 +755,7 @@ async function runAbsoluteWait(
 interface TerminateOutcome {
 	session: ExecSession;
 	escalated: boolean;
-	finalOutput: string;
+	collected: CollectResult;
 	/** true when the process is confirmed dead; false = kill did NOT land. */
 	killed: boolean;
 }
@@ -872,58 +801,7 @@ async function terminateSessionById(
 		// Restore its prior wake eligibility.
 		ctx.coordinator.restoreAfterFailedKill(sid);
 	}
-	return { session, escalated, finalOutput: decode(collected.bytes), killed };
-}
-
-interface FinalizeInput {
-	wallTimeSec: number;
-	collected: Uint8Array;
-	sessionId: number | undefined;
-	exitCode: number | null | undefined;
-	signal: NodeJS.Signals | null;
-	failure: string | null;
-	tty: boolean;
-	logPath: string | undefined;
-	cwd?: string;
-	command?: string;
-	yieldTimeMs?: number;
-	/** Middle bytes dropped by the retention cap during this call's drain. */
-	omittedBytes?: number;
-	/** Cumulative bytes the session has produced since spawn. */
-	totalBytes?: number;
-	/** Long-wait / wake metadata merged into the shape (undefined values skipped). */
-	extra?: Partial<ResponseShape>;
-}
-
-function finalizeResponse(input: FinalizeInput): ResponseShape {
-	const { wallTimeSec, collected, sessionId, exitCode, signal, failure, tty, logPath, cwd, command, yieldTimeMs } = input;
-	const rawText = decode(collected);
-	const originalTokens = approxTokenCount(collected);
-	const truncation = truncateTail(rawText, { maxBytes: DEFAULT_MAX_BYTES, maxLines: DEFAULT_MAX_LINES });
-	const shape: ResponseShape = {
-		chunk_id: generateChunkId(),
-		wall_time_seconds: wallTimeSec,
-		output: truncation.content,
-		original_token_count: originalTokens,
-		tty,
-	};
-	if (sessionId !== undefined) shape.session_id = sessionId;
-	if (exitCode !== undefined && exitCode !== null) shape.exit_code = exitCode;
-	if (signal) shape.signal = signal;
-	if (failure) shape.failure_message = failure;
-	if (logPath) shape.log_path = logPath;
-	if (cwd) shape.cwd = cwd;
-	if (command) shape.command = command;
-	if (yieldTimeMs) shape.yield_time_ms = yieldTimeMs;
-	if (input.omittedBytes) shape.omitted_bytes = input.omittedBytes;
-	if (input.totalBytes !== undefined) shape.output_bytes_total = input.totalBytes;
-	if (truncation.truncated) shape.truncation = truncation;
-	if (input.extra) {
-		for (const [key, value] of Object.entries(input.extra)) {
-			if (value !== undefined) (shape as unknown as Record<string, unknown>)[key] = value;
-		}
-	}
-	return shape;
+	return { session, escalated, collected, killed };
 }
 
 function runningSessions(ctx: ExtensionCtx): ExecSession[] {
@@ -1023,7 +901,7 @@ function buildStreamUpdate(
 	session: ExecSession,
 	extra?: Record<string, unknown>,
 ): { content: [{ type: "text"; text: string }]; details: unknown } {
-	const tailText = decode(session.snapshotStreamTail());
+	const tailText = sanitizeOutputText(decode(session.snapshotStreamTail()));
 	return {
 		content: [{ type: "text", text: tailText }],
 		details: {
@@ -1300,12 +1178,12 @@ export default function (pi: ExtensionAPI) {
 			const shape = await runExecCommand(ctx, params as ExecCommandArgs, signal, onUpdate as any, eventCtx.cwd);
 			updateRunningSessionsUi(ctx);
 			return {
-				content: [{ type: "text", text: renderResponseText(shape) }],
+				content: [{ type: "text", text: renderProcessResultText(shape) }],
 				details: shape,
 			};
 		},
 		renderCall: renderExecCommandCall,
-		renderResult,
+		renderResult: renderProcessResult,
 	});
 
 	pi.registerTool({
@@ -1352,12 +1230,12 @@ export default function (pi: ExtensionAPI) {
 			const shape = await runWriteStdin(ctx, params as WriteStdinArgs, signal, onUpdate as any, toolCallId);
 			updateRunningSessionsUi(ctx);
 			return {
-				content: [{ type: "text", text: renderResponseText(shape) }],
+				content: [{ type: "text", text: renderProcessResultText(shape) }],
 				details: shape,
 			};
 		},
 		renderCall: renderWriteStdinCall,
-		renderResult,
+		renderResult: renderProcessResult,
 	});
 
 	pi.registerTool({
@@ -1419,7 +1297,7 @@ export default function (pi: ExtensionAPI) {
 			};
 		},
 		renderCall: renderSetOnExitCall,
-		renderResult,
+		renderResult: renderSetOnExitResult,
 	});
 
 	pi.registerTool({
@@ -1438,51 +1316,56 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui ??= eventCtx.ui;
 			const sid = (params as { session_id: number; signal?: string }).session_id;
 			const initial = normalizeSignal((params as { signal?: string }).signal);
+			const startedAt = Date.now();
 			const outcome = await terminateSessionById(ctx, sid, initial);
 			if (!outcome) {
 				return {
 					content: [{ type: "text", text: `No such session: ${sid}` }],
-					details: { session_id: sid, found: false },
+					details: {
+						operation: "kill_session",
+						status: "kill_failed",
+						running: false,
+						session_id: sid,
+						found: false,
+					} as const,
 				};
 			}
-			const { session, escalated, finalOutput: text, killed } = outcome;
+			const { session, escalated, collected, killed } = outcome;
 			updateRunningSessionsUi(ctx);
-			const details = {
-				session_id: sid,
-				final_output: text,
-				exit_code: session.exitCode,
+			const killFailure = killed
+				? session.failureMessage
+				: [
+						`process still running after ${initial}${escalated ? " and SIGKILL escalation" : ""}; ` +
+							"the session remains registered — retry kill_session or check permissions",
+						session.failureMessage,
+					]
+					.filter((value): value is string => Boolean(value))
+					.join("; ");
+			const details = finalizeKillResult({
+				wallTimeSec: (Date.now() - startedAt) / 1000,
+				collected: collected.bytes,
+				omittedBytes: collected.omittedBytes,
+				totalBytes: session.totalBytesSeen,
+				sessionId: sid,
+				pid: session.pid,
+				requestedSignal: initial,
+				exitCode: session.exitCode,
 				signal: session.signal,
+				failure: killFailure || null,
+				tty: session.tty,
+				logPath: session.logPath,
+				cwd: session.cwd,
+				command: session.displayCommand,
 				escalated,
 				killed,
-				log_path: session.logPath,
-			};
-			if (!killed) {
-				// The kill did NOT land — do not pretend it did. The session
-				// stays in the store so it can be retried or inspected.
-				return {
-					content: [
-						{
-							type: "text",
-							text:
-								`FAILED to terminate session ${sid} (pid ${session.pid ?? "?"}): process still running after ${initial}` +
-								(escalated ? " and SIGKILL escalation" : "") +
-								`. The session remains registered — retry kill_session, or check permissions.` +
-								(session.logPath ? `\nlog_path: ${session.logPath}` : ""),
-						},
-					],
-					details,
-				};
-			}
-			const summary =
-				`Killed session ${sid} (pid ${session.pid ?? "?"}) with ${initial}` +
-				(escalated ? " — escalated to SIGKILL" : "") +
-				(session.exitCode !== null ? ` — exit_code=${session.exitCode}` : session.signal ? ` — signal=${session.signal}` : "");
-			const logLine = session.logPath ? `\nlog_path: ${session.logPath}` : "";
+			});
 			return {
-				content: [{ type: "text", text: `${summary}${logLine}\n---\n${text || "(no output)"}` }],
+				content: [{ type: "text", text: renderKillResultText(details) }],
 				details,
 			};
 		},
+		renderCall: renderKillSessionCall,
+		renderResult: renderKillSessionResult,
 	});
 
 	pi.registerTool({
@@ -1539,7 +1422,7 @@ export default function (pi: ExtensionAPI) {
 						const wake = s.wake_armed ? " [wake]" : "";
 						return `  ${String(s.session_id).padStart(3)}  pid=${String(s.pid ?? "?").padStart(6)}  ${
 							s.tty ? "tty" : "pipe"
-						}  ${((s.elapsed_ms / 1000).toFixed(1) + "s").padStart(8)}${wake}  ${s.command.length > 60 ? s.command.slice(0, 60) + "…" : s.command}${exitedSuffix}\n        log: ${s.log_path}`;
+						}  ${((s.elapsed_ms / 1000).toFixed(1) + "s").padStart(8)}${wake}  ${oneLineCommand(s.command, 60)}${exitedSuffix}\n        log: ${s.log_path}`;
 					})
 				: ["  (no live sessions)"];
 			const header = reaped.length
@@ -1549,8 +1432,10 @@ export default function (pi: ExtensionAPI) {
 				// tool_time_utc lets the model compute a yield_until deadline from a
 				// trustworthy host clock without an extra probing call.
 				content: [{ type: "text", text: `${header}\n${lines.join("\n")}\ntool_time_utc: ${toolTimeUtc}` }],
-				details: { sessions, active_count: live.length, tool_time_utc: toolTimeUtc },
+				details: { sessions, active_count: live.length, just_exited_count: reaped.length, tool_time_utc: toolTimeUtc },
 			};
 		},
+		renderCall: renderListSessionsCall,
+		renderResult: renderListSessionsResult,
 	});
 }

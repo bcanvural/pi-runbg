@@ -47,8 +47,8 @@ message at call time.
 Verify the install:
 
 ```bash
-npx tsc --noEmit                    # clean typecheck
-npx tsx --test tests/*.test.ts      # all tests (~10–15s)
+npm run check                       # clean strict typecheck
+npm test                            # typecheck + all tests
 ```
 
 You should see on the order of **250+** tests with `fail 0` (a few skipped on
@@ -62,7 +62,7 @@ sibling view, indexed by concern:
 
 | Concern | File(s) |
 |---|---|
-| Tool schemas, LLM-visible behavior | `src/index.ts` (`exec_command`, `write_stdin`, `set_on_exit`, `kill_session`, `list_sessions`) |
+| Tool schemas and orchestration | `src/index.ts` (`exec_command`, `write_stdin`, `set_on_exit`, `kill_session`, `list_sessions`) |
 | Session lifecycle (spawn, write, kill, log-stream) | `src/session.ts` |
 | Session registry, LRU eviction, shutdown | `src/session-store.ts` |
 | The yield-until-deadline loop (relative polls) | `src/collect.ts` + `src/notify.ts` |
@@ -70,21 +70,22 @@ sibling view, indexed by concern:
 | Human duration / remaining labels | `src/format-time.ts` (re-exported remaining helper from `time.ts`) |
 | `on_exit: "wake"` completion scheduling (exactly-once) | `src/completion.ts` (`setOnExit`, tombstones, flush) |
 | In-memory drain buffer | `src/head-tail-buffer.ts` |
-| On-disk log file mirroring | `src/session.ts` (`logStream`) |
-| Tail truncation for the LLM | `truncateTail` imported from `@earendil-works/pi-coding-agent` |
+| On-disk raw log file mirroring | `src/session.ts` (`logStream`) |
+| Terminal-inert result/partial text | `src/output-safety.ts` |
+| Bounded process/kill details + LLM-visible text | `src/tool-result.ts` (`truncateTail` from Pi) |
 | C-style escape decoding for `chars` | `src/unescape.ts` |
 | PTY vs pipe spawning, Windows tree-kill | `src/pty.ts` |
 | Shell selection & argv construction | `src/shell.ts` |
-| TUI renderCall / renderResult | `src/render.ts` |
+| Explicit call/result renderers for all five tools | `src/render.ts` |
 | Initiative / doctrine docs | `docs/IV-*.md`, `docs/DC-*.md` |
 | Constants mirroring codex | top of `src/index.ts` |
 
 ## Dev loop
 
 1. Edit files under `src/`.
-2. `npx tsc --noEmit` (catch type errors early).
+2. `npm run check` (catch type errors early).
 3. `npx tsx --test tests/<relevant>.test.ts` (fast inner loop).
-4. `npx tsx --test tests/*.test.ts` before committing.
+4. `npm test` before committing.
 5. In a running pi: `/reload` to pick up changes.
 
 ### Important gotchas for the dev loop
@@ -190,22 +191,30 @@ stating whether they mirror codex or diverge. When you touch one:
 3. Check whether any e2e test depends on the old value (search for
    the number literal).
 
-### Add a new field to the response shape
+### Add a new output-result field
 
-1. Add it to `interface ResponseShape` in `src/index.ts`.
-2. Add the conditional line in `renderResponseText(shape)` for LLM
-   visibility.
-3. Plumb it through `FinalizeInput` and every `finalizeResponse({ … })`
-   call site.
-4. If the TUI should show it, update `buildStatusLine()` in
+1. Add it to `ProcessResultDetails`, `KillResultDetails`, or their shared
+   envelope in `src/tool-result.ts`.
+2. Populate it in `finalizeProcessResult()` / `finalizeKillResult()`.
+3. Add it to `renderProcessResultText()` / `renderKillResultText()` only when
+   the model needs the field in textual content (details are TUI/session data).
+4. If the TUI should show it, update the appropriate status/list renderer in
    `src/render.ts`.
-5. Add a test asserting `r.details.<field>` in `tests/e2e.test.ts`.
+5. Add a pure assertion in `tests/tool-result.test.ts` and an end-to-end
+   assertion in `tests/e2e.test.ts` when process lifecycle matters.
+
+Never put an unbounded value in `content` or details and expect
+`renderResult` to hide it: Pi falls back to raw content if a renderer throws.
+Pass child text through `sanitizeOutputText()` before model/session/TUI use;
+only the on-disk log owns the exact raw stream. Keep renderer-side sanitization
+as defense for legacy results and fallback content.
 
 ### Tune TUI rendering
 
-`src/render.ts` is the only file that touches pi-tui (`Text`,
-`Container`, `theme.fg`, etc.). Changes here are visual-only and
-won't affect tests. Verify via the tmux recipe above.
+`src/render.ts` is the only file that touches pi-tui (`Text`, `Container`,
+`theme.fg`, etc.). Add or update `tests/render.test.ts` for collapse, expand,
+re-collapse, width, status, and hint behavior, then use the tmux recipe above
+for a real interactive smoke test.
 
 ## Debugging aids
 
@@ -273,11 +282,11 @@ Confirm what we actually consume:
 grep -rh 'from "@earendil-works/pi-coding-agent' src/ | sort -u
 ```
 
-As of 2026-04-21 the surface is:
+As of 2026-08-04 the surface is:
 
 - **Types**: `ExtensionAPI`, `ExtensionContext`, `AgentToolResult`,
   `ToolRenderResultOptions`, `Theme`, `TruncationResult`
-- **Helpers**: `formatSize`, `truncateTail`, `truncateToVisualLines`
+- **Helpers**: `formatSize`, `keyHint`, `truncateTail`, `truncateToVisualLines`
 - **Constants**: `DEFAULT_MAX_BYTES`, `DEFAULT_MAX_LINES`
 - **`ExtensionAPI` methods**: `on("session_start" | "session_shutdown")`,
   `registerFlag`, `getFlag`, `registerTool`, `getActiveTools`,
@@ -296,7 +305,7 @@ The surest test is to bump locally and let TypeScript tell us:
 ```bash
 npm install --save-dev @earendil-works/pi-coding-agent@<new-version> \
                          @earendil-works/pi-tui@<new-version>
-npx tsc --noEmit
+npm run check
 ```
 
 A clean typecheck means the API surface we import is unchanged. If it
@@ -310,7 +319,7 @@ grep -rn 'getActiveTools\|setActiveTools\|SessionShutdownEvent' \
 ### 4. Run the full test suite
 
 ```bash
-npx tsx --test tests/*.test.ts
+npm test
 ```
 
 `tests/e2e.test.ts` stubs `ExtensionAPI` ourselves, so a clean
@@ -342,14 +351,14 @@ If steps 1–4 pass, bump both dev pins in `package.json` and commit:
 ```bash
 npm install --save-dev @earendil-works/pi-coding-agent@<new-version> \
                          @earendil-works/pi-tui@<new-version>
-npx tsc --noEmit && npx tsx --test tests/*.test.ts
+npm test
 git add package.json package-lock.json Changelog.md
 git commit -m "unified-exec: verify compat with pi-coding-agent <new-version>"
 ```
 
-`peerDependencies` stays at `"*"` — end users pick up whatever pi
-version they already have installed; the dev pins only govern what we
-typecheck and test against.
+The coding-agent peer minimum stays at the oldest version whose lifecycle and
+renderer APIs are actually supported (`>=0.80.5` today); exact dev pins govern
+the host version we typecheck and test against.
 
 ## Releasing to npm
 
@@ -387,8 +396,7 @@ as appropriate for semver.
 ### What CI does on tag push
 
 1. `npm ci` — reproducible install from `package-lock.json`
-2. `npx tsc --noEmit` — typecheck
-3. `npx tsx --test tests/*.test.ts` — full test suite (246 tests)
+2. `npm test` — strict typecheck + full test suite
 4. **Version-vs-tag guard**: fails CI if `package.json` version doesn't
    match the git tag. Catches the "forgot to bump" footgun.
    `npm version` does both atomically so this normally passes.

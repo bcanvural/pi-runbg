@@ -1,5 +1,13 @@
 # Areas to Improve
 
+> Historical Pi 0.73 compatibility audit. Resolved items remain here as
+> evidence; active lifecycle work is owned by
+> [`docs/IV-0001-long-wait-and-wake-control.md`](./docs/IV-0001-long-wait-and-wake-control.md)
+> and
+> [`docs/IV-0002-output-lifecycle-and-rendering.md`](./docs/IV-0002-output-lifecycle-and-rendering.md).
+> IV-0002 tracks output-archive safety and renderer-ticker ownership separately
+> from the shipped 0.9.0 bounded-result contract.
+
 Source reviewed: latest `badlogic/pi-mono` clone at `local_data/pi-mono`,
 commit `30298368` on `main`, with `@mariozechner/pi-coding-agent` and
 `@mariozechner/pi-tui` release `0.73.0`.

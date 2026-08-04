@@ -30,9 +30,6 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Typecheck
-        run: npx tsc --noEmit
-
       # Windows only: run the PTY e2e file directly (not via --test) so
       # per-test output streams live instead of being buffered until file
       # completion — if a ConPTY hang recurs, the log shows exactly which
@@ -49,7 +46,7 @@ jobs:
           EXPECT_PTY: "1"
 
       - name: Test
-        run: npx tsx --test tests/*.test.ts
+        run: npm test
         timeout-minutes: 10
         env:
           # All matrix platforms have node-pty prebuilds; a load failure

@@ -10,6 +10,7 @@
 import { strict as assert } from "node:assert";
 import { existsSync, readFileSync } from "node:fs";
 import { describe, it } from "node:test";
+import { DEFAULT_MAX_BYTES } from "@earendil-works/pi-coding-agent";
 import extensionFactory, { MAX_EMPTY_POLL_ENV_VAR, resolveMaxEmptyPollMs } from "../src/index.ts";
 import { IS_WINDOWS } from "../src/shell.ts";
 
@@ -22,6 +23,8 @@ interface ToolDef {
 		onUpdate: any,
 		ctx: any,
 	) => Promise<{ content: Array<{ type: string; text: string }>; details: any }>;
+	renderCall?: (...args: any[]) => unknown;
+	renderResult?: (...args: any[]) => unknown;
 }
 
 function makeHarness() {
@@ -84,6 +87,7 @@ function makeHarness() {
 			return cmd.handler(args, stubCtx);
 		},
 		stubCtx,
+		tools,
 		uiEvents,
 		async emit(event: string, evt: any = {}) {
 			const results = [];
@@ -111,6 +115,14 @@ describe("unified-exec e2e", () => {
 		assert.equal(resolveMaxEmptyPollMs({ [MAX_EMPTY_POLL_ENV_VAR]: "60000" }), 60_000);
 		assert.equal(resolveMaxEmptyPollMs({ [MAX_EMPTY_POLL_ENV_VAR]: "1000" }), 5_000);
 		assert.equal(resolveMaxEmptyPollMs({ [MAX_EMPTY_POLL_ENV_VAR]: "not-a-number" }), 290_000);
+	});
+
+	it("registers explicit call/result renderers for every unified-exec tool", () => {
+		const h = makeHarness();
+		for (const name of ["exec_command", "write_stdin", "set_on_exit", "kill_session", "list_sessions"]) {
+			assert.equal(typeof h.tools[name]?.renderCall, "function", `${name} renderCall missing`);
+			assert.equal(typeof h.tools[name]?.renderResult, "function", `${name} renderResult missing`);
+		}
 	});
 
 	it("Windows: shell=powershell and shell=cmd get shell-appropriate flags", { skip: !IS_WINDOWS }, async () => {
@@ -343,6 +355,56 @@ describe("unified-exec e2e", () => {
 		// Either signal=SIGTERM, or exit_code set (sleep can be killed with no code).
 		assert.ok(r2.details.signal === "SIGTERM" || r2.details.exit_code != null, `details=${JSON.stringify(r2.details)}`);
 		await h.emit("session_shutdown");
+	});
+
+	it("kill_session bounds delayed noisy output while the log retains the complete stream", async () => {
+		const h = makeHarness();
+		await h.emit("session_start");
+		try {
+			// Yield before the burst so kill_session, rather than exec_command,
+			// owns the buffered output that exercises this regression.
+			const started = await h.call("exec_command", {
+				cmd: 'sleep 0.8; for i in $(seq 1 4000); do echo "kill-line-${i}-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"; done; sleep 60',
+				yield_time_ms: 250,
+			});
+			const sid = started.details.session_id;
+			assert.ok(typeof sid === "number", JSON.stringify(started.details));
+			const logPath = started.details.log_path;
+			assert.ok(typeof logPath === "string");
+			assert.ok(
+				await waitFor(() => {
+					try {
+						return readFileSync(logPath, "utf8").includes("kill-line-4000-");
+					} catch {
+						return false;
+					}
+				}),
+				"noisy command did not finish its output burst",
+			);
+
+			const killed = await h.call("kill_session", { session_id: sid });
+			assert.equal(killed.details.operation, "kill_session");
+			assert.equal(killed.details.status, "killed");
+			assert.equal(killed.details.running, false);
+			assert.equal(killed.details.killed, true);
+			assert.equal(Object.hasOwn(killed.details, "final_output"), false);
+			assert.ok(Buffer.byteLength(killed.details.output, "utf8") <= DEFAULT_MAX_BYTES);
+			assert.equal(killed.details.truncation?.truncated, true, JSON.stringify(killed.details.truncation));
+			assert.match(killed.content[0].text, /^\[killed\]/);
+			assert.match(killed.content[0].text, /Showing lines/);
+			assert.match(killed.content[0].text, /Full output:/);
+			assert.ok(
+				Buffer.byteLength(killed.content[0].text, "utf8") < DEFAULT_MAX_BYTES + 4096,
+				`kill content unexpectedly large: ${Buffer.byteLength(killed.content[0].text, "utf8")}`,
+			);
+
+			const fullLog = readFileSync(logPath, "utf8");
+			assert.match(fullLog, /kill-line-1-/);
+			assert.match(fullLog, /kill-line-4000-/);
+			assert.ok(fullLog.split("\n").filter((line) => line.startsWith("kill-line-")).length >= 4000);
+		} finally {
+			await h.emit("session_shutdown");
+		}
 	});
 
 	it("kill_session escalates to SIGKILL when SIGTERM is trapped", async () => {

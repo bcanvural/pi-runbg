@@ -2,6 +2,64 @@
 
 All notable changes to this project. **Newest entries go on top.**
 
+## 2026-08-04 — 0.9.0
+
+### Fixed
+
+- **`kill_session` output is now bounded before it reaches either the model or
+  the TUI.** The tool previously appended its complete retained drain directly
+  to `content` and `details.final_output`, bypassing the normal 50 KiB / 2000
+  line cap (up to the 1 MiB in-memory retention) and Pi's collapse state. Kill
+  results now use the same tail truncation, omission metadata, recovery marker,
+  token/byte metrics, and `log_path` contract as exec/write results.
+- **Every unified-exec tool now has an explicit call and result renderer.**
+  `kill_session` and `list_sessions` no longer fall through to Pi's generic raw
+  renderer. Kill output defaults to a five-visual-line tail; `list_sessions`
+  defaults to five compact entries. Both honor `app.tools.expand`, use Pi's
+  configured `keyHint`, and keep status/truncation/log evidence visible.
+- **Child output is made terminal-inert before entering model content, result
+  details, partial updates, or custom TUI rendering.** ANSI/VT mode changes,
+  OSC clipboard/title writes, terminal strings, C0/C1 controls, SGR, and
+  carriage returns are stripped; the exact raw byte stream remains available
+  only in `log_path`. Renderers also sanitize legacy/raw details defensively,
+  and model-visible metadata headers have independent scan/display caps.
+- **Streaming output previews now refresh when partial output changes** at the
+  same terminal width instead of reusing a stale visual-line cache.
+- **Settled session inventories cache their rendered rows by terminal width**
+  and bound command-preview scanning instead of re-sanitizing arbitrarily long
+  command strings on every unrelated TUI redraw.
+- **Session-list command previews are control-character sanitized** in the
+  model-visible fallback text as well as the custom renderer.
+
+### Changed
+
+- Output-bearing details now carry explicit `operation`, `status`, and
+  `running` fields. Kill identity is no longer mistaken for proof that a
+  process remains alive.
+- The undocumented kill-only `details.final_output` field was replaced by the
+  canonical bounded `details.output`. No external consumer was found in a
+  repository-wide/GitHub code search; the observable shape change is released
+  as 0.9.0.
+- Shared output bounding and model-text formatting moved from `src/index.ts` to
+  `src/tool-result.ts`, with separate process and kill result types.
+- Development pins moved from Pi/TUI 0.80.10 to 0.83.0 while the peer minimum
+  remains `>=0.80.5`. Added canonical `npm run check` / `npm test` scripts and
+  aligned CI with them. Removed package metadata's dead issues URL because the
+  repository intentionally has issues disabled.
+
+### Tests / docs
+
+- Added pure result-contract, terminal-safety, and renderer tests for bounding,
+  control-sequence stripping, collapse, expansion, re-collapse, kill failure,
+  unknown ids, cache refresh, and session-list previews.
+- Added a real delayed 4000-line regression: `exec_command` yields before the
+  burst, `kill_session` drains it, the result stays bounded, and the complete
+  stream remains in the log.
+- Added `docs/IV-0002-output-lifecycle-and-rendering.md` with the three-layer
+  capture/model/TUI contract, upstream issue evidence, reproduction procedure,
+  and separate archive/ticker follow-up backlog. Updated README/developer
+  guidance for bounded expansion and complete-log recovery.
+
 ## 2026-07-23 — 0.8.0
 
 ### Fixed

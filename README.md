@@ -47,6 +47,13 @@ pi-flavor additions (`set_on_exit`, `kill_session`, `list_sessions`).
   consume the wake instead. `set_on_exit` disarms or re-arms wake without
   killing the process (including coordinator tombstones after eviction);
   `list_sessions` and the running-session UI surface `wake_armed` / `[wake]`.
+- **Compact, bounded output with complete recovery.** Every output-bearing
+  result—including `kill_session`—is tail-capped at 50 KiB / 2000 lines before
+  it reaches model context or persisted details. All five tools have explicit
+  TUI renderers; child output defaults to a five-visual-line tail and expands
+  with Pi's configured `app.tools.expand` binding. Model/result/TUI text strips
+  terminal-control sequences; the complete raw stream remains available at
+  `log_path`.
 - **Ctrl-C and other control bytes, not just stdin text.**
   `write_stdin` decodes C-style escapes (`\x03` Ctrl-C, `\x04` EOF,
   `\x1b[A` arrow-up, …) before writing, so the LLM can interrupt a
@@ -305,6 +312,15 @@ Pi-flavor. Not in codex.
 Signal names are normalized (`term`, `INT`, `sigkill` all work). Unknown
 names are rejected with an error instead of silently no-opping.
 
+The result uses the same bounded output envelope as `exec_command` and
+`write_stdin`: `details.output` contains at most 50 KiB / 2000 lines of
+terminal-inert plain text, `truncation` and `omitted_bytes` explain any loss,
+and `log_path` points to the complete raw session stream. Explicit `operation`,
+`status`, `running`, `killed`,
+`escalated`, requested/actual signal, and process metadata distinguish session
+identity from liveness. A failed kill remains registered and reports
+`running: true`.
+
 ### `list_sessions`
 
 Pi-flavor. Not in codex. Prunes exited sessions from the in-memory store, but
@@ -381,6 +397,21 @@ waits mark `cancelled`; armed wakes may show `wake armed`.
 set_on_exit session_id=2 → none
 ```
 
+**kill_session** (collapsed by default):
+```
+kill_session session_id=2 signal=SIGTERM
+... (147 earlier lines, Ctrl+O to expand)
+last output line 1
+last output line 2
+last output line 3
+last output line 4
+last output line 5
+  took 0.3s · killed session_id=2 · signal=SIGTERM · log: /tmp/...
+```
+
+**list_sessions** shows up to five compact entries while collapsed and all
+bounded entries plus log paths when expanded.
+
 **Running-session UI:** while any unified-exec process is still alive, the TUI
 footer shows `unified-exec: N sessions running`. After `/tree` navigation, a
 widget above the editor lists the live `session_id`s and commands (with
@@ -389,9 +420,13 @@ branch navigation. The footer/widget refreshes as soon as a background session
 exits; the exited session remains drainable via `write_stdin` until observed,
 preserving the usual lazy cleanup semantics.
 
-By design this display omits some metadata the LLM sees (chunk_id,
-original_token_count, full log path if tildified) — use `Ctrl+O` on the tool
-row to expand the full captured output.
+By design this display omits some metadata the LLM sees (`chunk_id`,
+`original_token_count`, and tildified paths). Use the configured
+`app.tools.expand` binding (Ctrl+O by default) to reveal the complete **bounded
+result**. Expansion never reads an arbitrary-size log synchronously; use
+`log_path` when the complete raw session stream is required. Raw PTY logs can
+contain terminal mode/clipboard sequences, so inspect them through `read`, a
+hex/escape visualizer, or another non-executing viewer rather than `cat`.
 
 ## Constants
 
@@ -420,7 +455,7 @@ MAX_TIMER_ARM_MS               = 2^31-1   (setTimeout chunk size for multi-day y
 DEFAULT_MAX_BYTES            = 50 KiB  (LLM-visible per-call truncation cap)
 DEFAULT_MAX_LINES            = 2000
 OUTPUT_POLL_INTERVAL_MS      = 250     (pi-specific: onUpdate cadence)
-PREVIEW_LINES                = 5       (TUI preview lines before ctrl+o expand)
+PREVIEW_LINES                = 5       (visual TUI lines before app.tools.expand)
 ```
 
 ## Semantic notes
@@ -473,7 +508,9 @@ src/
 ├── notify.ts             # Notify / Gate / sleep primitives
 ├── pty.ts                # node-pty loader + pipes fallback + Windows tree-kill
 ├── shell.ts              # shell selection & argv construction (Windows-aware)
-├── render.ts             # renderCall / renderResult for the TUI
+├── output-safety.ts      # terminal-control stripping (raw bytes stay in logs)
+├── tool-result.ts        # bounded process/kill envelopes + model-visible text
+├── render.ts             # explicit renderCall / renderResult for all five tools
 └── unescape.ts           # C-style escape decoder for write_stdin `chars`
 ```
 
@@ -481,9 +518,10 @@ Workspace docs (agent memory, not runtime):
 
 ```
 docs/
-├── DC-0001-agentic-workspace.md              # IV/DC doctrine
-├── IV-0001-long-wait-and-wake-control.md     # long-wait / wake initiative
-└── DEV.md                                    # contributor onboarding
+├── DC-0001-agentic-workspace.md                  # IV/DC doctrine
+├── IV-0001-long-wait-and-wake-control.md         # long-wait / wake initiative
+├── IV-0002-output-lifecycle-and-rendering.md     # bounded output / compact TUI
+└── DEV.md                                        # contributor onboarding
 ```
 
 ## Worked examples
@@ -589,7 +627,7 @@ From the repo root:
 
 ```bash
 npm install
-npx tsx --test tests/*.test.ts
+npm test                 # strict typecheck + all tests
 ```
 
 Tests cover yield_until timestamp validation (strict RFC 3339 UTC subset,
@@ -608,10 +646,12 @@ abort-listener/timer cleanup), SessionStore LRU (10 scenarios), truncateTail
 `\xHH`/`\uHHHH`/`\u{…}`/unknown escapes/Windows path footguns),
 chars-encoding end-to-end (13 scenarios covering raw bytes, escape decoding,
 chars_b64 binary-safety, and mutual-exclusion errors), signal-name mapping,
-full e2e pipes (35+ scenarios incl. log-file retention, byte/line truncation,
-spawn-failure diagnostics, EPIPE safety, exited-session reporting, shutdown
-SIGKILL escalation, onUpdate streaming, and the `/unified-exec-sessions`
-command), PTY mode (3 scenarios: simple command, Python REPL drive, Ctrl-C
+full e2e pipes (45+ scenarios incl. log-file retention, byte/line truncation,
+a delayed 4000-line kill drain, renderer registration, spawn-failure
+diagnostics, EPIPE safety, exited-session reporting, shutdown SIGKILL
+escalation, onUpdate streaming, and the `/unified-exec-sessions` command), pure
+output-envelope, terminal-control, cache-refresh, and collapse/expand/re-collapse
+renderer coverage, PTY mode (3 scenarios: simple command, Python REPL drive, Ctrl-C
 injection, cmd.exe verbatim payload), shell selection (per-shell argv
 construction, PATH lookup with synthetic PATH fixtures, Windows
 bash→powershell fallback both branches, WSL-stub exclusion, binary
@@ -677,10 +717,10 @@ completion and never revisit the log, it'll linger until your next reboot.
   post-`/tree` widget so humans can see that processes survived branch
   navigation. The UI refreshes immediately on background session exit without
   pruning the exited session before the next `write_stdin`/`list_sessions`.
-- Rich `renderCall` / `renderResult` mirroring pi bash's styling: command
-  banner with `(yield Ns · cwd: …)` suffix, 5-line collapsed preview with
-  `ctrl+o` expand, live "elapsed" counter, `yielded`/`took`/`exit_code`
-  status footer, and a `⟳ poll` / `» input` banner for `write_stdin`.
+- Explicit `renderCall` / `renderResult` coverage for all five tools, mirroring
+  Pi bash's styling: command banners, five-visual-line output tails, configured
+  `app.tools.expand` hints, compact session inventories, live elapsed counters,
+  process/kill status footers, and `⟳ poll` / `» input` banners.
 - `cwd`, `command`, and `yield_time_ms` are surfaced in tool-call details
   (and `cwd` in the LLM-visible response header) for easy debugging.
 

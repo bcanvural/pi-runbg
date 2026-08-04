@@ -1,6 +1,6 @@
 {
 	"name": "pi-unified-exec",
-	"version": "0.8.0",
+	"version": "0.9.0",
 	"description": "Codex-style unified_exec for pi: long-lived shell sessions the LLM polls and drives with write_stdin (Ctrl-C, arrow keys, PTY, REPLs, ssh, dev servers). Full output logged to disk.",
 	"keywords": [
 		"pi-package",
@@ -16,11 +16,12 @@
 		"type": "git",
 		"url": "git+https://github.com/iamwrm/pi-unified-exec.git"
 	},
-	"bugs": {
-		"url": "https://github.com/iamwrm/pi-unified-exec/issues"
-	},
 	"homepage": "https://github.com/iamwrm/pi-unified-exec#readme",
 	"type": "module",
+	"scripts": {
+		"check": "tsc --noEmit",
+		"test": "npm run check && tsx --test tests/*.test.ts"
+	},
 	"engines": {
 		"node": ">=22.19.0"
 	},
@@ -46,8 +47,8 @@
 		"@homebridge/node-pty-prebuilt-multiarch": "0.13.1"
 	},
 	"devDependencies": {
-		"@earendil-works/pi-coding-agent": "0.80.10",
-		"@earendil-works/pi-tui": "0.80.10",
+		"@earendil-works/pi-coding-agent": "0.83.0",
+		"@earendil-works/pi-tui": "0.83.0",
 		"@types/node": "^22.0.0",
 		"tsx": "^4.19.0",
 		"typebox": "1.1.24",
