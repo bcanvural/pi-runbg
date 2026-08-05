@@ -2,31 +2,31 @@
 
 > **Status: design only — nothing implemented yet.**
 
-A pi extension idea for running long-lived processes in the background, outside
-the agent turn: start a job, get a job id back immediately, poll its status and
-logs later — same turn, or in a completely different session.
+A pi extension for **long-lived background sessions** — the codex
+`unified_exec` model ported to pi: every command becomes a session the agent
+drives across turns with writes and polls, instead of a single blocking
+`bash` call.
 
-Pi's `bash` tool is synchronous: it blocks until the command exits. Builds,
-test suites, daemons, and migrations either hog the turn or die with it.
-`pi-runbg` gives the agent the "start, do other work, collect results" pattern
-the codex CLI's prompt philosophy assumes.
+## Approach
 
-## Why a new one?
+Build on [pi-unified-exec](https://github.com/iamwrm/pi-unified-exec) (MIT,
+unmaintained — we fork it). It is a faithful port of codex's `unified_exec`
+with a proven tool surface and 250+ tests. Our additions: the system-prompt
+integration that fixes the long-running-loop failure mode, headless-safety
+review, and ongoing hardening.
 
-The community attempt ([iamwrm/pi-unified-exec](https://github.com/iamwrm/pi-unified-exec))
-is unmaintained and caused problems in the past. Pi itself ships no background
-capability (built-in tools: `read`, `bash`, `edit`, `edit-diff`, `find`, `grep`,
-`index`, `ls`, `write` — nothing async).
+See [docs/design.md](docs/design.md) for the full design.
 
 ## Layout
 
 ```
 pi-runbg/
 ├── README.md          ← you are here
-├── docs/design.md     ← the full design: tools, state model, safety, open questions
+├── docs/design.md     ← full design (v2: aligned with pi-unified-exec)
 └── .gitignore
 ```
 
-Design decisions, tradeoffs, and open questions live in
-[docs/design.md](docs/design.md). Implementation is intentionally out of scope
-until the design is agreed.
+## Related
+
+- [pi-sysprompt](../pi-sysprompt) — template wiring for the session discipline
+- [pi-webfetch](../pi-webfetch) — sibling web-tool design
