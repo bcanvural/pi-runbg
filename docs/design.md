@@ -151,8 +151,8 @@ Plus session hygiene for the model:
    `list_sessions` in the status bar.)
 4. **Config surface:** upstream uses env + constants; do we add a config file
    (e.g. `~/.pi/runbg.json`) for yield caps / log retention?
-5. **Template scope:** which `-pi` templates get the "Long-running tasks"
-   section — all, or just codex-family?
+5. **Template scope:** resolved — only `codex-pi` carries the session
+   guidance (and `bg: true`); opencode prompts stay oblivious.
 6. **Retention:** log rotation/TTL for on-disk session logs.
 
 ## 10. Implementation sketch (fork layout)
@@ -174,7 +174,24 @@ symlinked into `~/.pi/agent/extensions/`.
 
 ## 11. Template wiring (in `pi-sysprompt`)
 
-Draft "Long-running tasks" section for the `-pi` templates:
+**The prompt text is the gate — no extension-to-extension mechanism.** The
+sysprompt extension stays a pure prompt manager; it has no knowledge of runbg's
+tools. Instead:
+
+- **codex-pi** carries the session guidance below, so its model is taught the
+  `exec_command` / `write_stdin` / `set_on_exit` / `kill_session` /
+  `list_sessions` discipline. The opencode templates never mention them, so
+  their models stay oblivious (they simply never call the tools).
+- **`bg: true` frontmatter convention:** codex-pi declares `bg: true` in its
+  frontmatter. Nothing reads it today — it is inert documentation and the
+  future contract if strict availability gating is ever wanted.
+- **Future availability gating (if ever needed) happens *inside runbg*, not
+  sysprompt:** runbg's `before_agent_start` can read the active template's
+  frontmatter (`~/.pi/agent/sysprompt.json` → `active` → template file →
+  `bg:`) and call `pi.setActiveTools()` on its own tool names. That keeps the
+  dependency one-way (runbg → template data) and sysprompt fully ignorant.
+
+Draft "Long-running tasks" section for codex-pi:
 
 > Long-running commands: start them with `exec_command` (session), not a
 > blocking `bash` call. Then do other work and poll with `write_stdin` /
@@ -187,4 +204,5 @@ Draft "Long-running tasks" section for the `-pi` templates:
 
 Reminder: pi injects `promptSnippet` / `promptGuidelines` only in the default
 (non-custom) prompt branch — custom templates must carry this guidance
-themselves.
+themselves. Since the guidance lives in the template text, the opencode
+prompts simply don't include it and never learn the session tools.
