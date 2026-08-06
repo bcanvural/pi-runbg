@@ -43,6 +43,30 @@ its names.
 
 ### Added
 
+- **Per-session interaction serialization** (divergence #7, code review,
+  new `src/interaction-lock.ts`): pi runs a turn's tool batch in parallel, so
+  two `write_stdin` calls on one session could starve each other's drain (a
+  probe showed one poll returning zero bytes for its entire 5 s window) and
+  both deliver a terminal result for the same exit. Interactions against one
+  session now serialize, as in codex's per-process `interaction_lock`. Ours
+  adds preemption because our waits are far longer: an empty progress poll
+  yields as soon as anything else wants the session (queue-aware, so several
+  queued polls degenerate correctly) and reports
+  `wait_status: "preempted"` — distinct from `"cancelled"`. Interactions
+  cancelled while queued are dropped instead of executing minutes later;
+  `yield_until` parks lock-free and locks only its drains; a call queued
+  behind the exit observer gets a truthful `[exited]` echo from a bounded
+  tombstone ring instead of a thrown "unknown session_id".
+- **Refuse at the session cap instead of killing a live session**
+  (divergence #6, code review): upstream SIGTERM'd the LRU unprotected
+  session to make room — a single unconfirmed signal, after which a surviving
+  child had left the store and was invisible to `list_sessions`,
+  `kill_session` and the crash reaper. Exited entries are now reaped first
+  (regardless of the recency-protected set) and a genuine cap hit returns an
+  actionable error. Enforced pre-spawn and re-checked after the early-exit
+  grace, where refusal kills the newborn with full SIGTERM→SIGKILL
+  escalation so a refused call never leaks a process. Cap is configurable
+  via `PI_RUNBG_MAX_SESSIONS` (default 64, codex's constant).
 - **`/runbg` settings command; the session tools ship dormant** (divergence
   #5, `UPSTREAM.md`): after install, `exec_command` & friends stay out of the
   active tool set until `/runbg on` (persisted in `<agentDir>/runbg.json`;

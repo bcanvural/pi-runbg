@@ -87,15 +87,49 @@ describe("SessionStore", () => {
 		assert.equal(store.size, 3);
 	});
 
-	it("falls back to oldest alive when no unprotected exited entries", () => {
-		// cap=3, protected=1. All alive.
+	// Divergence #6 (UPSTREAM.md): insert NEVER kills a live session to make
+	// room. Upstream fell back to "oldest unprotected, alive or not"; callers
+	// must now check wouldEvictLive() and refuse instead.
+	it("never evicts a live session on insert (all-alive store)", () => {
 		const store = new SessionStore({ maxSessions: 3, lruProtectedCount: 1 });
-		store.insert(stub(1, 1000));
+		const a = stub(1, 1000);
+		store.insert(a);
 		store.insert(stub(2, 2000));
-		store.insert(stub(3, 3000)); // newest → protected
-		const d = stub(4, 4000);
-		const { pruned } = store.insert(d);
-		assert.equal(pruned!.id, 1);
+		store.insert(stub(3, 3000));
+		assert.equal(store.wouldEvictLive(), true, "at cap with only live sessions → caller must refuse");
+		const { pruned } = store.insert(stub(4, 4000));
+		assert.equal(pruned, undefined, "no victim");
+		assert.equal((a as unknown as StubSession).terminatedWith, null, "live session must not be signalled");
+	});
+
+	it("reaps an exited entry on insert even when recency-protected", () => {
+		// cap=2, protected=2: both entries protected, one exited.
+		const store = new SessionStore({ maxSessions: 2, lruProtectedCount: 2 });
+		store.insert(stub(1, 1000, /*exited*/ true));
+		store.insert(stub(2, 2000));
+		assert.equal(store.wouldEvictLive(), false, "an exited entry is free room");
+		const { pruned } = store.insert(stub(3, 3000));
+		assert.equal(pruned!.id, 1, "the exited entry is reaped despite protection");
+	});
+
+	it("reapExited clears every exited entry and reports them", () => {
+		const store = new SessionStore({ maxSessions: 10, lruProtectedCount: 8 });
+		store.insert(stub(1, 1000, true));
+		store.insert(stub(2, 2000));
+		store.insert(stub(3, 3000, true));
+		const reaped = store.reapExited().map((s) => s.id).sort();
+		assert.deepEqual(reaped, [1, 3]);
+		assert.equal(store.size, 1);
+		assert.equal(store.liveCount, 1);
+	});
+
+	it("liveCount counts only non-exited entries", () => {
+		const store = new SessionStore({ maxSessions: 10, lruProtectedCount: 2 });
+		store.insert(stub(1, 1000, true));
+		store.insert(stub(2, 2000));
+		store.insert(stub(3, 3000));
+		assert.equal(store.size, 3);
+		assert.equal(store.liveCount, 2);
 	});
 
 	it("protects the N most recent entries", () => {
@@ -112,13 +146,15 @@ describe("SessionStore", () => {
 		assert.equal(pruned!.id, 1);
 	});
 
-	it("terminates evicted session", () => {
+	it("terminates the evicted session (exited victim)", () => {
 		const store = new SessionStore({ maxSessions: 1, lruProtectedCount: 0 });
-		const victim = stub(1, 1000);
+		const victim = stub(1, 1000, /*exited*/ true);
 		store.insert(victim);
 		store.insert(stub(2, 2000));
-		const terminated = (victim as unknown as StubSession).terminatedWith;
-		assert.equal(terminated, "SIGTERM");
+		// terminate() on an already-exited session is a no-op in the real
+		// ExecSession, but the store still calls it — pin that it's the victim.
+		assert.equal((victim as unknown as StubSession).terminatedWith, "SIGTERM");
+		assert.equal(store.get(1), undefined);
 	});
 
 	it("terminateAll clears and signals each session", () => {

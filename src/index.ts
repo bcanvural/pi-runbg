@@ -79,8 +79,24 @@ const DEFAULT_EXEC_YIELD_MS = 10_000;
 const DEFAULT_WRITE_STDIN_YIELD_MS = 250;
 const EARLY_EXIT_GRACE_PERIOD_MS = 150;
 const MAX_SESSIONS = 64;
-const WARNING_SESSIONS = 60;
+export const MAX_SESSIONS_ENV_VAR = "PI_RUNBG_MAX_SESSIONS";
+/** Warn this many slots before the cap (upstream warned at 60 of 64). */
+const WARNING_HEADROOM = 4;
 const LRU_PROTECTED_COUNT = 8;
+
+/**
+ * Concurrent-session cap (codex's constant is preserved as the default).
+ * Overridable because the cap is now a REFUSAL boundary (divergence #6), so
+ * operators may want it lower — and tests need a small one. Values are
+ * floored at 1; garbage falls back to the default.
+ */
+export function resolveMaxSessions(env: Record<string, string | undefined> = process.env): number {
+	const raw = env[MAX_SESSIONS_ENV_VAR];
+	if (raw === undefined || raw.trim() === "") return MAX_SESSIONS;
+	const parsed = Number(raw);
+	if (!Number.isFinite(parsed)) return MAX_SESSIONS;
+	return Math.max(1, Math.floor(parsed));
+}
 const OUTPUT_POLL_INTERVAL_MS = 250; // onUpdate cadence (relative waits only)
 // PTY dimension clamps for exec_command's cols/rows (tty: true only).
 const MIN_PTY_COLS = 20;
@@ -490,6 +506,32 @@ function resolveWriteInput(args: WriteStdinArgs): Uint8Array | undefined {
 	return undefined;
 }
 
+/**
+ * At the session cap with nothing reapable: pending (spawned, pre-insert)
+ * sessions count, so two parallel exec_commands can't both slip past the
+ * pre-spawn check at cap-1.
+ *
+ * `excluding` is the caller's own session on the post-grace re-check: it is
+ * already in `pendingSessions` and is the very session asking for the slot,
+ * so counting it would refuse (and kill) every session that reaches the cap
+ * exactly.
+ */
+function atSessionCap(ctx: ExtensionCtx, excluding?: ExecSession): boolean {
+	if (ctx.store.wouldEvictLive()) return true;
+	let pending = ctx.pendingSessions.size;
+	if (excluding && ctx.pendingSessions.has(excluding)) pending--;
+	return ctx.store.liveCount + pending >= ctx.store.maxSessions;
+}
+
+function capError(ctx: ExtensionCtx): string {
+	return (
+		`runbg: session cap reached (${ctx.store.maxSessions} max, ${ctx.store.liveCount} running` +
+		`${ctx.pendingSessions.size ? ` + ${ctx.pendingSessions.size} starting` : ""}). ` +
+		`Free a slot first: kill_session on a session you no longer need (list_sessions to review them), ` +
+		`or /runbg-sessions to clean up by hand. No new session was started.`
+	);
+}
+
 async function runExecCommand(
 	ctx: ExtensionCtx,
 	args: ExecCommandArgs,
@@ -501,6 +543,15 @@ async function runExecCommand(
 		finalizeProcessResult({ ...input, operation: "exec_command" });
 	if (ctx.shuttingDown) {
 		throw new Error("runbg: session is shutting down; not starting new commands.");
+	}
+	// Refuse at the cap BEFORE spawning (divergence #6): upstream silently
+	// SIGTERM'd the LRU live session to make room, which breaks whatever
+	// depended on it and (once out of the store) hides it from list_sessions,
+	// kill_session and the crash reaper. Reap exited corpses first — they are
+	// free room, protected-set or not.
+	ctx.store.reapExited().forEach((s) => unwatchSessionExit(ctx, s.id));
+	if (atSessionCap(ctx)) {
+		throw new Error(capError(ctx));
 	}
 	const tty = args.tty ?? false;
 	if (tty && !isPtyAvailable()) {
@@ -620,6 +671,26 @@ async function runExecCommand(
 			});
 		}
 
+		// The child outlived the grace window. Re-check both refusal conditions
+		// now — shutdown may have started, and two parallel exec_commands can
+		// both have passed the pre-spawn check at cap-1. In either case the
+		// child is ALREADY RUNNING, so refusing means killing it: returning an
+		// error while leaving it alive would leak a process that no longer
+		// appears in the store, the picker, or the crash reaper.
+		if (ctx.shuttingDown || atSessionCap(ctx, session)) {
+			const reason = ctx.shuttingDown
+				? "runbg: session shut down while this command was starting; the process was terminated."
+				: capError(ctx);
+			ctx.coordinator.suppress(session.id);
+			session.kill("SIGTERM");
+			await waitForExitOrDeadline({ exited: session.exited, durationMs: 2000 });
+			if (!session.hasExited && !IS_WINDOWS) {
+				session.kill("SIGKILL");
+				await waitForExitOrDeadline({ exited: session.exited, durationMs: 500 });
+			}
+			throw new Error(reason);
+		}
+
 		// Live session: register it BEFORE we keep polling, so an early abort
 		// doesn't let the session be GC'd / lose its place.
 		const { pruned, count } = ctx.store.insert(session);
@@ -629,9 +700,12 @@ async function runExecCommand(
 			// Suppresses the wake for live victims; keeps a tombstone for a
 			// naturally-exited wake session so its completion is not silently lost.
 			ctx.coordinator.handleEviction(pruned);
-			ctx.ui?.notify(`runbg: evicted session ${pruned.id} (LRU, over cap ${ctx.store.maxSessions})`, "warning");
+			// Only ever an already-exited session (divergence #6): live ones make
+			// exec_command refuse instead of being killed to free a slot.
+			ctx.ui?.notify(`runbg: reaped exited session ${pruned.id} (LRU, at cap ${ctx.store.maxSessions})`, "info");
 		}
-		if (count >= WARNING_SESSIONS) {
+		// Derived from the (configurable) cap so a lowered cap still warns.
+		if (count >= Math.max(1, ctx.store.maxSessions - WARNING_HEADROOM)) {
 			ctx.ui?.notify(`runbg: ${count}/${ctx.store.maxSessions} sessions open`, "warning");
 		}
 		// Note: sessions stay in the store until a later tool call observes the
@@ -1413,7 +1487,7 @@ export default function (pi: ExtensionAPI) {
 		coordinator,
 		// Eviction UI (status clear + warning) is handled at the insert site;
 		// no onEvict callback needed.
-		store: new SessionStore({ maxSessions: MAX_SESSIONS, lruProtectedCount: LRU_PROTECTED_COUNT }),
+		store: new SessionStore({ maxSessions: resolveMaxSessions(), lruProtectedCount: LRU_PROTECTED_COUNT }),
 		ui: undefined,
 		widgetVisible: false,
 		exitUnsubscribers: new Map(),
