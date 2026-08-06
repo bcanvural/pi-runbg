@@ -16,6 +16,18 @@ its names.
   session tools keep a working shell, and `bash`-guarding extensions are not
   silently bypassed. Covered by `tests/builtin-bash.test.ts`.
 
+### Fixed
+
+- **In-call output accumulation is now bounded** (divergence #4,
+  `UPSTREAM.md`): `collectOutputUntilDeadline` kept every drained chunk in an
+  array for the whole call, so a chatty child inside a single long empty poll
+  (up to 290 s) could accumulate output in process memory without limit — the
+  session buffer only bounds what piles up *between* drains. Drained bytes now
+  land in a second head/tail buffer capped at the session retention plus 4 KiB
+  marker headroom; a single drain still passes through byte-exact, and
+  call-level drops splice an explicit "in-call retention" marker and count
+  into `omitted_bytes`.
+
 ### Added
 
 - **Crash-path child reaping** (divergence #2, `UPSTREAM.md`): a synchronous

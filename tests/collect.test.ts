@@ -12,7 +12,7 @@
 import { strict as assert } from "node:assert";
 import { getEventListeners } from "node:events";
 import { describe, it } from "node:test";
-import { collectOutputUntilDeadline } from "../src/collect.ts";
+import { CALL_RETENTION_HEADROOM_BYTES, collectOutputUntilDeadline } from "../src/collect.ts";
 import { HeadTailBuffer } from "../src/head-tail-buffer.ts";
 import { Gate, Notify, sleep } from "../src/notify.ts";
 
@@ -282,5 +282,70 @@ describe("collectOutputUntilDeadline", () => {
 			deadlineMs: t0 + 2000,
 		});
 		assert.equal(text(out.bytes), "real");
+	});
+
+	// Divergence #4 (UPSTREAM.md, design §7.4): the in-call accumulation is
+	// bounded. Upstream kept every drained chunk in an array for the whole
+	// call, so a chatty child during one long empty poll accumulated output
+	// without limit even though the session buffer itself was capped.
+	it("bounds in-call accumulation to the session retention across many drains", async () => {
+		const buffer = new HeadTailBuffer(4 * 1024); // small cap to keep the test fast
+		const outputNotify = new Notify();
+		const outputClosed = new Gate();
+		const exitedAc = new AbortController();
+
+		const chunk = "x".repeat(1024);
+		const totalPushed = 64 * 1024; // 16x the retention
+		const collectP = collectOutputUntilDeadline({
+			buffer,
+			outputNotify,
+			outputClosed,
+			exited: exitedAc.signal,
+			deadlineMs: Date.now() + 8000,
+		});
+		// Interleave pushes with event-loop turns so the collector drains many
+		// times (the accumulation vector), not once at the end.
+		for (let pushed = 0; pushed < totalPushed; pushed += chunk.length) {
+			buffer.pushChunk(s(`${chunk.slice(0, chunk.length - String(pushed).length - 1)}:${pushed}`));
+			outputNotify.notifyAll();
+			await sleep(1);
+		}
+		buffer.pushChunk(s("FINAL-TAIL"));
+		outputNotify.notifyAll();
+		exitedAc.abort();
+		outputClosed.close();
+		const out = await collectP;
+
+		// Bounded: retention + headroom + marker slack — nowhere near 64 KiB.
+		assert.ok(
+			out.bytes.length <= 4 * 1024 + CALL_RETENTION_HEADROOM_BYTES + 512,
+			`in-call payload must stay bounded (got ${out.bytes.length} bytes)`,
+		);
+		assert.ok(out.omittedBytes > 0, "the cap must have dropped middle bytes");
+		const body = text(out.bytes);
+		assert.ok(body.includes("in-call retention"), `expected a call-level omission marker: ${body.slice(0, 200)}`);
+		assert.ok(body.endsWith("FINAL-TAIL"), `tail must survive: …${body.slice(-60)}`);
+		assert.ok(body.startsWith("x"), "head must survive");
+	});
+
+	it("keeps small multi-drain outputs byte-exact with no markers", async () => {
+		const h = makeHarness();
+		const t0 = Date.now();
+		setTimeout(() => h.push("one "), 10);
+		setTimeout(() => h.push("two "), 30);
+		setTimeout(() => h.push("three"), 50);
+		setTimeout(() => {
+			h.exit();
+			h.closeStream();
+		}, 70);
+		const out = await collectOutputUntilDeadline({
+			buffer: h.buffer,
+			outputNotify: h.outputNotify,
+			outputClosed: h.outputClosed,
+			exited: h.exited,
+			deadlineMs: t0 + 3000,
+		});
+		assert.equal(out.omittedBytes, 0);
+		assert.equal(text(out.bytes), "one two three");
 	});
 });

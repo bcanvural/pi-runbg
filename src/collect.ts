@@ -14,12 +14,27 @@
  *   - No `pause_state`: pi does not have codex's "out of band elicitation
  *     pause" concept, so the deadline is not extended across pauses.
  *   - Uses `AbortSignal` instead of tokio `CancellationToken`.
+ *   - Divergence #4 from upstream pi-unified-exec (UPSTREAM.md, design §7.4):
+ *     collected bytes are retained in a second HeadTailBuffer bounded to the
+ *     session buffer's own retention cap, instead of an unbounded chunk
+ *     array. The session buffer only bounds what accumulates BETWEEN drains;
+ *     a chatty child inside a single 290 s empty poll used to accumulate
+ *     every drained chunk in memory for the whole call.
  */
 
-import type { HeadTailBuffer } from "./head-tail-buffer.ts";
+import { HeadTailBuffer } from "./head-tail-buffer.ts";
 import type { Gate, Notify } from "./notify.ts";
 
 const POST_EXIT_CLOSE_WAIT_MS = 50;
+
+/**
+ * Headroom the call-level retention adds on top of the session retention so
+ * a single full drain (head+tail == session cap) plus its spliced omission
+ * markers passes through intact — the between-polls marker must never itself
+ * be dropped by the call-level cap. Only output beyond a full retention plus
+ * this slack triggers the call-level omission path.
+ */
+export const CALL_RETENTION_HEADROOM_BYTES = 4096;
 
 const markerEncoder = new TextEncoder();
 
@@ -31,6 +46,16 @@ const markerEncoder = new TextEncoder();
 function omissionMarker(omittedBytes: number, retentionBytes: number): Uint8Array {
 	return markerEncoder.encode(
 		`\n[... ${omittedBytes} bytes omitted here (output exceeded the ${retentionBytes}-byte in-memory retention between polls; the full stream is in the session log file) ...]\n`,
+	);
+}
+
+/**
+ * Same idea as `omissionMarker`, but for middle bytes dropped by the
+ * call-level retention while this call stayed attached (divergence #4).
+ */
+function callOmissionMarker(omittedBytes: number, retentionBytes: number): Uint8Array {
+	return markerEncoder.encode(
+		`\n[... ${omittedBytes} bytes omitted here (output exceeded the ${retentionBytes}-byte in-call retention during this attachment window; the full stream is in the session log file) ...]\n`,
 	);
 }
 
@@ -51,11 +76,14 @@ export interface CollectInputs {
 	postExitCloseWaitMs?: number;
 }
 
-/** Collected payload plus how many middle bytes the retention cap dropped. */
+/** Collected payload plus how many middle bytes the retention caps dropped. */
 export interface CollectResult {
 	/** Concatenated bytes, with an omission marker spliced in when bytes were dropped. */
 	bytes: Uint8Array;
-	/** Total middle bytes dropped by the HeadTailBuffer across this call's drains. */
+	/**
+	 * Total middle bytes dropped across this call: session-buffer drops
+	 * between drains plus call-level retention drops within the call.
+	 */
 	omittedBytes: number;
 }
 
@@ -71,7 +99,12 @@ export async function collectOutputUntilDeadline(inputs: CollectInputs): Promise
 	const { buffer, outputNotify, outputClosed, exited, deadlineMs, externalAbort } = inputs;
 	const postExitCloseWaitCap = inputs.postExitCloseWaitMs ?? POST_EXIT_CLOSE_WAIT_MS;
 
-	const collected: Uint8Array[] = [];
+	// Bounded in-call retention (divergence #4): sized to the session
+	// buffer's own cap plus marker headroom, so one attachment window never
+	// holds much more than one retention's worth of bytes, no matter how
+	// chatty the child is — while a single drain always passes through
+	// verbatim, spliced markers included.
+	const collected = new HeadTailBuffer(buffer.maxBytes + CALL_RETENTION_HEADROOM_BYTES);
 	let omittedTotal = 0;
 	let exitSignalReceived = exited.aborted;
 	let postExitDeadline: number | undefined;
@@ -140,12 +173,12 @@ export async function collectOutputUntilDeadline(inputs: CollectInputs): Promise
 
 			// 2) Collected some bytes — keep them (marker spliced at the exact
 			// head/tail boundary when the retention cap dropped middle bytes).
-			for (const chunk of drained.head) collected.push(chunk);
+			for (const chunk of drained.head) collected.pushChunk(chunk);
 			if (drained.omittedBytes > 0) {
 				omittedTotal += drained.omittedBytes;
-				collected.push(omissionMarker(drained.omittedBytes, buffer.maxBytes));
+				collected.pushChunk(omissionMarker(drained.omittedBytes, buffer.maxBytes));
 			}
-			for (const chunk of drained.tail) collected.push(chunk);
+			for (const chunk of drained.tail) collected.pushChunk(chunk);
 
 			if (exited.aborted) exitSignalReceived = true;
 			if (Date.now() >= deadlineMs) break;
@@ -154,7 +187,17 @@ export async function collectOutputUntilDeadline(inputs: CollectInputs): Promise
 		for (const cleanup of cleanups) cleanup();
 	}
 
-	return { bytes: concat(collected), omittedBytes: omittedTotal };
+	// Assemble the bounded payload; splice a marker where the call-level
+	// retention dropped middle bytes (per-drain markers are already inline).
+	const final = collected.drainSegments();
+	const parts: Uint8Array[] = [];
+	for (const chunk of final.head) parts.push(chunk);
+	if (final.omittedBytes > 0) {
+		omittedTotal += final.omittedBytes;
+		parts.push(callOmissionMarker(final.omittedBytes, collected.maxBytes));
+	}
+	for (const chunk of final.tail) parts.push(chunk);
+	return { bytes: concat(parts), omittedBytes: omittedTotal };
 }
 
 /**
