@@ -1,10 +1,14 @@
 /**
  * Fork divergence #1 (UPSTREAM.md): pi's built-in `bash` tool stays active by
- * default; --replace-builtin-bash opts into upstream's codex-parity removal —
- * and only while runbg is enabled (divergence #5), so a dormant runbg never
- * leaves pi without a shell. Also covers the startup warning when the
- * upstream package (pi-unified-exec) is installed alongside and registers
- * the same tool names.
+ * default; removal is opt-in — and only while runbg is enabled (divergence
+ * #5), so a dormant runbg never leaves pi without a shell. Also covers the
+ * startup warning when the upstream package (pi-unified-exec) is installed
+ * alongside and registers the same tool names.
+ *
+ * This file covers the `--replace-builtin-bash` startup flag. The persisted
+ * `/runbg replace-bash on|off` setting — the primary switch, including its
+ * mid-session toggling and its interaction with this flag — lives in
+ * tests/toggle.test.ts alongside the rest of the settings command.
  *
  * PI_CODING_AGENT_DIR is pinned to a temp dir so the developer's real
  * runbg.json can never leak into assertions.

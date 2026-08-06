@@ -12,9 +12,18 @@ its names.
 
 - **Pi's built-in `bash` tool is kept by default** (divergence #1,
   `UPSTREAM.md`): upstream removes it unless `--keep-builtin-bash`; runbg
-  keeps it unless `--replace-builtin-bash`. Templates that never mention the
-  session tools keep a working shell, and `bash`-guarding extensions are not
-  silently bypassed. Covered by `tests/builtin-bash.test.ts`.
+  keeps it unless asked, via `/runbg replace-bash on` (below) or
+  `--replace-builtin-bash`. Templates that never mention the session tools
+  keep a working shell, and `bash`-guarding extensions are not silently
+  bypassed. Covered by `tests/builtin-bash.test.ts`.
+- **`--replace-builtin-bash` is now a one-invocation force-on, not the only
+  switch.** The persisted `replace-bash` setting is the primary control; the
+  flag can only turn removal *on*, because pi reports a boolean flag's
+  default for "absent" and so cannot distinguish `--replace-builtin-bash=false`
+  from an absent flag. `/runbg status` names the flag whenever it — rather
+  than the stored setting — is the reason `bash` is gone, and
+  `/runbg replace-bash off` warns instead of silently failing when the flag
+  overrules it.
 
 ### Fixed
 
@@ -74,6 +83,38 @@ its names.
 
 ### Added
 
+- **`/runbg replace-bash on|off`: bash replacement is now a persisted,
+  mid-session-toggleable setting** (divergence #1 + #5), off by default.
+  Previously the only way to hand pi's shell over to the session tools was
+  the `--replace-builtin-bash` startup flag, which meant restarting pi to
+  change your mind — awkward for the intended workflow of pairing it with
+  `/sysprompt` when switching to a codex-parity template. `/runbg` became the
+  general settings command its namespace anticipated: a declarative table of
+  boolean settings drives the grammar (`/runbg <setting> on|off`, plus bare
+  `/runbg on|off` for the primary switch and `/runbg <setting>` to report just
+  one value), the argument completions, and the status line, so a future
+  setting is one table entry rather than four parallel edits. Notes worth
+  keeping:
+  - **Completion values are whole argument strings.** pi's
+    `applyCompletion` substitutes the argument text it handed us, so
+    returning a bare `on` for the prefix `replace-bash ` would rewrite the
+    line to `/runbg on` — the wrong setting. Pinned by a test.
+  - **`bash` is never traded away for a shell that is not there.** Removal
+    now additionally requires an active `exec_command`; gating deliberately
+    skips tool names another package's registration won, so without this
+    check a `pi-unified-exec` install that left `exec_command` inactive could
+    have left pi with no shell at all.
+  - **A `/reload` clears the "we removed bash" latch** while pi's active-tool
+    set keeps `bash` removed, so a later `off` cannot honestly restore it.
+    Rather than resurrect a `bash` it cannot prove it took (divergence #1's
+    never-resurrect rule), runbg now says so and points at pi's tool
+    settings.
+  - Known settings keys are normalized with a strict `=== true`, so a
+    hand-edited `"true"` reads as off: these settings remove tools, and the
+    safe default is the one that leaves pi's own shell in place.
+  Covered by nine new cases in `tests/toggle.test.ts` (flag/setting
+  precedence, the inert-while-dormant path, the no-session-shell guard, the
+  unrestorable-latch message) plus the completion-contract test above.
 - **Log liveness heartbeat and TTL floor** (divergence #3 follow-up, code
   review): the stale-log sweep is mtime-based, so a live-but-quiet session (a
   dev server idle for days) looked abandoned to another pi process, which

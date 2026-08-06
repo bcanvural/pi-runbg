@@ -383,9 +383,16 @@ function warnIfUpstreamPackagePresent(ctx: ExtensionCtx, pi: ExtensionAPI): void
  * them. Settings live in `<agentDir>/runbg.json` — the file is the
  * namespace for future extension settings, so unknown keys are preserved
  * verbatim on every write.
+ *
+ * Every known key is normalized with a strict `=== true`, so a hand-edited
+ * `"true"` or `1` reads as off rather than half-on: these settings remove
+ * tools, and the safe default has to be the one that leaves pi's own shell
+ * in place.
  */
 interface RunbgSettings {
 	enabled: boolean;
+	/** Divergence #1: remove pi's built-in `bash` while runbg is enabled. */
+	replaceBuiltinBash: boolean;
 	[key: string]: unknown;
 }
 
@@ -399,12 +406,180 @@ export function readRunbgSettings(): RunbgSettings {
 	try {
 		const raw: unknown = JSON.parse(readFileSync(runbgSettingsPath(), "utf8"));
 		if (raw && typeof raw === "object" && !Array.isArray(raw)) {
-			return { ...(raw as Record<string, unknown>), enabled: (raw as Record<string, unknown>).enabled === true };
+			const obj = raw as Record<string, unknown>;
+			return { ...obj, enabled: obj.enabled === true, replaceBuiltinBash: obj.replaceBuiltinBash === true };
 		}
 	} catch {
 		// missing or corrupt file → defaults
 	}
-	return { enabled: false };
+	return { enabled: false, replaceBuiltinBash: false };
+}
+
+/** State a setting's toast may report on, beyond the value being written. */
+interface SettingNoticeInfo {
+	/** The stored value already equalled the requested one. */
+	already: boolean;
+	/** Live sessions right now (a disable leaves them running). */
+	live: number;
+	/** The primary switch, after the write — settings are inert while off. */
+	enabled: boolean;
+	/** `--replace-builtin-bash` was passed at startup (forces the setting on). */
+	flagForced: boolean;
+	/**
+	 * Bash removal was in force before this write and is not any more, yet
+	 * `bash` is still inactive — i.e. the user has reason to expect it back
+	 * and the latch could not deliver it (see BASH_NOT_RESTORED_NOTE).
+	 */
+	bashRestorePending: boolean;
+}
+
+/**
+ * One boolean setting of `/runbg`. The table below is the single source of
+ * truth for the command's grammar, its argument completions, and its status
+ * line, so adding a setting is one entry rather than four parallel edits.
+ *
+ * Grammar for every entry: `/runbg <name>` reports, `/runbg <name> on|off`
+ * writes. `enabled` additionally answers to the bare `/runbg on|off` it has
+ * always had, which is why it opts out of completions — offering
+ * `enabled on` next to `on` would just be the same switch twice.
+ */
+interface BooleanSetting {
+	/** Canonical `/runbg <name> …` word. */
+	name: string;
+	/** Extra accepted spellings; never offered in completions. */
+	aliases: readonly string[];
+	/** Key in runbg.json. */
+	key: "enabled" | "replaceBuiltinBash";
+	/** Offer `<name> on|off` in argument completions. */
+	offerCompletions: boolean;
+	onHint: string;
+	offHint: string;
+	/** Toast for a write (or a no-op write) of this setting. */
+	notice: (value: boolean, info: SettingNoticeInfo) => { message: string; type: "info" | "warning" };
+	/**
+	 * Reported value, when the stored boolean is not the whole truth (a flag
+	 * forcing it, another setting making it inert). Defaults to on/off.
+	 */
+	label?: (pi: ExtensionAPI, settings: RunbgSettings) => string;
+}
+
+/** What `/runbg status` and `/runbg <setting>` print for one setting. */
+function settingLabel(setting: BooleanSetting, pi: ExtensionAPI, settings: RunbgSettings): string {
+	if (setting.label) return setting.label(pi, settings);
+	return settings[setting.key] === true ? "on" : "off";
+}
+
+/**
+ * `/reload` builds a fresh ExtensionCtx, which clears the "we removed bash"
+ * latch while pi's active-tool set keeps bash removed. Turning replacement
+ * off after that must still not resurrect a bash we cannot prove we took
+ * (divergence #1's never-resurrect rule), so say so instead of silently
+ * leaving pi shell-less-looking.
+ */
+const BASH_NOT_RESTORED_NOTE =
+	"; pi's built-in `bash` stays inactive — runbg has no record of removing it in this session (a /reload clears that record), re-enable it in pi's tool settings if you want it back";
+
+/** The primary switch — the one bare `/runbg on|off` targets. */
+const ENABLED_SETTING: BooleanSetting = {
+	name: "enabled",
+	aliases: [],
+	key: "enabled",
+	// Bare `/runbg on|off` already covers this one; offering `enabled on`
+	// beside `on` would just be the same switch listed twice.
+	offerCompletions: false,
+	onHint: "Enable the session tools (persists across sessions)",
+	offHint: "Disable the session tools (persists; running sessions keep running)",
+	notice: (value, info) =>
+		value
+			? {
+					message: info.already
+						? "runbg: already enabled — tool state re-applied for this session"
+						: "runbg: session tools enabled (persists across sessions) — disable with /runbg off",
+					type: "info",
+				}
+			: {
+					message:
+						(info.already
+							? "runbg: already disabled — tool state re-applied for this session"
+							: `runbg: session tools disabled (persists)${info.live ? ` — ${info.live} live session(s) keep running; /runbg-sessions to manage them` : ""}`) +
+						(info.bashRestorePending ? BASH_NOT_RESTORED_NOTE : ""),
+					type: !info.already && info.live ? "warning" : "info",
+				},
+};
+
+/** Divergence #1 as a runtime setting rather than a startup-only flag. */
+const REPLACE_BASH_SETTING: BooleanSetting = {
+	name: "replace-bash",
+	// Exact flag parity, so `--replace-builtin-bash` muscle memory works.
+	aliases: ["replace-builtin-bash"],
+	key: "replaceBuiltinBash",
+	offerCompletions: true,
+	onHint: "Remove pi's built-in `bash` so the session tools are the only shell (codex parity)",
+	offHint: "Keep pi's built-in `bash` alongside the session tools (default)",
+	notice: (value, info) => {
+		if (value) {
+			const base = info.already
+				? "runbg: replace-bash already on — tool state re-applied for this session"
+				: "runbg: replace-bash on (persists) — pi's built-in `bash` is removed while runbg is enabled";
+			// Removal is gated on `enabled` (never leave pi shell-less), so
+			// saving this while runbg is dormant must not look like it took
+			// effect.
+			return { message: info.enabled ? base : `${base}; inert until /runbg on`, type: "info" };
+		}
+		const base = info.already
+			? "runbg: replace-bash already off — tool state re-applied for this session"
+			: "runbg: replace-bash off (persists) — pi's built-in `bash` stays available";
+		// A saved `off` that the startup flag overrules would otherwise look
+		// like a broken toggle: bash stays gone with no explanation.
+		if (info.flagForced) {
+			return {
+				message: `${base}, but --replace-builtin-bash was passed at startup and forces it back on — restart pi without the flag`,
+				type: "warning",
+			};
+		}
+		return { message: base + (info.bashRestorePending ? BASH_NOT_RESTORED_NOTE : ""), type: "info" };
+	},
+	label: (pi, settings) => {
+		const { effective, fromFlag } = replaceBuiltinBashRequest(pi, settings);
+		if (!effective) return "off";
+		// Both qualifiers answer "bash is/isn't gone, and why" — the two
+		// questions a bare `on` would leave the reader guessing at.
+		return `on${fromFlag ? " (--replace-builtin-bash)" : ""}${settings.enabled ? "" : " (inert while disabled)"}`;
+	},
+};
+
+const BOOLEAN_SETTINGS: readonly BooleanSetting[] = [ENABLED_SETTING, REPLACE_BASH_SETTING];
+
+function findBooleanSetting(word: string): BooleanSetting | undefined {
+	return BOOLEAN_SETTINGS.find((setting) => setting.name === word || setting.aliases.includes(word));
+}
+
+/** `on|off` vocabulary accepted for every setting (and bare, for `enabled`). */
+const BOOLEAN_WORDS: Record<string, boolean | undefined> = {
+	on: true,
+	enable: true,
+	off: false,
+	disable: false,
+};
+
+/**
+ * Is the built-in-bash replacement (divergence #1) requested, and by what?
+ *
+ * The persisted setting is the primary switch (`/runbg replace-bash on`).
+ * `--replace-builtin-bash` is a per-invocation FORCE-ON rather than a
+ * two-way override: pi reports a boolean flag's default for "absent", so
+ * `--replace-builtin-bash=false` and "not passed at all" are
+ * indistinguishable here and only the true direction carries information.
+ * Union semantics is the only honest reading — and the status line names
+ * whichever source is active so a setting the flag overrules never looks
+ * like a broken toggle.
+ */
+function replaceBuiltinBashRequest(
+	pi: ExtensionAPI,
+	settings: RunbgSettings,
+): { effective: boolean; fromFlag: boolean } {
+	const fromFlag = (pi.getFlag("replace-builtin-bash") ?? pi.getFlag("--replace-builtin-bash")) === true;
+	return { effective: fromFlag || settings.replaceBuiltinBash === true, fromFlag };
 }
 
 function writeRunbgSettings(settings: RunbgSettings): void {
@@ -437,24 +612,31 @@ function applyToolGating(pi: ExtensionAPI, enabled: boolean): void {
 
 /**
  * The full session-tool policy, applied at session_start AND on every
- * `/runbg on|off` (unconditionally — a settings file another pi process
+ * `/runbg` write (unconditionally — a settings file another pi process
  * already flipped must still take effect in THIS session):
  *   1. gate our tools by the persisted enabled state;
- *   2. while enabled with --replace-builtin-bash, remove pi's built-in
- *      `bash` (divergence #1) and LATCH that we did;
+ *   2. while enabled and bash replacement is requested (the `replace-bash`
+ *      setting or `--replace-builtin-bash`), remove pi's built-in `bash`
+ *      (divergence #1) and LATCH that we did;
  *   3. otherwise restore `bash` only if the latch says we removed it —
  *      never resurrect a bash the user or another extension disabled
  *      independently of us.
  * The latch is what keeps the "never leave pi shell-less" invariant true
- * across mid-session `/runbg off`.
+ * across a mid-session `/runbg off` or `/runbg replace-bash off`.
  */
 function applySessionToolPolicy(ctx: ExtensionCtx, pi: ExtensionAPI): void {
-	const enabled = readRunbgSettings().enabled;
+	const settings = readRunbgSettings();
+	const enabled = settings.enabled;
 	applyToolGating(pi, enabled);
-	const replace = pi.getFlag("replace-builtin-bash") ?? pi.getFlag("--replace-builtin-bash");
-	if (enabled && replace === true) {
+	const replace = replaceBuiltinBashRequest(pi, settings).effective;
+	if (enabled && replace) {
 		const active = pi.getActiveTools();
-		if (active.includes("bash")) {
+		// Trade `bash` away only for a session shell that is actually active.
+		// Gating above adds our tools, but it deliberately skips names another
+		// package's registration won — if that package left `exec_command`
+		// inactive, removing `bash` too would leave pi with no shell at all,
+		// which is strictly worse than ignoring the request.
+		if (active.includes("bash") && active.includes("exec_command")) {
 			pi.setActiveTools(active.filter((name) => name !== "bash"));
 			ctx.removedBuiltinBash = true;
 		}
@@ -1678,12 +1860,17 @@ export default function (pi: ExtensionAPI) {
 
 	// Divergence #1 from upstream (see UPSTREAM.md): upstream removes pi's
 	// built-in `bash` unless --keep-builtin-bash is passed; runbg keeps it
-	// unless --replace-builtin-bash is. System-prompt templates that never
-	// mention the session tools — and extensions that guard `bash` calls —
-	// need a working `bash`, so exec_command stays additive by default.
+	// unless asked. System-prompt templates that never mention the session
+	// tools — and extensions that guard `bash` calls — need a working `bash`,
+	// so exec_command stays additive by default.
+	//
+	// `/runbg replace-bash on|off` is the primary switch (persisted, toggleable
+	// mid-session). This flag stays as a force-on for one invocation, so a
+	// codex-parity wrapper script needs no state in the agent dir; see
+	// replaceBuiltinBashRequest for why it can only force ON.
 	pi.registerFlag("replace-builtin-bash", {
 		description:
-			"Remove pi's built-in `bash` tool so exec_command/write_stdin are the only shell (upstream pi-unified-exec's default). By default runbg keeps bash.",
+			"Force-remove pi's built-in `bash` tool for this run so exec_command/write_stdin are the only shell (upstream pi-unified-exec's default). Persistent equivalent: /runbg replace-bash on. By default runbg keeps bash.",
 		type: "boolean",
 		default: false,
 	});
@@ -1820,68 +2007,108 @@ export default function (pi: ExtensionAPI) {
 		ctx.reaped.clear();
 	});
 
-	// Configuration surface for the extension. `on`/`off` (enable/disable the
-	// session tools) is the first setting; future settings join the same
-	// namespace as further subcommands and extra keys in runbg.json.
+	// Configuration surface for the extension: `/runbg <setting> on|off`, with
+	// bare `/runbg on|off` kept as shorthand for the primary switch.
+	// BOOLEAN_SETTINGS is the grammar — every entry there is automatically
+	// readable, writable, completable and reported by `status`, so a future
+	// setting is one table entry rather than four parallel edits here.
+	const USAGE = `/runbg on|off | ${BOOLEAN_SETTINGS.filter((s) => s.offerCompletions)
+		.map((s) => `${s.name} on|off`)
+		.join(" | ")} | status`;
 	pi.registerCommand("runbg", {
-		description: "Configure runbg — on|off enables/disables the session tools (persisted; default off), status shows the current state",
+		description:
+			"Configure runbg — on|off enables/disables the session tools (persisted; default off), replace-bash on|off removes/keeps pi's built-in bash, status shows the current state",
 		getArgumentCompletions: (prefix: string) => {
+			// pi replaces the ENTIRE argument text with the chosen `value`
+			// (CombinedAutocompleteProvider.applyCompletion substitutes the
+			// prefix it handed us), so every value must be a complete argument
+			// string: returning a bare "on" for the prefix "replace-bash "
+			// would rewrite the line to "/runbg on".
 			const needle = prefix.trim().toLowerCase();
 			const items = [
 				{ value: "on", label: "on", description: "Enable the session tools (persists across sessions)" },
 				{ value: "off", label: "off", description: "Disable the session tools (persists; running sessions keep running)" },
 				{ value: "status", label: "status", description: "Show the current state" },
+				...BOOLEAN_SETTINGS.filter((setting) => setting.offerCompletions).flatMap((setting) => [
+					{ value: `${setting.name} on`, label: `${setting.name} on`, description: setting.onHint },
+					{ value: `${setting.name} off`, label: `${setting.name} off`, description: setting.offHint },
+				]),
 			].filter((item) => item.value.startsWith(needle));
 			return items.length ? items : null;
 		},
 		handler: async (args, cmdCtx) => {
 			ctx.ui = cmdCtx.ui;
 			const notify = (message: string, type: "info" | "warning" = "info") => cmdCtx.ui?.notify(message, type);
-			const sub = args.trim().toLowerCase();
+			const tokens = args.trim().toLowerCase().split(/\s+/).filter(Boolean);
 			const settings = readRunbgSettings();
 			const live = runningSessions(ctx).length;
-			switch (sub) {
-				case "on":
-				case "enable": {
-					const already = settings.enabled;
-					if (!already) {
-						writeRunbgSettings({ ...settings, enabled: true });
-					}
-					// Unconditionally: another pi process may have flipped the
-					// file while this session's tools are still in the old state.
-					applySessionToolPolicy(ctx, pi);
-					notify(
-						already
-							? "runbg: already enabled — tool state re-applied for this session"
-							: "runbg: session tools enabled (persists across sessions) — disable with /runbg off",
-					);
-					return;
+			const before = replaceBuiltinBashRequest(pi, settings);
+			// "Bash removal was in force" — the only state from which a user can
+			// reasonably expect `bash` back when they turn replacement off.
+			const wasReplacing = settings.enabled && before.effective;
+
+			/** Persist one setting, re-apply the tool policy, report honestly. */
+			const write = (setting: BooleanSetting, value: boolean): void => {
+				const already = settings[setting.key] === value;
+				if (!already) {
+					const next: RunbgSettings = { ...settings };
+					next[setting.key] = value;
+					writeRunbgSettings(next);
 				}
-				case "off":
-				case "disable": {
-					const already = !settings.enabled;
-					if (!already) {
-						writeRunbgSettings({ ...settings, enabled: false });
-					}
-					applySessionToolPolicy(ctx, pi);
-					notify(
-						already
-							? "runbg: already disabled — tool state re-applied for this session"
-							: `runbg: session tools disabled (persists)${live ? ` — ${live} live session(s) keep running; /runbg-sessions to manage them` : ""}`,
-						!already && live ? "warning" : "info",
-					);
-					return;
-				}
-				case "":
-				case "status": {
-					notify(
-						`runbg: ${settings.enabled ? "enabled" : "disabled"}${live ? ` — ${live} live session(s)` : ""} — /runbg on|off to change (settings: ${runbgSettingsPath()})`,
-					);
-					return;
-				}
-				default:
-					notify(`runbg: unknown setting "${sub}" — usage: /runbg on|off|status`, "warning");
+				// Unconditionally: another pi process may have flipped the file
+				// while this session's tools are still in the old state.
+				applySessionToolPolicy(ctx, pi);
+				const after = readRunbgSettings();
+				const replaceAfter = replaceBuiltinBashRequest(pi, after);
+				const { message, type } = setting.notice(value, {
+					already,
+					live,
+					enabled: after.enabled,
+					flagForced: replaceAfter.fromFlag,
+					// Active tools are sampled AFTER the policy ran, so this
+					// reflects what the latch actually managed to restore.
+					bashRestorePending:
+						wasReplacing &&
+						!(after.enabled && replaceAfter.effective) &&
+						!pi.getActiveTools().includes("bash"),
+				});
+				notify(message, type);
+			};
+
+			const [first, second] = tokens;
+			if (tokens.length === 0 || first === "status") {
+				// The primary switch is the leading word; every other setting in
+				// the table reports itself, so a new one needs no edit here.
+				const others = BOOLEAN_SETTINGS.filter((s) => s !== ENABLED_SETTING)
+					.map((s) => `${s.name}: ${settingLabel(s, pi, settings)}`)
+					.join(", ");
+				notify(
+					`runbg: ${settings.enabled ? "enabled" : "disabled"}${live ? ` — ${live} live session(s)` : ""}` +
+						(others ? ` — ${others}` : "") +
+						` — ${USAGE} (settings: ${runbgSettingsPath()})`,
+				);
+				return;
 			}
+			// Bare `on|off` is the primary switch's shorthand.
+			if (tokens.length === 1 && BOOLEAN_WORDS[first] !== undefined) {
+				write(ENABLED_SETTING, BOOLEAN_WORDS[first] === true);
+				return;
+			}
+			const setting = findBooleanSetting(first);
+			if (!setting) {
+				notify(`runbg: unknown setting "${tokens.join(" ")}" — usage: ${USAGE}`, "warning");
+				return;
+			}
+			if (tokens.length === 1) {
+				notify(`runbg: ${setting.name} is ${settingLabel(setting, pi, settings)} — /runbg ${setting.name} on|off to change`);
+				return;
+			}
+			const value = BOOLEAN_WORDS[second];
+			if (value === undefined || tokens.length > 2) {
+				notify(`runbg: ${setting.name} takes on|off, not "${tokens.slice(1).join(" ")}"`, "warning");
+				return;
+			}
+			write(setting, value);
 		},
 	});
 

@@ -212,8 +212,10 @@ entry, a README note, and a line in `UPSTREAM.md` (§10). Never silent.
    the whole §14 gating model — opencode templates that never mention session
    tools would be left with *no shell at all* — and would silently bypass the
    user-side `bash-guard` extension. Flip the default; offer
-   `--replace-builtin-bash` for codex-parity setups. This change alone
-   justifies forking over pinning (upstream accepts no PRs).
+   `/runbg replace-bash on` (persisted, off by default) — plus
+   `--replace-builtin-bash` as a one-invocation force-on — for codex-parity
+   setups. This change alone justifies forking over pinning (upstream accepts
+   no PRs).
 2. **Best-effort crash cleanup.** Register a `process.on("exit")` handler (at
    `session_start`, per the factory constraint) that synchronously
    group-kills live sessions. Covers `uncaughtException`/EIO exits that skip
@@ -360,7 +362,13 @@ description broke frontmatter parsing entirely, hiding the template from
   flips them via `pi.setActiveTools()`, persisted in `<agentDir>/runbg.json`
   (a settings namespace for future runbg options — unknown keys preserved).
   The human pairs `/runbg on` with `/sysprompt codex-pi` by hand — no
-  extension reads another's state. *Automatic* template-frontmatter gating
+  extension reads another's state. `/runbg` grew into the general settings
+  command that namespace anticipated: a declarative table of boolean settings
+  drives its grammar (`/runbg <setting> on|off`, plus bare `/runbg on|off`
+  for the primary switch), its argument completions, and its status line, so
+  divergence #1's bash replacement is a peer setting (`replace-bash`, off by
+  default) rather than a startup-only flag. Adding a setting is one table
+  entry. *Automatic* template-frontmatter gating
   (`before_agent_start` reads `sysprompt.json` → a re-added `bg:` marker)
   remains designed-but-deferred; verified feasible (precedents: `zz-read-only-mode`
   setActiveTools save/restore; `advisor` reads others' config files;

@@ -209,17 +209,173 @@ describe("/runbg settings command", () => {
 		await h.shutdown();
 	});
 
-	it("offers on/off/status argument completions", () => {
+	it("offers on/off/status plus every completable setting", () => {
 		const h = makeHarness(["bash"]);
 		const complete = h.commands.runbg.getArgumentCompletions!;
 		assert.deepEqual(
 			complete("").map((i: any) => i.value),
-			["on", "off", "status"],
+			["on", "off", "status", "replace-bash on", "replace-bash off"],
 		);
 		assert.deepEqual(
 			complete("o").map((i: any) => i.value),
 			["on", "off"],
 		);
 		assert.equal(complete("x"), null);
+	});
+
+	it("completion values are whole arguments (pi replaces the entire prefix)", () => {
+		// CombinedAutocompleteProvider.applyCompletion substitutes the argument
+		// text it passed in, so a bare "on" here would rewrite the user's
+		// "/runbg replace-bash " to "/runbg on" — the wrong setting.
+		const h = makeHarness(["bash"]);
+		const complete = h.commands.runbg.getArgumentCompletions!;
+		for (const prefix of ["replace", "replace-bash", "replace-bash "]) {
+			assert.deepEqual(
+				complete(prefix).map((i: any) => i.value),
+				["replace-bash on", "replace-bash off"],
+				`prefix ${JSON.stringify(prefix)}`,
+			);
+		}
+		assert.deepEqual(
+			complete("replace-bash o").map((i: any) => i.value),
+			["replace-bash on", "replace-bash off"],
+		);
+	});
+});
+
+describe("/runbg replace-bash setting (divergence #1 without the startup flag)", () => {
+	it("off by default: enabling runbg alone keeps pi's bash", async () => {
+		const h = makeHarness(["bash", "read", ...RUNBG_TOOLS]);
+		await h.emit("session_start");
+		await h.invokeCommand("runbg", "on");
+		assert.ok(h.activeTools().includes("bash"), "bash must survive a plain /runbg on");
+		assert.equal(JSON.parse(readFileSync(SETTINGS, "utf8")).replaceBuiltinBash, false);
+		await h.shutdown();
+	});
+
+	it("toggles bash removal mid-session and persists both directions", async () => {
+		const h = makeHarness(["bash", "read", ...RUNBG_TOOLS]);
+		await h.emit("session_start");
+		await h.invokeCommand("runbg", "on");
+
+		await h.invokeCommand("runbg", "replace-bash on");
+		assert.ok(!h.activeTools().includes("bash"), "replace-bash on must remove bash");
+		assert.ok(h.activeTools().includes("exec_command"), "the session shell must stay");
+		assert.ok(h.activeTools().includes("read"), "unrelated tools are untouched");
+		assert.equal(JSON.parse(readFileSync(SETTINGS, "utf8")).replaceBuiltinBash, true);
+		assert.ok(h.notifications.at(-1)?.message.includes("replace-bash on"), JSON.stringify(h.notifications.at(-1)));
+
+		await h.invokeCommand("runbg", "replace-bash off");
+		assert.ok(h.activeTools().includes("bash"), "replace-bash off must restore the bash we removed");
+		assert.equal(JSON.parse(readFileSync(SETTINGS, "utf8")).replaceBuiltinBash, false);
+		assert.ok(h.notifications.at(-1)?.message.includes("replace-bash off"));
+		await h.shutdown();
+	});
+
+	it("applies a persisted replace-bash at session_start, with no flag involved", async () => {
+		writeFileSync(SETTINGS, JSON.stringify({ enabled: true, replaceBuiltinBash: true }));
+		const h = makeHarness(["bash", "read"]);
+		await h.emit("session_start");
+		assert.ok(!h.activeTools().includes("bash"));
+		assert.ok(h.activeTools().includes("exec_command"));
+		await h.shutdown();
+	});
+
+	it("is inert while runbg is disabled, and takes effect on the later /runbg on", async () => {
+		const h = makeHarness(["bash", "read", ...RUNBG_TOOLS]);
+		await h.emit("session_start");
+		await h.invokeCommand("runbg", "replace-bash on");
+		assert.ok(h.activeTools().includes("bash"), "a dormant runbg must never leave pi shell-less");
+		assert.ok(h.notifications.at(-1)?.message.includes("inert until /runbg on"), JSON.stringify(h.notifications.at(-1)));
+
+		await h.invokeCommand("runbg", "on");
+		assert.ok(!h.activeTools().includes("bash"), "enabling now applies the stored setting");
+		// ...and disabling runbg gives the shell back even though the setting stays on.
+		await h.invokeCommand("runbg", "off");
+		assert.ok(h.activeTools().includes("bash"));
+		assert.equal(JSON.parse(readFileSync(SETTINGS, "utf8")).replaceBuiltinBash, true);
+		await h.shutdown();
+	});
+
+	it("warns that --replace-builtin-bash overrules a saved off", async () => {
+		writeFileSync(SETTINGS, JSON.stringify({ enabled: true, replaceBuiltinBash: true }));
+		const h = makeHarness(["bash", "read", ...RUNBG_TOOLS], { flags: { "replace-builtin-bash": true } });
+		await h.emit("session_start");
+		assert.ok(!h.activeTools().includes("bash"));
+
+		await h.invokeCommand("runbg", "replace-bash off");
+		const last = h.notifications.at(-1)!;
+		assert.equal(last.type, "warning", JSON.stringify(last));
+		assert.ok(last.message.includes("--replace-builtin-bash"), last.message);
+		assert.ok(!h.activeTools().includes("bash"), "the flag still forces removal");
+		assert.equal(JSON.parse(readFileSync(SETTINGS, "utf8")).replaceBuiltinBash, false, "the setting is still saved");
+		await h.shutdown();
+	});
+
+	it("accepts the long alias, reports a bare setting name, and rejects a bad value", async () => {
+		const h = makeHarness(["bash", ...RUNBG_TOOLS]);
+		await h.emit("session_start");
+
+		await h.invokeCommand("runbg", "replace-builtin-bash on");
+		assert.equal(JSON.parse(readFileSync(SETTINGS, "utf8")).replaceBuiltinBash, true, "alias must write the same key");
+
+		await h.invokeCommand("runbg", "replace-bash");
+		assert.ok(h.notifications.at(-1)?.message.includes("replace-bash is on"), JSON.stringify(h.notifications.at(-1)));
+
+		await h.invokeCommand("runbg", "replace-bash yes");
+		const bad = h.notifications.at(-1)!;
+		assert.equal(bad.type, "warning");
+		assert.ok(bad.message.includes("takes on|off"), bad.message);
+		assert.equal(JSON.parse(readFileSync(SETTINGS, "utf8")).replaceBuiltinBash, true, "a bad value must not write");
+		await h.shutdown();
+	});
+
+	it("status reports the setting, and names the flag when it is the reason", async () => {
+		writeFileSync(SETTINGS, JSON.stringify({ enabled: true, replaceBuiltinBash: true }));
+		const plain = makeHarness(["bash", ...RUNBG_TOOLS]);
+		await plain.emit("session_start");
+		await plain.invokeCommand("runbg", "status");
+		assert.ok(plain.notifications.at(-1)?.message.includes("replace-bash: on"), JSON.stringify(plain.notifications.at(-1)));
+		assert.ok(!plain.notifications.at(-1)!.message.includes("--replace-builtin-bash"));
+		await plain.shutdown();
+
+		writeFileSync(SETTINGS, JSON.stringify({ enabled: false, replaceBuiltinBash: false }));
+		const flagged = makeHarness(["bash", ...RUNBG_TOOLS], { flags: { "replace-builtin-bash": true } });
+		await flagged.emit("session_start");
+		await flagged.invokeCommand("runbg", "status");
+		const message = flagged.notifications.at(-1)!.message;
+		assert.ok(message.includes("replace-bash: on (--replace-builtin-bash)"), message);
+		assert.ok(message.includes("inert while disabled"), message);
+
+		// The single-setting report must tell the same truth as `status`: the
+		// stored value alone would claim "off" while bash is actually gone.
+		await flagged.invokeCommand("runbg", "replace-bash");
+		const single = flagged.notifications.at(-1)!.message;
+		assert.ok(single.includes("replace-bash is on (--replace-builtin-bash)"), single);
+		await flagged.shutdown();
+	});
+
+	it("keeps bash when the session shell it would trade for is not active", async () => {
+		// exec_command is owned by another package's registration and inactive,
+		// so gating leaves it alone — removing bash too would leave no shell.
+		const foreign = { path: "/home/u/.pi/agent/node_modules/pi-unified-exec/src/index.ts" };
+		writeFileSync(SETTINGS, JSON.stringify({ enabled: true, replaceBuiltinBash: true }));
+		const h = makeHarness(["bash", "read"], { allTools: [{ name: "exec_command", sourceInfo: foreign }] });
+		await h.emit("session_start");
+		assert.ok(!h.activeTools().includes("exec_command"), "foreign-won name must not be activated by us");
+		assert.ok(h.activeTools().includes("bash"), "never leave pi shell-less");
+		await h.shutdown();
+	});
+
+	it("says so when it cannot restore a bash it has no record of removing", async () => {
+		// Mirrors a /reload: the setting is on and bash is already absent, so
+		// the latch never fires and `off` cannot honestly restore anything.
+		writeFileSync(SETTINGS, JSON.stringify({ enabled: true, replaceBuiltinBash: true }));
+		const h = makeHarness(["read", ...RUNBG_TOOLS]);
+		await h.emit("session_start");
+		await h.invokeCommand("runbg", "replace-bash off");
+		assert.ok(!h.activeTools().includes("bash"), "still never resurrects a bash it did not remove");
+		assert.ok(h.notifications.at(-1)?.message.includes("no record of removing it"), JSON.stringify(h.notifications.at(-1)));
+		await h.shutdown();
 	});
 });

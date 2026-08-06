@@ -15,8 +15,8 @@ pi-flavor additions (`set_on_exit`, `kill_session`, `list_sessions`).
 > env vars, log prefix, and slash command are renamed to `runbg`.
 > Deliberate behavior divergences are documented in
 > [UPSTREAM.md](./UPSTREAM.md) — the headline one: **pi's built-in `bash`
-> tool is kept by default** (upstream removes it); pass
-> `--replace-builtin-bash` for upstream's codex-parity behavior.
+> tool is kept by default** (upstream removes it); `/runbg replace-bash on`
+> opts into upstream's codex-parity behavior.
 > Design rationale lives in [docs/design.md](./docs/design.md).
 > Do not install this alongside `pi-unified-exec` — both register the same
 > tool names.
@@ -343,17 +343,21 @@ without an extra probing call.
   dormant** (divergence #5 in [UPSTREAM.md](./UPSTREAM.md)): install
   globally, then `/runbg on` activates `exec_command` & friends, `/runbg off`
   puts them back to sleep (running sessions keep running), `/runbg status`
-  (or no argument) reports the current state. The choice persists across
-  sessions in `~/.pi/agent/runbg.json` — that file is the namespace for any
-  future runbg settings, and unknown keys in it are preserved. Pairs
-  naturally with `/sysprompt`: enable runbg when you switch to a template
-  that teaches the session tools, disable it when you switch away.
+  (or no argument) reports every setting. The choices persist across sessions
+  in `~/.pi/agent/runbg.json` — that file is the namespace for runbg
+  settings, and unknown keys in it are preserved. Pairs naturally with
+  `/sysprompt`: enable runbg when you switch to a template that teaches the
+  session tools, disable it when you switch away.
+  - Settings: `/runbg on|off` is the primary switch (shorthand for
+    `/runbg enabled on|off`); `/runbg replace-bash on|off` removes or keeps
+    pi's built-in `bash` (see below; off by default). Every setting also
+    answers `/runbg <setting>` on its own to report just that value.
 - `/runbg-sessions` — human-facing escape hatch: lists live sessions in
   a selector (armed wakes show `[wake]`) and kills the chosen one (or all of
   them) without going through the model. Uses the same SIGTERM → 2s → SIGKILL
   escalation as `kill_session`. Works even while the tools are disabled.
 
-## Flag
+## Replacing pi's built-in `bash`
 
 By default, this extension **keeps pi's built-in `bash` tool** alongside the
 session tools — quick one-shot commands stay on `bash`, long-lived or
@@ -361,13 +365,26 @@ interactive work goes through `exec_command` / `write_stdin`. (This inverts
 the upstream default — divergence #1 in [UPSTREAM.md](./UPSTREAM.md):
 prompts and guard extensions that only know `bash` must keep working.)
 
-- `--replace-builtin-bash` — remove the built-in `bash` so the session tools
-  are the only shell (upstream pi-unified-exec's default, codex parity). Use
-  with prompts written for codex's `unified_exec`-only surface. Only acts
-  while runbg is enabled, and is applied at session start *and* on every
-  `/runbg on|off`: disabling restores `bash` — but only if runbg was the one
-  that removed it (it never resurrects a `bash` you disabled yourself). A
-  dormant runbg never leaves pi without a shell.
+- `/runbg replace-bash on|off` — **off by default.** `on` removes the
+  built-in `bash` so the session tools are the only shell (upstream
+  pi-unified-exec's default, codex parity). Use it with prompts written for
+  codex's `unified_exec`-only surface. Persisted in `runbg.json` and
+  toggleable mid-session, so you can flip it in the same breath as
+  `/sysprompt`.
+- `--replace-builtin-bash` — the same thing for **one invocation**, for
+  codex-parity wrapper scripts that would rather not leave state in the agent
+  dir. It can only force the behavior *on*: pi reports a boolean flag's
+  default for "absent", so `--replace-builtin-bash=false` and "not passed"
+  are indistinguishable, and the flag therefore never turns a saved `on`
+  off. `/runbg status` names the flag whenever it — rather than your
+  setting — is the reason `bash` is gone.
+
+Either way removal only acts **while runbg is enabled**, and is applied at
+session start *and* on every `/runbg` write: turning it off restores `bash` —
+but only if runbg was the one that removed it (it never resurrects a `bash`
+you disabled yourself, and it tells you when it is declining to). A dormant
+runbg never leaves pi without a shell, and neither does a setup where the
+session tools failed to activate.
 
 At session start the extension also warns if it detects the upstream
 `pi-unified-exec` package installed alongside — both register the same five
