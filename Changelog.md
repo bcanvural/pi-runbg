@@ -30,6 +30,13 @@ its names.
 
 ### Added
 
+- **`/runbg` settings command; the session tools ship dormant** (divergence
+  #5, `UPSTREAM.md`): after install, `exec_command` & friends stay out of the
+  active tool set until `/runbg on` (persisted in `<agentDir>/runbg.json`;
+  `/runbg off` re-sleeps them without killing running sessions; `/runbg
+  status` reports state). The settings file is a namespace for future runbg
+  settings — unknown keys survive round-trips. `--replace-builtin-bash` only
+  acts while enabled, so a dormant runbg never leaves pi without a shell.
 - **Log archive safety** (divergence #3, `UPSTREAM.md`, adopting upstream's
   IV-0002 backlog; new `src/log-archive.ts`): session logs are created
   exclusively (`O_EXCL`, collision-retried) with `0600` permissions, so a

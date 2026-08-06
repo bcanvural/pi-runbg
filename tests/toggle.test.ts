@@ -1,0 +1,166 @@
+/**
+ * Divergence #5 (UPSTREAM.md, design §14): the session tools ship dormant and
+ * `/runbg` is the extension's settings command — `on`/`off` (persisted in
+ * <agentDir>/runbg.json) is the first setting; the file is a namespace, so
+ * unknown keys must survive round-trips.
+ *
+ * The whole file pins PI_CODING_AGENT_DIR to a temp dir: settings reads must
+ * never depend on the developer's real ~/.pi/agent/runbg.json.
+ */
+
+import { strict as assert } from "node:assert";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { after, beforeEach, describe, it } from "node:test";
+import extensionFactory from "../src/index.ts";
+
+const AGENT_DIR = mkdtempSync(join(tmpdir(), "runbg-agent-"));
+const SETTINGS = join(AGENT_DIR, "runbg.json");
+const PREV_ENV = process.env.PI_CODING_AGENT_DIR;
+process.env.PI_CODING_AGENT_DIR = AGENT_DIR;
+after(() => {
+	if (PREV_ENV === undefined) delete process.env.PI_CODING_AGENT_DIR;
+	else process.env.PI_CODING_AGENT_DIR = PREV_ENV;
+});
+beforeEach(() => {
+	rmSync(SETTINGS, { force: true });
+});
+
+const RUNBG_TOOLS = ["exec_command", "write_stdin", "set_on_exit", "kill_session", "list_sessions"];
+
+function makeHarness(initialActive: string[]) {
+	const handlers: Record<string, Array<(event: any, ctx: any) => any>> = {};
+	const commands: Record<string, { description?: string; getArgumentCompletions?: (p: string) => any; handler: (args: string, ctx: any) => Promise<void> }> = {};
+	const notifications: Array<{ message: string; type?: string }> = [];
+	const setActiveToolsCalls: string[][] = [];
+	let active = [...initialActive];
+	const stubCtx = {
+		cwd: process.cwd(),
+		ui: { notify: (message: string, type?: string) => notifications.push({ message, type }), setStatus: () => {}, setWidget: () => {} },
+		hasUI: false,
+	};
+	const pi: any = {
+		registerTool: () => {},
+		on: (event: string, handler: (e: any, ctx: any) => any) => {
+			(handlers[event] ??= []).push(handler);
+		},
+		registerCommand: (name: string, def: any) => {
+			commands[name] = def;
+		},
+		registerShortcut: () => {},
+		registerFlag: () => {},
+		registerMessageRenderer: () => {},
+		getFlag: () => false,
+		getActiveTools: () => [...active],
+		setActiveTools: (names: string[]) => {
+			setActiveToolsCalls.push([...names]);
+			active = [...names];
+		},
+		sendMessage: () => {},
+	};
+	(extensionFactory as any)(pi);
+	return {
+		commands,
+		notifications,
+		setActiveToolsCalls,
+		activeTools: () => [...active],
+		async emit(event: string, evt: any = {}) {
+			for (const h of handlers[event] ?? []) await h(evt, stubCtx);
+		},
+		async invokeCommand(name: string, args = "") {
+			return commands[name].handler(args, stubCtx);
+		},
+		async shutdown() {
+			await this.emit("session_shutdown");
+		},
+	};
+}
+
+describe("/runbg settings command", () => {
+	it("ships dormant: session_start deactivates the session tools when no settings exist", async () => {
+		const h = makeHarness(["bash", "read", ...RUNBG_TOOLS]);
+		await h.emit("session_start");
+		for (const name of RUNBG_TOOLS) assert.ok(!h.activeTools().includes(name), `${name} must be inactive`);
+		assert.ok(h.activeTools().includes("bash"), "bash stays");
+		await h.shutdown();
+	});
+
+	it("stays active at session_start when settings say enabled", async () => {
+		writeFileSync(SETTINGS, JSON.stringify({ enabled: true }));
+		const h = makeHarness(["bash", "read"]);
+		await h.emit("session_start");
+		for (const name of RUNBG_TOOLS) assert.ok(h.activeTools().includes(name), `${name} must be active`);
+		await h.shutdown();
+	});
+
+	it("treats a corrupt settings file as disabled", async () => {
+		writeFileSync(SETTINGS, "{not json");
+		const h = makeHarness(["bash", ...RUNBG_TOOLS]);
+		await h.emit("session_start");
+		assert.ok(!h.activeTools().includes("exec_command"));
+		await h.shutdown();
+	});
+
+	it("/runbg on activates the tools and persists; /runbg off reverses both", async () => {
+		const h = makeHarness(["bash", "read", ...RUNBG_TOOLS]);
+		await h.emit("session_start");
+		assert.ok(!h.activeTools().includes("exec_command"));
+
+		await h.invokeCommand("runbg", "on");
+		assert.ok(h.activeTools().includes("exec_command"), "on must activate");
+		assert.equal(JSON.parse(readFileSync(SETTINGS, "utf8")).enabled, true);
+		assert.ok(h.notifications.at(-1)?.message.includes("enabled"), JSON.stringify(h.notifications));
+
+		await h.invokeCommand("runbg", "off");
+		assert.ok(!h.activeTools().includes("exec_command"), "off must deactivate");
+		assert.equal(JSON.parse(readFileSync(SETTINGS, "utf8")).enabled, false);
+		assert.ok(h.notifications.at(-1)?.message.includes("disabled"));
+
+		await h.invokeCommand("runbg", "on"); // idempotence messages
+		await h.invokeCommand("runbg", "on");
+		assert.ok(h.notifications.at(-1)?.message.includes("already enabled"));
+		await h.shutdown();
+	});
+
+	it("preserves unknown settings keys across writes (settings file is a namespace)", async () => {
+		writeFileSync(SETTINGS, JSON.stringify({ enabled: false, future_setting: 42 }));
+		const h = makeHarness(["bash", ...RUNBG_TOOLS]);
+		await h.emit("session_start");
+		await h.invokeCommand("runbg", "on");
+		const parsed = JSON.parse(readFileSync(SETTINGS, "utf8"));
+		assert.equal(parsed.enabled, true);
+		assert.equal(parsed.future_setting, 42, "unknown keys must survive round-trips");
+		await h.shutdown();
+	});
+
+	it("status and no-arg report state without changing it; unknown args warn", async () => {
+		const h = makeHarness(["bash", ...RUNBG_TOOLS]);
+		await h.emit("session_start");
+		await h.invokeCommand("runbg", "status");
+		assert.ok(h.notifications.at(-1)?.message.includes("disabled"));
+		await h.invokeCommand("runbg", "");
+		assert.ok(h.notifications.at(-1)?.message.includes("disabled"));
+		assert.ok(!h.activeTools().includes("exec_command"), "status must not enable");
+
+		await h.invokeCommand("runbg", "bogus");
+		const last = h.notifications.at(-1)!;
+		assert.equal(last.type, "warning");
+		assert.ok(last.message.includes("unknown setting"));
+		await h.shutdown();
+	});
+
+	it("offers on/off/status argument completions", () => {
+		const h = makeHarness(["bash"]);
+		const complete = h.commands.runbg.getArgumentCompletions!;
+		assert.deepEqual(
+			complete("").map((i: any) => i.value),
+			["on", "off", "status"],
+		);
+		assert.deepEqual(
+			complete("o").map((i: any) => i.value),
+			["on", "off"],
+		);
+		assert.equal(complete("x"), null);
+	});
+});

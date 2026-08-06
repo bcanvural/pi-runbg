@@ -92,9 +92,11 @@ To try without installing:
 pi -e ./path/to/pi-runbg
 ```
 
-Reload a running pi with `/reload`. If `pi-unified-exec` is also installed,
-remove it first (duplicate tool names); runbg warns at startup if it detects
-the upstream package alongside itself.
+Reload a running pi with `/reload`. **After installing, the session tools are
+dormant — run `/runbg on` to activate them** (persists; see Commands below).
+If `pi-unified-exec` is also installed, remove it first (duplicate tool
+names); runbg warns at startup if it detects the upstream package alongside
+itself.
 
 ## Tools
 
@@ -333,12 +335,21 @@ The response also carries **`tool_time_utc`** (text trailer + details) so the
 model can compute a `yield_until` deadline from the trustworthy host clock
 without an extra probing call.
 
-## Command
+## Commands
 
+- `/runbg` — the extension's settings command. **The session tools ship
+  dormant** (divergence #5 in [UPSTREAM.md](./UPSTREAM.md)): install
+  globally, then `/runbg on` activates `exec_command` & friends, `/runbg off`
+  puts them back to sleep (running sessions keep running), `/runbg status`
+  (or no argument) reports the current state. The choice persists across
+  sessions in `~/.pi/agent/runbg.json` — that file is the namespace for any
+  future runbg settings, and unknown keys in it are preserved. Pairs
+  naturally with `/sysprompt`: enable runbg when you switch to a template
+  that teaches the session tools, disable it when you switch away.
 - `/runbg-sessions` — human-facing escape hatch: lists live sessions in
   a selector (armed wakes show `[wake]`) and kills the chosen one (or all of
   them) without going through the model. Uses the same SIGTERM → 2s → SIGKILL
-  escalation as `kill_session`.
+  escalation as `kill_session`. Works even while the tools are disabled.
 
 ## Flag
 
@@ -351,7 +362,8 @@ prompts and guard extensions that only know `bash` must keep working.)
 - `--replace-builtin-bash` — remove the built-in `bash` at session start so
   the session tools are the only shell (upstream pi-unified-exec's default,
   codex parity). Use with prompts written for codex's `unified_exec`-only
-  surface.
+  surface. Only acts while runbg is enabled (`/runbg on`) — a dormant runbg
+  never leaves pi without a shell.
 
 At session start the extension also warns if it detects the upstream
 `pi-unified-exec` package installed alongside — both register the same five

@@ -23,8 +23,10 @@
  *     / 2000 lines per call and the full file is available via `read`.
  */
 
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { constants as osConstants } from "node:os";
-import { type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { dirname, join } from "node:path";
+import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Type, type TUnsafe } from "typebox";
 
 import type { CollectResult } from "./collect.ts";
@@ -259,6 +261,64 @@ function warnIfUpstreamPackagePresent(ctx: ExtensionCtx, pi: ExtensionAPI): void
 		`runbg: pi-unified-exec is also installed and registers ${foreign.length} of the same tool name(s) — uninstall one of the two packages.`,
 		"warning",
 	);
+}
+
+// ---------------- Settings (/runbg command) ----------------
+
+/**
+ * Divergence #5 (UPSTREAM.md, design §14): the session tools ship dormant.
+ * `/runbg on` activates them (persisted), so the extension can stay
+ * installed globally while prompts that don't know the tools never see
+ * them. Settings live in `<agentDir>/runbg.json` — the file is the
+ * namespace for future extension settings, so unknown keys are preserved
+ * verbatim on every write.
+ */
+interface RunbgSettings {
+	enabled: boolean;
+	[key: string]: unknown;
+}
+
+const SETTINGS_FILE_NAME = "runbg.json";
+
+export function runbgSettingsPath(): string {
+	return join(getAgentDir(), SETTINGS_FILE_NAME);
+}
+
+export function readRunbgSettings(): RunbgSettings {
+	try {
+		const raw: unknown = JSON.parse(readFileSync(runbgSettingsPath(), "utf8"));
+		if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+			return { ...(raw as Record<string, unknown>), enabled: (raw as Record<string, unknown>).enabled === true };
+		}
+	} catch {
+		// missing or corrupt file → defaults
+	}
+	return { enabled: false };
+}
+
+function writeRunbgSettings(settings: RunbgSettings): void {
+	const path = runbgSettingsPath();
+	mkdirSync(dirname(path), { recursive: true });
+	// Atomic replace (tmp + rename), matching the sysprompt.json convention.
+	const tmp = `${path}.tmp-${process.pid}`;
+	writeFileSync(tmp, `${JSON.stringify(settings, null, "\t")}\n`);
+	renameSync(tmp, path);
+}
+
+/**
+ * Activate or deactivate the five session tools. Registration is
+ * unconditional (pi needs the definitions for renderers and resume), only
+ * membership in the active set changes; `setActiveTools` is called only
+ * when that membership actually changes.
+ */
+function applyToolGating(pi: ExtensionAPI, enabled: boolean): void {
+	const active = pi.getActiveTools();
+	const target = enabled
+		? [...active, ...RUNBG_TOOL_NAMES.filter((name) => !active.includes(name))]
+		: active.filter((name) => !RUNBG_TOOL_NAMES.includes(name));
+	if (target.length !== active.length) {
+		pi.setActiveTools(target);
+	}
 }
 
 type ExecCommandArgs = {
@@ -1106,11 +1166,17 @@ export default function (pi: ExtensionAPI) {
 		ctx.shuttingDown = false; // reload/new/resume re-arms the extension
 		ctx.coordinator.reset(); // never resurrect wakes from a previous session
 		updateRunningSessionsUi(ctx);
+		// Tool gating (divergence #5): the session tools are dormant unless
+		// /runbg enabled them (persisted in runbg.json).
+		const enabled = readRunbgSettings().enabled;
+		applyToolGating(pi, enabled);
 		// Built-in `bash` stays available by default (divergence #1,
-		// UPSTREAM.md). Only --replace-builtin-bash removes it. Flag lookup
-		// uses the registered name without leading dashes.
+		// UPSTREAM.md). Only --replace-builtin-bash removes it — and only
+		// while runbg is enabled: a dormant runbg must never leave pi
+		// without any shell at all. Flag lookup uses the registered name
+		// without leading dashes.
 		const replace = pi.getFlag("replace-builtin-bash") ?? pi.getFlag("--replace-builtin-bash");
-		if (replace === true) {
+		if (enabled && replace === true) {
 			const active = pi.getActiveTools();
 			const filtered = active.filter((name) => name !== "bash");
 			if (filtered.length !== active.length) {
@@ -1189,6 +1255,65 @@ export default function (pi: ExtensionAPI) {
 			process.removeListener("exit", ctx.processExitHandler);
 			ctx.processExitHandler = undefined;
 		}
+	});
+
+	// Configuration surface for the extension. `on`/`off` (enable/disable the
+	// session tools) is the first setting; future settings join the same
+	// namespace as further subcommands and extra keys in runbg.json.
+	pi.registerCommand("runbg", {
+		description: "Configure runbg — on|off enables/disables the session tools (persisted; default off), status shows the current state",
+		getArgumentCompletions: (prefix: string) => {
+			const needle = prefix.trim().toLowerCase();
+			const items = [
+				{ value: "on", label: "on", description: "Enable the session tools (persists across sessions)" },
+				{ value: "off", label: "off", description: "Disable the session tools (persists; running sessions keep running)" },
+				{ value: "status", label: "status", description: "Show the current state" },
+			].filter((item) => item.value.startsWith(needle));
+			return items.length ? items : null;
+		},
+		handler: async (args, cmdCtx) => {
+			ctx.ui = cmdCtx.ui;
+			const notify = (message: string, type: "info" | "warning" = "info") => cmdCtx.ui?.notify(message, type);
+			const sub = args.trim().toLowerCase();
+			const settings = readRunbgSettings();
+			const live = runningSessions(ctx).length;
+			switch (sub) {
+				case "on":
+				case "enable": {
+					if (settings.enabled) {
+						notify("runbg: already enabled");
+						return;
+					}
+					writeRunbgSettings({ ...settings, enabled: true });
+					applyToolGating(pi, true);
+					notify("runbg: session tools enabled (persists across sessions) — disable with /runbg off");
+					return;
+				}
+				case "off":
+				case "disable": {
+					if (!settings.enabled) {
+						notify("runbg: already disabled");
+						return;
+					}
+					writeRunbgSettings({ ...settings, enabled: false });
+					applyToolGating(pi, false);
+					notify(
+						`runbg: session tools disabled (persists)${live ? ` — ${live} live session(s) keep running; /runbg-sessions to manage them` : ""}`,
+						live ? "warning" : "info",
+					);
+					return;
+				}
+				case "":
+				case "status": {
+					notify(
+						`runbg: ${settings.enabled ? "enabled" : "disabled"}${live ? ` — ${live} live session(s)` : ""} — /runbg on|off to change (settings: ${runbgSettingsPath()})`,
+					);
+					return;
+				}
+				default:
+					notify(`runbg: unknown setting "${sub}" — usage: /runbg on|off|status`, "warning");
+			}
+		},
 	});
 
 	// Human-facing escape hatch: inspect and kill live sessions without going

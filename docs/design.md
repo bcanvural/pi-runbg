@@ -353,15 +353,20 @@ consumed, so **`bg: true` is genuinely inert** (already present in
   is not possible") — with runbg it is wrong and actively fights the tools;
   update the frontmatter description ("bash instead of exec_command" is
   stale once runbg ships).
-- **Future availability gating (if ever needed) stays inside runbg:**
-  `before_agent_start` reads `sysprompt.json` → template frontmatter (`bg:`)
-  and calls `pi.setActiveTools()`. Verified feasible (precedents:
-  `zz-read-only-mode` does setActiveTools with save/restore; `advisor` reads
-  others' config files; `parseFrontmatter` is exported by pi). Recorded
-  caveats: setActiveTools is session-wide, not per-turn → save/restore
-  required; a dangling active-template name must read as `bg: false`; and
-  toggling snippet-bearing tools rebuilds the system prompt and invalidates
-  the provider cache prefix — one more reason gating stays deferred.
+- **Availability gating shipped as a *manual* toggle** (divergence #5,
+  implemented 2026-08-06): the tools are dormant by default; `/runbg on|off`
+  flips them via `pi.setActiveTools()`, persisted in `<agentDir>/runbg.json`
+  (a settings namespace for future runbg options — unknown keys preserved).
+  The human pairs `/runbg on` with `/sysprompt codex-pi` by hand — no
+  extension reads another's state. *Automatic* template-frontmatter gating
+  (`before_agent_start` reads `sysprompt.json` → `bg:` frontmatter) remains
+  designed-but-deferred; verified feasible (precedents: `zz-read-only-mode`
+  setActiveTools save/restore; `advisor` reads others' config files;
+  `parseFrontmatter` exported by pi), with recorded caveats: setActiveTools
+  is session-wide, not per-turn; a dangling active-template name must read
+  as `bg: false`; toggling snippet-bearing tools rebuilds the system prompt
+  and invalidates the provider cache prefix — fine for a manual command,
+  costly if automated per-turn.
 
 Draft "Long-running tasks" section for codex-pi (param names corrected):
 

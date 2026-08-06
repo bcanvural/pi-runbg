@@ -1,13 +1,33 @@
 /**
  * Fork divergence #1 (UPSTREAM.md): pi's built-in `bash` tool stays active by
- * default; --replace-builtin-bash opts into upstream's codex-parity removal.
- * Also covers the startup warning when the upstream package
- * (pi-unified-exec) is installed alongside and registers the same tool names.
+ * default; --replace-builtin-bash opts into upstream's codex-parity removal —
+ * and only while runbg is enabled (divergence #5), so a dormant runbg never
+ * leaves pi without a shell. Also covers the startup warning when the
+ * upstream package (pi-unified-exec) is installed alongside and registers
+ * the same tool names.
+ *
+ * PI_CODING_AGENT_DIR is pinned to a temp dir so the developer's real
+ * runbg.json can never leak into assertions.
  */
 
 import { strict as assert } from "node:assert";
-import { describe, it } from "node:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { after, beforeEach, describe, it } from "node:test";
 import extensionFactory from "../src/index.ts";
+
+const AGENT_DIR = mkdtempSync(join(tmpdir(), "runbg-agent-"));
+const SETTINGS = join(AGENT_DIR, "runbg.json");
+const PREV_ENV = process.env.PI_CODING_AGENT_DIR;
+process.env.PI_CODING_AGENT_DIR = AGENT_DIR;
+after(() => {
+	if (PREV_ENV === undefined) delete process.env.PI_CODING_AGENT_DIR;
+	else process.env.PI_CODING_AGENT_DIR = PREV_ENV;
+});
+beforeEach(() => {
+	rmSync(SETTINGS, { force: true });
+});
 
 function makeHarness(
 	opts: {
@@ -20,6 +40,7 @@ function makeHarness(
 	const registeredFlags: Record<string, { description?: string; default?: unknown }> = {};
 	const setActiveToolsCalls: string[][] = [];
 	const notifications: Array<{ message: string; type?: string }> = [];
+	let active = [...(opts.activeTools ?? ["bash", "read", "edit"])];
 	const eventCtx = {
 		cwd: process.cwd(),
 		ui: {
@@ -41,8 +62,11 @@ function makeHarness(
 		},
 		registerMessageRenderer: () => {},
 		getFlag: (name: string) => opts.flags?.[name],
-		getActiveTools: () => opts.activeTools ?? ["bash", "read", "edit"],
-		setActiveTools: (names: string[]) => setActiveToolsCalls.push(names),
+		getActiveTools: () => [...active],
+		setActiveTools: (names: string[]) => {
+			setActiveToolsCalls.push([...names]);
+			active = [...names];
+		},
 	};
 	if (opts.allTools) {
 		pi.getAllTools = () => opts.allTools;
@@ -52,6 +76,7 @@ function makeHarness(
 		registeredFlags,
 		setActiveToolsCalls,
 		notifications,
+		activeTools: () => [...active],
 		async emit(event: string, evt: any = {}) {
 			for (const h of handlers[event] ?? []) await h(evt, eventCtx);
 		},
@@ -62,10 +87,11 @@ function makeHarness(
 }
 
 describe("builtin bash divergence", () => {
-	it("keeps pi's built-in bash by default (no setActiveTools call)", async () => {
+	it("keeps pi's built-in bash by default (no setActiveTools call when nothing changes)", async () => {
 		const h = makeHarness();
 		await h.emit("session_start");
 		assert.deepEqual(h.setActiveToolsCalls, []);
+		assert.ok(h.activeTools().includes("bash"));
 		await h.shutdown();
 	});
 
@@ -76,17 +102,29 @@ describe("builtin bash divergence", () => {
 		assert.equal(h.registeredFlags["keep-builtin-bash"], undefined, "upstream flag name must not be registered");
 	});
 
-	it("--replace-builtin-bash removes bash from the active tools", async () => {
+	it("--replace-builtin-bash removes bash while runbg is enabled", async () => {
+		writeFileSync(SETTINGS, JSON.stringify({ enabled: true }));
 		const h = makeHarness({ flags: { "replace-builtin-bash": true }, activeTools: ["bash", "read", "edit"] });
 		await h.emit("session_start");
-		assert.deepEqual(h.setActiveToolsCalls, [["read", "edit"]]);
+		assert.ok(!h.activeTools().includes("bash"), "bash must be removed");
+		assert.ok(h.activeTools().includes("exec_command"), "session tools must be active");
+		assert.ok(h.activeTools().includes("read"));
+		await h.shutdown();
+	});
+
+	it("--replace-builtin-bash is inert while runbg is disabled (never leave pi shell-less)", async () => {
+		const h = makeHarness({ flags: { "replace-builtin-bash": true }, activeTools: ["bash", "read", "edit"] });
+		await h.emit("session_start");
+		assert.ok(h.activeTools().includes("bash"), "bash must survive while runbg is dormant");
 		await h.shutdown();
 	});
 
 	it("--replace-builtin-bash is a no-op when bash is already absent", async () => {
+		writeFileSync(SETTINGS, JSON.stringify({ enabled: true }));
 		const h = makeHarness({ flags: { "replace-builtin-bash": true }, activeTools: ["read", "edit"] });
 		await h.emit("session_start");
-		assert.deepEqual(h.setActiveToolsCalls, []);
+		assert.ok(!h.activeTools().includes("bash"));
+		assert.ok(h.activeTools().includes("exec_command"));
 		await h.shutdown();
 	});
 
