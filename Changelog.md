@@ -18,6 +18,18 @@ its names.
 
 ### Fixed
 
+- **A finished job's output no longer disappears when polls arrive batched**
+  (code review, N1 — regression in divergence #7's first cut): preemption was
+  merged into `collect`'s `externalAbort`, and that signal is checked *before*
+  the first drain (deliberately, so a cancelled call cannot swallow output into
+  a discarded result). A poll preempted at grant therefore drained nothing; if
+  it was also the call that observed the exit, it reported `[exited]` with an
+  empty body and reaped the session, leaving the concurrent caller only the
+  echo — the whole output reachable solely via `log_path`, with both results
+  labeled `wait_status: "completed"` so nothing hinted at the loss.
+  `CollectInputs` now carries `preemptAbort` separately: cancellation still
+  breaks before draining, preemption always drains first and only then stops
+  waiting. Regression-tested end to end.
 - **`\x03` now actually interrupts a pipes-mode session** (divergence #8,
   code review): a PTY's line discipline turns `0x03` into SIGINT, but pipes
   have no line discipline, so upstream's literal byte-write was inert for
@@ -75,8 +87,10 @@ its names.
   new `src/interaction-lock.ts`): pi runs a turn's tool batch in parallel, so
   two `write_stdin` calls on one session could starve each other's drain (a
   probe showed one poll returning zero bytes for its entire 5 s window) and
-  both deliver a terminal result for the same exit. Interactions against one
-  session now serialize, as in codex's per-process `interaction_lock`. Ours
+  both run a live terminal drain for the same exit. Interactions against one
+  session now serialize, as in codex's per-process `interaction_lock`, so at
+  most one call drains a session's exit and a concurrent caller gets an
+  explicitly labeled echo of the same exit facts. Ours
   adds preemption because our waits are far longer: an empty progress poll
   yields as soon as anything else wants the session (queue-aware, so several
   queued polls degenerate correctly) and reports
@@ -94,7 +108,10 @@ its names.
   actionable error. Enforced pre-spawn and re-checked after the early-exit
   grace, where refusal kills the newborn with full SIGTERM→SIGKILL
   escalation so a refused call never leaks a process. Cap is configurable
-  via `PI_RUNBG_MAX_SESSIONS` (default 64, codex's constant).
+  via `PI_RUNBG_MAX_SESSIONS` (default 64, codex's constant). An unconfirmed
+  refusal kill (SIGKILL denied, taskkill failure) registers the survivor
+  instead — deliberately one over cap — so no live child is ever untracked,
+  and that path runs the same eviction bookkeeping as a normal insert.
 - **`/runbg` settings command; the session tools ship dormant** (divergence
   #5, `UPSTREAM.md`): after install, `exec_command` & friends stay out of the
   active tool set until `/runbg on` (persisted in `<agentDir>/runbg.json`;

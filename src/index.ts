@@ -695,7 +695,14 @@ async function runExecCommand(
 				// failure). An untracked live child is strictly worse than being one
 				// over the cap: register it so list_sessions, kill_session, the
 				// picker, and the crash reaper can all still reach it.
-				ctx.store.insert(session);
+				// Same bookkeeping the normal insert path owes: this insert can
+				// still prune an exited victim, which needs its tombstone, lock
+				// cleanup, and coordinator eviction handling.
+				const { pruned: overCapPruned } = ctx.store.insert(session);
+				if (overCapPruned) {
+					afterSessionRemoved(ctx, overCapPruned);
+					ctx.coordinator.handleEviction(overCapPruned);
+				}
 				watchSessionExit(ctx, session);
 				updateRunningSessionsUi(ctx);
 				throw new Error(
@@ -740,18 +747,20 @@ async function runExecCommand(
 			// Cancelled while queued behind a kill: fall through unlocked with
 			// no drain — the terminal path below reports the session state.
 		}
-		const initialAbort = initialHandle
-			? signal
-				? AbortSignal.any([signal, initialHandle.preempt])
-				: initialHandle.preempt
-			: signal;
-		const pollStream = startStreaming(session, onUpdate, deadlineMs, initialAbort);
+		// Cancellation and preemption are kept SEPARATE (see collect.ts): a
+		// cancelled call must not drain (its result may be discarded), while a
+		// preempted call's result IS delivered and must drain first. Streaming
+		// stops on either, so the UI signal is still the merged one.
+		const initialPreempt = initialHandle?.preempt;
+		const streamAbort =
+			signal && initialPreempt ? AbortSignal.any([signal, initialPreempt]) : (initialPreempt ?? signal);
+		const pollStream = startStreaming(session, onUpdate, deadlineMs, streamAbort);
 		// Release in `finally`: a throw here would otherwise hold this session's
 		// lock forever, hanging every later interaction with it.
 		let collected: CollectResult;
 		try {
 			collected = initialHandle
-				? await session.collect({ deadlineMs, externalAbort: initialAbort })
+				? await session.collect({ deadlineMs, externalAbort: signal, preemptAbort: initialPreempt })
 				: { bytes: new Uint8Array(0), omittedBytes: 0 };
 		} finally {
 			initialHandle?.release();
@@ -894,7 +903,9 @@ async function runWriteStdin(
 	// concurrent exit is held instead of enqueuing a wake (see completion.ts).
 	ctx.coordinator.beginObservation(session.id, toolCallId);
 	// The drain must end on the caller's cancellation OR on preemption.
-	const drainAbort = signal ? AbortSignal.any([signal, handle.preempt]) : handle.preempt;
+	// Streaming stops on cancellation OR preemption; the DRAIN keeps them
+	// separate (see collect.ts) so a preempted poll still returns its bytes.
+	const streamAbort = signal ? AbortSignal.any([signal, handle.preempt]) : handle.preempt;
 	try {
 		let writeFailure: string | null = null;
 		// Divergence #8 / codex parity: in a PTY the terminal line discipline
@@ -910,17 +921,18 @@ async function runWriteStdin(
 		//   - `chars_b64` is never reinterpreted — it is the documented raw-
 		//     bytes escape hatch, so a child that consumes 0x03 as protocol
 		//     data can still be fed one.
-		if (
-			!isEmptyPoll &&
-			writeBytes &&
-			!session.tty &&
-			args.chars_b64 === undefined &&
-			writeBytes.length === 1 &&
-			writeBytes[0] === 0x03
-		) {
+		// The chars_b64 exemption tests for a NON-EMPTY string, matching
+		// resolveWriteInput: an empty chars_b64 is treated as absent there, so
+		// `{chars: "\x03", chars_b64: ""}` must still interrupt.
+		const usedRawBytes = typeof args.chars_b64 === "string" && args.chars_b64.length > 0;
+		if (!isEmptyPoll && writeBytes && !session.tty && !usedRawBytes && writeBytes.length === 1 && writeBytes[0] === 0x03) {
 			session.interrupt();
-			await sleep(100, drainAbort);
-			const collected = await session.collect({ deadlineMs: start + yieldTimeMs, externalAbort: drainAbort });
+			await sleep(100, signal);
+			const collected = await session.collect({
+				deadlineMs: start + yieldTimeMs,
+				externalAbort: signal,
+				preemptAbort: handle.preempt,
+			});
 			const wallSec = (Date.now() - start) / 1000;
 			if (session.hasExited) {
 				const armed = ctx.coordinator.isArmed(session.id);
@@ -975,7 +987,11 @@ async function runWriteStdin(
 			}
 			if (!ok && session.hasExited) {
 				// Session already exited; return its final state.
-				const collected = await session.collect({ deadlineMs: Date.now() + 50, externalAbort: drainAbort });
+				const collected = await session.collect({
+					deadlineMs: Date.now() + 50,
+					externalAbort: signal,
+					preemptAbort: handle.preempt,
+				});
 				const armed = ctx.coordinator.isArmed(session.id);
 				removeSession(ctx, session.id);
 				ctx.coordinator.markPendingTerminal(session.id, toolCallId);
@@ -1005,8 +1021,8 @@ async function runWriteStdin(
 		}
 
 		const deadlineMs = start + yieldTimeMs;
-		const pollStream = startStreaming(session, onUpdate, deadlineMs, drainAbort);
-		const collected = await session.collect({ deadlineMs, externalAbort: drainAbort });
+		const pollStream = startStreaming(session, onUpdate, deadlineMs, streamAbort);
+		const collected = await session.collect({ deadlineMs, externalAbort: signal, preemptAbort: handle.preempt });
 		pollStream.stop();
 		const wallSec = (Date.now() - start) / 1000;
 
@@ -1915,6 +1931,8 @@ export default function (pi: ExtensionAPI) {
 			"NEVER use yield_until for REPLs, sudo, ssh, password prompts, dev servers, file watchers, debuggers, or any indefinite/interactive session — it is only for finite commands that will exit on their own.",
 			'on_exit wake is set via exec_command or set_on_exit, not write_stdin. Observing an exit here consumes an armed wake (direct result). To disarm wake without killing, call set_on_exit(session_id, on_exit: "none").',
 			"In tty sessions, submit lines with \\r (the Enter key) rather than \\n: POSIX terminals accept both, but Windows console programs only execute input on \\r.",
+			"To interrupt a running command, send chars \\x03 on its own (never via chars_b64, which is always literal bytes): in a pipes session that is delivered as a real SIGINT to the process group, and in a tty session the terminal turns it into Ctrl-C.",
+			'Poll one session at a time. Concurrent calls against the same session_id are serialized, so a progress poll may return early with wait_status "preempted" (and possibly no new output) when another call wants that session — that is not an error; poll again if you still need output.',
 			"For very noisy jobs, rely on the log_path and final/truncated output instead of repeatedly polling.",
 		],
 		parameters: Type.Object({

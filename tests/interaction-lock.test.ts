@@ -196,6 +196,46 @@ describe("serialized session interactions (e2e)", () => {
 		await h.shutdown();
 	});
 
+	// Regression: preemption must never skip the drain. Merging the preempt
+	// signal into collect's `externalAbort` made a preempted holder break
+	// BEFORE its first drain, so when that holder was the one taking the
+	// terminal path, a finished job's entire output vanished from every result
+	// (it survived only in the log file) — and both results claimed
+	// `wait_status: "completed"`, hiding the loss.
+	it("batched polls on an already-exited session still deliver its final output", async () => {
+		const h = makeHarness();
+		try {
+			await h.emit("session_start");
+			const started = await h.call("exec_command", {
+				cmd: "sleep 0.4; echo FINAL-OUTPUT-XYZ; exit 3",
+				yield_time_ms: 250,
+			});
+			const sid = started.details.session_id;
+			assert.ok(typeof sid === "number", JSON.stringify(started.details));
+			assert.ok(!started.details.output.includes("FINAL-OUTPUT-XYZ"), "output must arrive after the first yield");
+
+			// Let the child finish, THEN batch two polls: the first holder is
+			// preempted at grant, so it must still drain before reporting.
+			await new Promise((r) => setTimeout(r, 700));
+			const [a, b] = await Promise.all([
+				h.call("write_stdin", { session_id: sid, yield_time_ms: 5000 }),
+				h.call("write_stdin", { session_id: sid, yield_time_ms: 5000 }),
+			]);
+
+			const combined = `${a.details.output}${b.details.output}`;
+			assert.ok(
+				combined.includes("FINAL-OUTPUT-XYZ"),
+				`final output must reach a result, not only the log: ${JSON.stringify([a.details, b.details])}`,
+			);
+			// Exactly one live terminal drain; the other is the labeled echo.
+			const withOutput = [a, b].filter((r) => r.details.output.includes("FINAL-OUTPUT-XYZ"));
+			assert.equal(withOutput.length, 1, "the output must not be duplicated across results");
+			assert.ok([a, b].every((r) => r.details.exit_code === 3), "both results carry the true exit code");
+		} finally {
+			await h.shutdown();
+		}
+	});
+
 	it("a poll queued behind the exit observer gets a truthful [exited] echo, not an error", async () => {
 		const h = makeHarness();
 		await h.emit("session_start");

@@ -51,10 +51,12 @@ pi-flavor additions (`set_on_exit`, `kill_session`, `list_sessions`).
   terminal-control sequences; the complete raw stream remains available at
   `log_path`.
 - **Ctrl-C and other control bytes, not just stdin text.**
-  `write_stdin` decodes C-style escapes (`\x03` Ctrl-C, `\x04` EOF,
-  `\x1b[A` arrow-up, …) before writing, so the LLM can interrupt a
-  stuck command or drive an interactive TUI — `chars_b64` covers the
-  arbitrary-binary case.
+  `write_stdin` decodes C-style escapes (`\x04` EOF, `\x1b[A` arrow-up, …)
+  before writing, so the LLM can drive an interactive TUI. `chars: "\x03"`
+  on its own interrupts: a tty session's line discipline turns it into
+  Ctrl-C, and in a pipes session runbg delivers a real SIGINT to the process
+  group (divergence #8 — upstream wrote an inert byte there). `chars_b64`
+  covers the arbitrary-binary case and is never reinterpreted as a signal.
 
 ## Why
 
@@ -726,8 +728,11 @@ per-entry and in `kill_session` details.
 Log files live in `/tmp/` and outlive their sessions (they are the recovery
 surface). Stale ones are cleaned up by age at session start:
 `pi-runbg-*.log` files older than `PI_RUNBG_LOG_TTL_DAYS` (default 7; `0`
-disables) are deleted best-effort — age-based only, so a concurrent pi
-process's fresh logs are never touched, and symlinks are never followed.
+disables; positive values are floored at 1 day) are deleted best-effort —
+age-based only, and symlinks are never followed. Live sessions' logs are kept
+recent by an hourly liveness touch, so a long-idle dev server's log is not
+mistaken for abandoned by another pi process; the 1-day floor exists so a
+configured TTL can never undercut that heartbeat.
 
 ## Other pi-flavor additions
 

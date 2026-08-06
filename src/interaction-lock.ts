@@ -155,6 +155,13 @@ export class InteractionLocks {
 	 * Forget a session's lock. Safe while callers are still queued: they hold
 	 * their own reference, so pending waiters still drain in order — this only
 	 * stops the map from growing per session id.
+	 *
+	 * Note the invariant this relies on: a caller arriving AFTER the forget
+	 * gets a *fresh* lock, so it is not mutually excluded against waiters on
+	 * the old one. That is harmless only because forget() happens on removal
+	 * and **every drain path re-reads the store while holding its lock** — a
+	 * removed session fails that check before touching the buffer. A future
+	 * drain path that skips the re-check would turn this into a real race.
 	 */
 	forget(sessionId: number): void {
 		this.locks.delete(sessionId);

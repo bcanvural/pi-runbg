@@ -73,8 +73,21 @@ export interface CollectInputs {
 	exited: AbortSignal;
 	/** Absolute monotonic deadline (Date.now() ms) to stop waiting. */
 	deadlineMs: number;
-	/** External abort (e.g. user pressed Esc). Breaks out immediately. */
+	/**
+	 * External abort (e.g. user pressed Esc). Breaks out immediately, BEFORE
+	 * draining: pi may discard a cancelled call's result, so buffered output
+	 * must stay with the session rather than vanish into a dropped result.
+	 */
 	externalAbort?: AbortSignal;
+	/**
+	 * Preemption (another interaction wants this session — see
+	 * interaction-lock.ts). Deliberately NOT merged with `externalAbort`:
+	 * a preempted call's result IS delivered, so it must always drain what is
+	 * already buffered first and only then stop waiting for more. Merging the
+	 * two dropped a finished job's final output from every result when polls
+	 * arrived batched.
+	 */
+	preemptAbort?: AbortSignal;
 	/** Override the trailing-output grace after exit (ms). */
 	postExitCloseWaitMs?: number;
 }
@@ -99,7 +112,7 @@ export interface CollectResult {
  * output arriving after we return stays in the buffer for the next collect().
  */
 export async function collectOutputUntilDeadline(inputs: CollectInputs): Promise<CollectResult> {
-	const { buffer, outputNotify, outputClosed, exited, deadlineMs, externalAbort } = inputs;
+	const { buffer, outputNotify, outputClosed, exited, deadlineMs, externalAbort, preemptAbort } = inputs;
 	const postExitCloseWaitCap = inputs.postExitCloseWaitMs ?? POST_EXIT_CLOSE_WAIT_MS;
 
 	// Bounded in-call retention (divergence #4): sized to the session
@@ -126,6 +139,9 @@ export async function collectOutputUntilDeadline(inputs: CollectInputs): Promise
 		const externalP: Promise<"external"> = externalAbort
 			? abortPromise(externalAbort, cleanups).then(() => "external" as const)
 			: new Promise<never>(() => {});
+		const preemptP: Promise<"preempt"> = preemptAbort
+			? abortPromise(preemptAbort, cleanups).then(() => "preempt" as const)
+			: new Promise<never>(() => {});
 		const deadlineP = timeoutPromise(deadlineMs - Date.now(), cleanups).then(() => "timeout" as const);
 		let closedP: Promise<"closed"> | undefined;
 		let graceP: Promise<"timeout"> | undefined;
@@ -144,6 +160,11 @@ export async function collectOutputUntilDeadline(inputs: CollectInputs): Promise
 				const now = Date.now();
 				if (now >= deadlineMs) break;
 
+				// Nothing left to hand over and someone else wants the session:
+				// stop waiting for more (the drain above already ran, so no
+				// buffered output can be lost here).
+				if (preemptAbort?.aborted) break;
+
 				if (exitSignalReceived) {
 					// Process exited but stream not closed yet — give it a short grace.
 					if (postExitDeadline === undefined) {
@@ -157,8 +178,11 @@ export async function collectOutputUntilDeadline(inputs: CollectInputs): Promise
 						closedP,
 						graceP!,
 						externalP,
+						preemptP,
 					]);
 					if (which === "timeout" || which === "external") break;
+					// Preempted mid-grace: loop once more to drain any trailing
+					// bytes, then the check above ends the call.
 					continue;
 				}
 
@@ -168,6 +192,7 @@ export async function collectOutputUntilDeadline(inputs: CollectInputs): Promise
 					exitedP,
 					deadlineP,
 					externalP,
+					preemptP,
 				]);
 				if (which === "timeout" || which === "external") break;
 				if (which === "exit") exitSignalReceived = true;
@@ -185,6 +210,8 @@ export async function collectOutputUntilDeadline(inputs: CollectInputs): Promise
 
 			if (exited.aborted) exitSignalReceived = true;
 			if (Date.now() >= deadlineMs) break;
+			// Got our bytes; yield the session to whoever is waiting.
+			if (preemptAbort?.aborted) break;
 		}
 	} finally {
 		for (const cleanup of cleanups) cleanup();

@@ -20,11 +20,14 @@ import { join } from "node:path";
 import { after } from "node:test";
 
 const AGENT_DIR_VAR = "PI_CODING_AGENT_DIR";
+const TMPDIR_VAR = "TMPDIR";
 const RUNBG_PREFIX = "PI_RUNBG_";
 
 export interface IsolatedAgentEnv {
 	/** The temp directory standing in for `~/.pi/agent`. */
 	agentDir: string;
+	/** The per-suite `TMPDIR` session logs are written to. */
+	tmpDir: string;
 	/** Path of the settings file the extension will read. */
 	settingsPath: string;
 	/** Set a `PI_RUNBG_*` (or any) variable for the current suite. */
@@ -41,6 +44,14 @@ export function useIsolatedAgentEnv(options: { keep?: string[] } = {}): Isolated
 	remember(AGENT_DIR_VAR);
 	process.env[AGENT_DIR_VAR] = agentDir;
 
+	// Session logs and the stale-log sweep both live in os.tmpdir(), which
+	// re-reads TMPDIR on every call — so pointing it at a per-suite directory
+	// keeps every log this suite creates (and deletes) out of the developer's
+	// real temp directory.
+	const tmp = mkdtempSync(join(tmpdir(), "runbg-tmp-"));
+	remember(TMPDIR_VAR);
+	process.env[TMPDIR_VAR] = tmp;
+
 	const keep = new Set(options.keep ?? []);
 	for (const name of Object.keys(process.env)) {
 		if (!name.startsWith(RUNBG_PREFIX) || keep.has(name)) continue;
@@ -54,10 +65,12 @@ export function useIsolatedAgentEnv(options: { keep?: string[] } = {}): Isolated
 			else process.env[name] = value;
 		}
 		rmSync(agentDir, { recursive: true, force: true });
+		rmSync(tmp, { recursive: true, force: true });
 	});
 
 	return {
 		agentDir,
+		tmpDir: tmp,
 		settingsPath: join(agentDir, "runbg.json"),
 		setEnv(name, value) {
 			remember(name);
