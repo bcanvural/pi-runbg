@@ -42,7 +42,7 @@ that landed it. See `docs/design.md` §7.
 | # | Divergence | Rationale | Status |
 |---|---|---|---|
 | 1 | Keep pi's built-in `bash` by default; `--replace-builtin-bash` opts into upstream's removal (upstream default removes `bash`, flag `--keep-builtin-bash` to keep). Startup warning when the upstream package is installed alongside (same tool names). | Templates that don't know the session tools must keep a shell; user-side `bash` guards must not be silently bypassed (§7.1) | landed |
-| 2 | Best-effort crash cleanup: `process.on("exit")` synchronously group-kills live sessions | pi's crash paths (`uncaughtException`, dead terminal) skip `session_shutdown`; upstream orphans children (§7.2) | planned |
+| 2 | Best-effort crash cleanup: `process.on("exit")` synchronously group-kills live sessions (installed at `session_start`, removed at `session_shutdown`; SIGKILL'd hosts still orphan) | pi's crash paths (`uncaughtException`, dead terminal) skip `session_shutdown`; upstream orphans children (§7.2) | landed |
 | 3 | Log archive safety: `0600` + exclusive create, per-session size cap, `log_status`, startup cleanup of stale logs | Adopts upstream's own IV-0002 follow-up backlog (§7.3) | planned |
 | 4 | Bounded relative-poll accumulation (head/tail buffer instead of an unbounded chunk array in `collectOutputUntilDeadline`) | A chatty child during a 290 s empty poll can accumulate GBs in-process (§7.4) | planned |
 

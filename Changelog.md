@@ -18,6 +18,12 @@ its names.
 
 ### Added
 
+- **Crash-path child reaping** (divergence #2, `UPSTREAM.md`): a synchronous
+  process-"exit" handler SIGKILLs every live session's process group when the
+  host exits without `session_shutdown` (pi's `uncaughtException` /
+  dead-terminal paths). Installed at `session_start`, removed at
+  `session_shutdown` (never stacks across reloads); a SIGKILL'd host still
+  orphans. Covered by `tests/crash-cleanup.test.ts`.
 - Startup warning when the upstream `pi-unified-exec` package is installed
   alongside this fork (both register the same five tool names).
 - Headless acceptance suite (`tests/headless.test.ts`, design §9): the full

@@ -33,7 +33,7 @@ import { formatElapsed } from "./format-time.ts";
 import { type LongWaitOutcome, startRateLimitedStream, waitForExitOrDeadline } from "./long-wait.ts";
 import { sleep } from "./notify.ts";
 import { sanitizeOutputText } from "./output-safety.ts";
-import { getPtyLoadError, isPtyAvailable } from "./pty.ts";
+import { getPtyLoadError, isPtyAvailable, killWindowsTreeSync } from "./pty.ts";
 import {
 	renderExecCommandCall,
 	renderKillSessionCall,
@@ -187,9 +187,48 @@ interface ExtensionCtx {
 	pendingSessions: Set<ExecSession>;
 	/** Set on session_shutdown; new exec_commands are rejected. */
 	shuttingDown: boolean;
+	/** Crash-path reaper registered on process "exit" (divergence #2). */
+	processExitHandler: (() => void) | undefined;
 }
 
 const RUNBG_TOOL_NAMES = ["exec_command", "write_stdin", "set_on_exit", "kill_session", "list_sessions"];
+
+/**
+ * Divergence #2 (UPSTREAM.md, design §7.2): last-resort child reaping for
+ * host exits that skip session_shutdown — pi's uncaughtException and
+ * dead-terminal paths call process.exit() after killing only its own bash
+ * children, which would orphan every runbg session. Runs inside the process
+ * "exit" event, so it must be fully synchronous: SIGKILL each live session's
+ * process group (both pipes and PTY children are group leaders on POSIX;
+ * Windows gets a synchronous taskkill tree). Graceful shutdowns have already
+ * emptied the store by the time "exit" fires, making this a no-op there.
+ * A SIGKILL'd host still orphans — nothing can run then.
+ */
+export function killLiveSessionsSync(
+	sessions: Iterable<Pick<ExecSession, "hasExited" | "pid">>,
+): number {
+	let killed = 0;
+	for (const s of sessions) {
+		if (s.hasExited || typeof s.pid !== "number") continue;
+		if (IS_WINDOWS) {
+			killWindowsTreeSync(s.pid);
+			killed++;
+			continue;
+		}
+		try {
+			process.kill(-s.pid, "SIGKILL");
+			killed++;
+		} catch {
+			try {
+				process.kill(s.pid, "SIGKILL");
+				killed++;
+			} catch {
+				// already gone
+			}
+		}
+	}
+	return killed;
+}
 
 /**
  * The upstream package this fork derives from (pi-unified-exec) registers the
@@ -1019,6 +1058,7 @@ export default function (pi: ExtensionAPI) {
 		warnedForeignTools: false,
 		pendingSessions: new Set(),
 		shuttingDown: false,
+		processExitHandler: undefined,
 	};
 
 	// Divergence #1 from upstream (see UPSTREAM.md): upstream removes pi's
@@ -1067,6 +1107,15 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		warnIfUpstreamPackagePresent(ctx, pi);
+		// Crash-path reaper (divergence #2): removed again on session_shutdown,
+		// so graceful teardowns never stack listeners across /reload cycles and
+		// the handler can only ever fire while this instance owns sessions.
+		if (!ctx.processExitHandler) {
+			ctx.processExitHandler = () => {
+				killLiveSessionsSync([...ctx.store.values(), ...ctx.pendingSessions]);
+			};
+			process.on("exit", ctx.processExitHandler);
+		}
 		if (!isPtyAvailable() && eventCtx.hasUI) {
 			// Non-fatal: pipes mode still works.
 			eventCtx.ui.notify(
@@ -1118,6 +1167,12 @@ export default function (pi: ExtensionAPI) {
 					(leftover ? `; ${leftover} did not confirm exit` : ""),
 				 leftover ? "warning" : "info",
 			);
+		}
+		// Graceful teardown complete — the crash-path reaper has nothing left
+		// to cover, and a /reload's fresh instance will install its own.
+		if (ctx.processExitHandler) {
+			process.removeListener("exit", ctx.processExitHandler);
+			ctx.processExitHandler = undefined;
 		}
 	});
 

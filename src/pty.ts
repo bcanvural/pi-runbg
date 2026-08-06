@@ -6,7 +6,7 @@
  * `codex_utils_pty::pipe` (tty=false).
  */
 
-import { spawn as cpSpawn, type ChildProcess } from "node:child_process";
+import { spawn as cpSpawn, spawnSync as cpSpawnSync, type ChildProcess } from "node:child_process";
 import { createRequire } from "node:module";
 import { constants as osConstants } from "node:os";
 
@@ -158,6 +158,21 @@ function killWindowsTree(pid: number): void {
 			windowsHide: true,
 		});
 		tk.on("error", () => {});
+	} catch {
+		// taskkill missing/unspawnable — nothing more we can do
+	}
+}
+
+/**
+ * Synchronous killWindowsTree for process-"exit" handlers, where an async
+ * spawn is not guaranteed to ever run. Same absolute-path rule as above.
+ */
+export function killWindowsTreeSync(pid: number): void {
+	try {
+		cpSpawnSync(taskkillPath(), ["/pid", String(pid), "/T", "/F"], {
+			stdio: "ignore",
+			windowsHide: true,
+		});
 	} catch {
 		// taskkill missing/unspawnable — nothing more we can do
 	}
