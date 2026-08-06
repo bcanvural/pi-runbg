@@ -44,8 +44,11 @@ const markerEncoder = new TextEncoder();
  * head+tail as contiguous output. The full stream is always in the log file.
  */
 function omissionMarker(omittedBytes: number, retentionBytes: number): Uint8Array {
+	// Deliberately does NOT promise the log holds the full stream: the log can
+	// be capped or degraded (divergence #3). This module has no session
+	// context, so it points at the result's own log fields instead.
 	return markerEncoder.encode(
-		`\n[... ${omittedBytes} bytes omitted here (output exceeded the ${retentionBytes}-byte in-memory retention between polls; the full stream is in the session log file) ...]\n`,
+		`\n[... ${omittedBytes} bytes omitted here (output exceeded the ${retentionBytes}-byte in-memory retention between polls; see log_path / log_status in this result to recover the stream) ...]\n`,
 	);
 }
 
@@ -55,7 +58,7 @@ function omissionMarker(omittedBytes: number, retentionBytes: number): Uint8Arra
  */
 function callOmissionMarker(omittedBytes: number, retentionBytes: number): Uint8Array {
 	return markerEncoder.encode(
-		`\n[... ${omittedBytes} bytes omitted here (output exceeded the ${retentionBytes}-byte in-call retention during this attachment window; the full stream is in the session log file) ...]\n`,
+		`\n[... ${omittedBytes} bytes omitted here (output exceeded the ${retentionBytes}-byte in-call retention during this attachment window; see log_path / log_status in this result to recover the stream) ...]\n`,
 	);
 }
 

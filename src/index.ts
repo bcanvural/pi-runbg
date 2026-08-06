@@ -34,7 +34,7 @@ import type { CollectResult } from "./collect.ts";
 import { CompletionCoordinator, type OnExitPolicy, sanitizeMeta } from "./completion.ts";
 import { formatElapsed } from "./format-time.ts";
 import { InteractionCancelled, type InteractionHandle, InteractionLocks } from "./interaction-lock.ts";
-import { cleanupStaleLogs, type LogStatus } from "./log-archive.ts";
+import { cleanupStaleLogs, LOG_HEARTBEAT_INTERVAL_MS, type LogStatus } from "./log-archive.ts";
 import { type LongWaitOutcome, startRateLimitedStream, waitForExitOrDeadline } from "./long-wait.ts";
 import { sleep } from "./notify.ts";
 import { sanitizeOutputText } from "./output-safety.ts";
@@ -210,6 +210,8 @@ interface ExtensionCtx {
 	shuttingDown: boolean;
 	/** Crash-path reaper registered on process "exit" (divergence #2). */
 	processExitHandler: (() => void) | undefined;
+	/** Liveness-touch timer for open session logs (divergence #3). */
+	logHeartbeat: NodeJS.Timeout | undefined;
 	/** True only while WE removed pi's built-in bash (divergence #1 latch). */
 	removedBuiltinBash: boolean;
 	/** Per-session interaction serialization (divergence #7). */
@@ -877,6 +879,76 @@ async function runWriteStdin(
 	const drainAbort = signal ? AbortSignal.any([signal, handle.preempt]) : handle.preempt;
 	try {
 		let writeFailure: string | null = null;
+		// Divergence #8 / codex parity: in a PTY the terminal line discipline
+		// turns 0x03 into SIGINT for the foreground group. On pipes there is no
+		// line discipline, so writing 0x03 to stdin is an inert byte almost no
+		// child interprets — the model's "Ctrl-C" would silently do nothing.
+		// Codex maps interrupt input to a real signal for non-tty processes;
+		// mirror that for `chars` input that is EXACTLY the interrupt byte.
+		//
+		// Two deliberate limits keep the literal-byte capability intact:
+		//   - embedded 0x03 in longer input stays a write (mixed write/signal
+		//     semantics would be unpredictable);
+		//   - `chars_b64` is never reinterpreted — it is the documented raw-
+		//     bytes escape hatch, so a child that consumes 0x03 as protocol
+		//     data can still be fed one.
+		if (
+			!isEmptyPoll &&
+			writeBytes &&
+			!session.tty &&
+			args.chars_b64 === undefined &&
+			writeBytes.length === 1 &&
+			writeBytes[0] === 0x03
+		) {
+			session.interrupt();
+			await sleep(100, drainAbort);
+			const collected = await session.collect({ deadlineMs: start + yieldTimeMs, externalAbort: drainAbort });
+			const wallSec = (Date.now() - start) / 1000;
+			if (session.hasExited) {
+				const armed = ctx.coordinator.isArmed(session.id);
+				removeSession(ctx, session.id);
+				ctx.coordinator.markPendingTerminal(session.id, toolCallId);
+				return finalizeResponse({
+					wallTimeSec: wallSec,
+					collected: collected.bytes,
+					omittedBytes: collected.omittedBytes,
+					totalBytes: session.totalBytesSeen,
+					sessionId: undefined,
+					exitCode: session.exitCode,
+					signal: session.signal,
+					failure: session.failureMessage,
+					tty: false,
+					logPath: session.logPath,
+					logStatus: session.logStatus,
+					cwd: session.cwd,
+					command: session.displayCommand,
+					yieldTimeMs,
+					extra: terminalWaitExtra(undefined, armed),
+				});
+			}
+			const armed = ctx.coordinator.isArmed(session.id);
+			ctx.coordinator.releaseObservation(session.id, toolCallId);
+			return finalizeResponse({
+				wallTimeSec: wallSec,
+				collected: collected.bytes,
+				omittedBytes: collected.omittedBytes,
+				totalBytes: session.totalBytesSeen,
+				sessionId: session.id,
+				exitCode: undefined,
+				signal: null,
+				failure: null,
+				tty: false,
+				logPath: session.logPath,
+				logStatus: session.logStatus,
+				cwd: session.cwd,
+				command: session.displayCommand,
+				yieldTimeMs,
+				extra: {
+					tool_time_utc: nowUtcIso(),
+					...(armed ? { on_exit: "wake" as const, completion_notification: "armed" as const } : {}),
+				},
+			});
+		}
 		if (!isEmptyPoll && writeBytes) {
 			const ok = session.write(writeBytes);
 			if (!ok && !session.hasExited) {
@@ -1497,6 +1569,7 @@ export default function (pi: ExtensionAPI) {
 		pendingSessions: new Set(),
 		shuttingDown: false,
 		processExitHandler: undefined,
+		logHeartbeat: undefined,
 		removedBuiltinBash: false,
 		locks: new InteractionLocks(),
 		reaped: new Map(),
@@ -1556,6 +1629,17 @@ export default function (pi: ExtensionAPI) {
 			};
 			process.on("exit", ctx.processExitHandler);
 		}
+		// Log liveness heartbeat (divergence #3): the TTL sweep is mtime-based,
+		// so a quiet-but-live session (dev server idle for days) would look
+		// stale to another pi process. Unref'd: never holds the process open.
+		if (!ctx.logHeartbeat) {
+			ctx.logHeartbeat = setInterval(() => {
+				for (const session of [...ctx.store.values(), ...ctx.pendingSessions]) {
+					if (!session.hasExited) session.touchLog();
+				}
+			}, LOG_HEARTBEAT_INTERVAL_MS);
+			ctx.logHeartbeat.unref?.();
+		}
 		if (!isPtyAvailable() && eventCtx.hasUI) {
 			// Non-fatal: pipes mode still works.
 			eventCtx.ui.notify(
@@ -1613,6 +1697,10 @@ export default function (pi: ExtensionAPI) {
 		if (ctx.processExitHandler) {
 			process.removeListener("exit", ctx.processExitHandler);
 			ctx.processExitHandler = undefined;
+		}
+		if (ctx.logHeartbeat) {
+			clearInterval(ctx.logHeartbeat);
+			ctx.logHeartbeat = undefined;
 		}
 	});
 
@@ -1788,7 +1876,7 @@ export default function (pi: ExtensionAPI) {
 		name: "write_stdin",
 		label: "write_stdin",
 		description:
-			"Write bytes to a running session. Omit both chars and chars_b64 to poll without writing. Use `chars` for text with C-style escapes (e.g. \\x03 Ctrl-C, \\x1b ESC, \\n newline); use `chars_b64` for raw binary. For empty polls, wait with yield_time_ms (relative, max 290 s) or yield_until (absolute UTC deadline — only when the human explicitly asks for a long attached wait).",
+			"Write bytes to a running session. Omit both chars and chars_b64 to poll without writing. Use `chars` for text with C-style escapes (e.g. \\x1b ESC, \\n newline); use `chars_b64` for raw binary. Interrupt: send chars \\x03 alone — in a tty session the terminal turns it into Ctrl-C, and in a pipes session (tty: false) runbg delivers a real SIGINT to the process group. For empty polls, wait with yield_time_ms (relative, max 290 s) or yield_until (absolute UTC deadline — only when the human explicitly asks for a long attached wait).",
 		promptSnippet: "Send input to or poll a running session",
 		promptGuidelines: [
 			`Use yield_time_ms for interaction or an empty progress poll of at most 290 seconds (${DEFAULT_MAX_BACKGROUND_POLL_MS} ms, cache-friendly). Larger values are rejected, not clamped. Repeat polls as needed instead of bypassing the cap.`,

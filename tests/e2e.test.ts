@@ -13,6 +13,10 @@ import { describe, it } from "node:test";
 import { DEFAULT_MAX_BYTES } from "@earendil-works/pi-coding-agent";
 import extensionFactory, { MAX_EMPTY_POLL_ENV_VAR, resolveMaxEmptyPollMs } from "../src/index.ts";
 import { IS_WINDOWS } from "../src/shell.ts";
+import { useIsolatedAgentEnv } from "./helpers/agent-env.ts";
+
+// Hermetic startup: pin the agent dir and scrub PI_RUNBG_* (see helper).
+useIsolatedAgentEnv();
 
 interface ToolDef {
 	name: string;

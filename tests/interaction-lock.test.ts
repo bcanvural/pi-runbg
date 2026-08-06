@@ -10,9 +10,15 @@
  */
 
 import { strict as assert } from "node:assert";
-import { describe, it } from "node:test";
+import { readFileSync } from "node:fs";
+import { afterEach, describe, it } from "node:test";
 import extensionFactory from "../src/index.ts";
 import { InteractionCancelled, InteractionLock } from "../src/interaction-lock.ts";
+import { IS_WINDOWS } from "../src/shell.ts";
+import { useIsolatedAgentEnv } from "./helpers/agent-env.ts";
+
+// Hermetic startup: pin the agent dir and scrub PI_RUNBG_* (see helper).
+useIsolatedAgentEnv();
 
 describe("InteractionLock", () => {
 	it("grants immediately when idle and serializes a second acquirer", async () => {
@@ -134,7 +140,8 @@ function makeHarness() {
 		sendMessage: () => {},
 	};
 	(extensionFactory as any)(pi);
-	return {
+	let shutDown = false;
+	const harness = {
 		async call(toolName: string, params: any, signal?: AbortSignal) {
 			return tools[toolName].execute(`lock-${nextId++}`, params, signal, undefined, stubCtx);
 		},
@@ -142,10 +149,25 @@ function makeHarness() {
 			for (const h of handlers[event] ?? []) await h(evt, stubCtx);
 		},
 		async shutdown() {
+			if (shutDown) return;
+			shutDown = true;
 			await this.emit("session_shutdown");
 		},
 	};
+	liveHarnesses.add(harness);
+	return harness;
 }
+
+/**
+ * Safety net: a spawned child keeps Node's event loop alive, so a failed
+ * assertion that skips cleanup would hang the whole file instead of reporting
+ * the failure. Shut every harness down after each test.
+ */
+const liveHarnesses = new Set<{ shutdown: () => Promise<void> }>();
+afterEach(async () => {
+	for (const h of liveHarnesses) await h.shutdown();
+	liveHarnesses.clear();
+});
 
 describe("serialized session interactions (e2e)", () => {
 	it("two overlapping empty polls: neither starves, exactly one reports the exit", async () => {
@@ -206,6 +228,52 @@ describe("serialized session interactions (e2e)", () => {
 			assert.ok(r.details.log_path, "every result keeps a recovery path");
 		}
 		await h.shutdown();
+	});
+
+	// Divergence #8 / codex parity: on pipes there is no line discipline, so a
+	// bare 0x03 byte would be inert. runbg turns it into a real SIGINT.
+	it("pipes-mode \\x03 delivers SIGINT instead of writing an inert byte", { skip: IS_WINDOWS }, async () => {
+		const h = makeHarness();
+		await h.emit("session_start");
+		// Reports the signal it dies from, so the assertion is unambiguous.
+		const started = await h.call("exec_command", {
+			cmd: "trap 'echo GOT-SIGINT; exit 42' INT; echo ready; sleep 30",
+			yield_time_ms: 600,
+		});
+		const sid = started.details.session_id;
+		assert.ok(typeof sid === "number", JSON.stringify(started.details));
+		assert.ok(started.details.output.includes("ready"));
+
+		const interrupted = await h.call("write_stdin", { session_id: sid, chars: "\\x03", yield_time_ms: 2000 });
+		assert.equal(interrupted.details.exit_code, 42, JSON.stringify(interrupted.details));
+		assert.ok(interrupted.details.output.includes("GOT-SIGINT"), JSON.stringify(interrupted.details.output));
+		await h.shutdown();
+	});
+
+	it("embedded \\x03 inside longer input stays a literal write", { skip: IS_WINDOWS }, async () => {
+		const h = makeHarness();
+		try {
+			await h.emit("session_start");
+			// Plain `cat` echoes byte-for-byte and unbuffered (BSD `cat -v` would
+			// block-buffer on a pipe and echo nothing).
+			const started = await h.call("exec_command", { cmd: "cat", yield_time_ms: 300 });
+			const sid = started.details.session_id;
+			assert.ok(typeof sid === "number");
+
+			const r = await h.call("write_stdin", { session_id: sid, chars: "a\\x03b\\n", yield_time_ms: 1500 });
+			// Still running: the byte was written to stdin, NOT turned into a signal.
+			assert.equal(r.details.status, "running", JSON.stringify(r.details));
+			// Model-visible text is control-stripped, so verify the echo in the raw
+			// log: cat wrote back exactly the bytes we sent, 0x03 included.
+			const logged = readFileSync(r.details.log_path);
+			assert.ok(logged.includes(Buffer.from([0x61, 0x03, 0x62])), `raw echo missing: ${logged.toString("hex")}`);
+			assert.equal(r.details.output.includes("ab"), true, JSON.stringify(r.details.output));
+			await h.call("kill_session", { session_id: sid });
+		} finally {
+			// A live child keeps Node's event loop alive, so cleanup must run even
+			// when an assertion fails — otherwise the whole file hangs.
+			await h.shutdown();
+		}
 	});
 
 	it("input write is not starved by a long empty poll (preemption keeps interrupts prompt)", async () => {

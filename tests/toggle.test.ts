@@ -9,20 +9,12 @@
  */
 
 import { strict as assert } from "node:assert";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { after, beforeEach, describe, it } from "node:test";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { beforeEach, describe, it } from "node:test";
 import extensionFactory from "../src/index.ts";
+import { useIsolatedAgentEnv } from "./helpers/agent-env.ts";
 
-const AGENT_DIR = mkdtempSync(join(tmpdir(), "runbg-agent-"));
-const SETTINGS = join(AGENT_DIR, "runbg.json");
-const PREV_ENV = process.env.PI_CODING_AGENT_DIR;
-process.env.PI_CODING_AGENT_DIR = AGENT_DIR;
-after(() => {
-	if (PREV_ENV === undefined) delete process.env.PI_CODING_AGENT_DIR;
-	else process.env.PI_CODING_AGENT_DIR = PREV_ENV;
-});
+const { settingsPath: SETTINGS } = useIsolatedAgentEnv();
 beforeEach(() => {
 	rmSync(SETTINGS, { force: true });
 });

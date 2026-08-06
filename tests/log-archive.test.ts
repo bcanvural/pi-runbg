@@ -8,7 +8,17 @@
  */
 
 import { strict as assert } from "node:assert";
-import { lutimesSync, mkdtempSync, readFileSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import {
+	closeSync,
+	lutimesSync,
+	mkdtempSync,
+	openSync,
+	readFileSync,
+	statSync,
+	symlinkSync,
+	utimesSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -18,13 +28,21 @@ import {
 	createExclusiveLog,
 	DEFAULT_LOG_TTL_DAYS,
 	DEFAULT_MAX_LOG_BYTES,
+	LOG_HEARTBEAT_INTERVAL_MS,
 	LOG_TTL_ENV_VAR,
 	MAX_LOG_BYTES_ENV_VAR,
+	MIN_LOG_TTL_DAYS,
 	resolveLogTtlDays,
 	resolveMaxLogBytes,
+	touchLiveLog,
 } from "../src/log-archive.ts";
 import { IS_WINDOWS } from "../src/shell.ts";
 import { truncationMarker } from "../src/tool-result.ts";
+import { useIsolatedAgentEnv } from "./helpers/agent-env.ts";
+
+// Hermetic startup: pin the agent dir and scrub PI_RUNBG_* so the developer's
+// own cap/TTL settings cannot change these assertions (see helper).
+const env = useIsolatedAgentEnv();
 
 interface ToolDef {
 	name: string;
@@ -77,11 +95,68 @@ describe("log archive safety", () => {
 		assert.equal(resolveMaxLogBytes({ [MAX_LOG_BYTES_ENV_VAR]: "nope" }), DEFAULT_MAX_LOG_BYTES);
 	});
 
-	it("resolveLogTtlDays: default, explicit, disable", () => {
+	it("resolveLogTtlDays: default, explicit, disable, and floor", () => {
 		assert.equal(resolveLogTtlDays({}), DEFAULT_LOG_TTL_DAYS);
-		assert.equal(resolveLogTtlDays({ [LOG_TTL_ENV_VAR]: "1" }), 1);
-		assert.equal(resolveLogTtlDays({ [LOG_TTL_ENV_VAR]: "0" }), 0);
+		assert.equal(resolveLogTtlDays({ [LOG_TTL_ENV_VAR]: "3" }), 3);
+		assert.equal(resolveLogTtlDays({ [LOG_TTL_ENV_VAR]: "0" }), 0, "0 disables cleanup");
 		assert.equal(resolveLogTtlDays({ [LOG_TTL_ENV_VAR]: "junk" }), DEFAULT_LOG_TTL_DAYS);
+		// A TTL below the heartbeat interval would delete live sessions' logs
+		// in other pi processes, so positive values are floored.
+		assert.equal(resolveLogTtlDays({ [LOG_TTL_ENV_VAR]: "0.02" }), MIN_LOG_TTL_DAYS);
+		assert.equal(resolveLogTtlDays({ [LOG_TTL_ENV_VAR]: "-3" }), 0, "negative still disables");
+		assert.ok(LOG_HEARTBEAT_INTERVAL_MS < MIN_LOG_TTL_DAYS * 24 * 60 * 60 * 1000, "heartbeat must beat the floor");
+	});
+
+	it("touchLiveLog refreshes mtime by fd and by path, and never follows a symlink", () => {
+		const dir = mkdtempSync(join(tmpdir(), "runbg-touch-"));
+		const old = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+
+		// by path (lutimes)
+		const byPath = join(dir, "pi-runbg-9-aaaabbbb.log");
+		writeFileSync(byPath, "x");
+		utimesSync(byPath, old, old);
+		touchLiveLog({ path: byPath });
+		assert.ok(statSync(byPath).mtimeMs > old.getTime() + 1000, "path touch must refresh mtime");
+
+		// by fd (futimes) — the preferred route while the stream is open
+		const byFd = join(dir, "pi-runbg-10-aaaabbbb.log");
+		writeFileSync(byFd, "x");
+		utimesSync(byFd, old, old);
+		const fd = openSync(byFd, "r+");
+		try {
+			touchLiveLog({ fd });
+		} finally {
+			closeSync(fd);
+		}
+		assert.ok(statSync(byFd).mtimeMs > old.getTime() + 1000, "fd touch must refresh mtime");
+
+		if (!IS_WINDOWS) {
+			// A symlink planted at a freed log name must not get its TARGET
+			// stamped — that would reopen the path-trust hole 0600+O_EXCL closes.
+			const victim = join(dir, "victim.txt");
+			writeFileSync(victim, "precious");
+			utimesSync(victim, old, old);
+			const link = join(dir, "pi-runbg-11-aaaabbbb.log");
+			symlinkSync(victim, link);
+			touchLiveLog({ path: link });
+			assert.ok(
+				Math.abs(statSync(victim).mtimeMs - old.getTime()) < 2000,
+				"symlink target mtime must be untouched",
+			);
+		}
+	});
+
+	it("heartbeat keeps a quiet live session's log out of a sweep", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "runbg-hb-"));
+		const stale = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+		const logPath = join(dir, "pi-runbg-12-ccccdddd.log");
+		writeFileSync(logPath, "quiet dev server");
+		utimesSync(logPath, stale, stale); // looks abandoned…
+
+		touchLiveLog({ path: logPath }); // …but its session is alive
+
+		assert.equal(await cleanupStaleLogs({ dir }), 0, "a heartbeat'd log must survive the sweep");
+		assert.equal(readFileSync(logPath, "utf8"), "quiet dev server");
 	});
 
 	it("createExclusiveLog retries past a colliding path and never reuses it", () => {

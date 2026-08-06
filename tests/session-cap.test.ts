@@ -11,23 +11,13 @@
  */
 
 import { strict as assert } from "node:assert";
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { after, describe, it } from "node:test";
+import { describe, it } from "node:test";
 import extensionFactory, { MAX_SESSIONS_ENV_VAR } from "../src/index.ts";
 import { IS_WINDOWS } from "../src/shell.ts";
+import { useIsolatedAgentEnv } from "./helpers/agent-env.ts";
 
-const AGENT_DIR = mkdtempSync(join(tmpdir(), "runbg-agent-"));
-const PREV = { dir: process.env.PI_CODING_AGENT_DIR, cap: process.env[MAX_SESSIONS_ENV_VAR] };
-process.env.PI_CODING_AGENT_DIR = AGENT_DIR;
-process.env[MAX_SESSIONS_ENV_VAR] = "2"; // tiny cap keeps the test fast
-after(() => {
-	if (PREV.dir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-	else process.env.PI_CODING_AGENT_DIR = PREV.dir;
-	if (PREV.cap === undefined) delete process.env[MAX_SESSIONS_ENV_VAR];
-	else process.env[MAX_SESSIONS_ENV_VAR] = PREV.cap;
-});
+const env = useIsolatedAgentEnv();
+env.setEnv(MAX_SESSIONS_ENV_VAR, "2"); // tiny cap keeps the test fast
 
 interface ToolDef {
 	name: string;

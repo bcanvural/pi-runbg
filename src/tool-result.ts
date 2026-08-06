@@ -129,9 +129,9 @@ function generateChunkId(): string {
 	return randomBytes(3).toString("hex");
 }
 
-function approxTokenCount(bytes: Uint8Array): number {
+function approxTokenCount(byteLength: number): number {
 	// Mirror codex's rough `approx_token_count` behaviour: 4 bytes ≈ 1 token.
-	return Math.ceil(bytes.length / 4);
+	return Math.ceil(byteLength / 4);
 }
 
 function decode(bytes: Uint8Array): string {
@@ -171,7 +171,11 @@ function createOutputEnvelope(input: OutputEnvelopeInput): OutputEnvelope {
 		chunk_id: generateChunkId(),
 		wall_time_seconds: input.wallTimeSec,
 		output: truncation.content,
-		original_token_count: approxTokenCount(input.collected),
+		// Codex counts the buffer's total_bytes() = retained + omitted, so the
+		// figure describes the volume the call actually saw, not what survived
+		// bounding. (Slight overcount: inline omission markers are part of
+		// `collected`. Off by ~150 bytes per omission event.)
+		original_token_count: approxTokenCount(input.collected.length + (input.omittedBytes ?? 0)),
 	};
 	if (input.logPath) envelope.log_path = input.logPath;
 	if (input.logStatus && input.logStatus !== "complete") envelope.log_status = input.logStatus;

@@ -16,7 +16,7 @@
  *     (`PI_RUNBG_LOG_TTL_DAYS`, `0` disables).
  */
 
-import { closeSync, openSync } from "node:fs";
+import { closeSync, futimesSync, lutimesSync, openSync } from "node:fs";
 import { lstat, readdir, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -51,13 +51,49 @@ export function resolveMaxLogBytes(env: Record<string, string | undefined> = pro
 	return Math.floor(parsed);
 }
 
-/** Age (days) after which stale logs are deleted at session_start. `<= 0` disables cleanup. */
+/**
+ * Age (days) after which stale logs are deleted at session_start. `<= 0`
+ * disables cleanup. Positive values are floored at `MIN_LOG_TTL_DAYS`: the
+ * sweep is mtime-based and live logs are kept fresh by an hourly heartbeat
+ * (`touchLiveLog`), so a TTL shorter than that heartbeat would delete logs
+ * belonging to running sessions in other pi processes.
+ */
 export function resolveLogTtlDays(env: Record<string, string | undefined> = process.env): number {
 	const raw = env[LOG_TTL_ENV_VAR];
 	if (raw === undefined || raw.trim() === "") return DEFAULT_LOG_TTL_DAYS;
 	const parsed = Number(raw);
 	if (!Number.isFinite(parsed)) return DEFAULT_LOG_TTL_DAYS;
-	return parsed;
+	if (parsed <= 0) return 0;
+	return Math.max(MIN_LOG_TTL_DAYS, parsed);
+}
+
+/** Interval between liveness touches of open session logs. */
+export const LOG_HEARTBEAT_INTERVAL_MS = 60 * 60 * 1000;
+/** Floor for a positive TTL — comfortably above the heartbeat interval. */
+export const MIN_LOG_TTL_DAYS = 1;
+
+/**
+ * Mark a live session's log as recently used so the age-based sweep in other
+ * pi processes never deletes it while its session is merely quiet (a
+ * long-running dev server can be output-silent for days).
+ *
+ * Never uses path-based `utimes`: that follows symlinks, so if our log were
+ * unlinked and an attacker claimed the freed name with a symlink, the
+ * heartbeat would keep stamping an arbitrary file. Prefers the open fd
+ * (`futimes`, immune to path games entirely) and falls back to `lutimes`,
+ * which touches a symlink itself rather than its target.
+ */
+export function touchLiveLog(target: { fd?: number; path?: string }): void {
+	const now = new Date();
+	try {
+		if (typeof target.fd === "number") {
+			futimesSync(target.fd, now, now);
+			return;
+		}
+		if (target.path) lutimesSync(target.path, now, now);
+	} catch {
+		// unlinked, read-only fs, permissions — nothing to do
+	}
 }
 
 /**

@@ -15,6 +15,10 @@ import {
 	sanitizeMeta,
 	type WakeMessage,
 } from "../src/completion.ts";
+import { useIsolatedAgentEnv } from "./helpers/agent-env.ts";
+
+// Hermetic startup: pin the agent dir and scrub PI_RUNBG_* (see helper).
+useIsolatedAgentEnv();
 
 class FakeSession implements CompletionSessionLike {
 	readonly id: number;

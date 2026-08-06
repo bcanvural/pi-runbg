@@ -10,13 +10,19 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { createWriteStream, type WriteStream } from "node:fs";
+import { createWriteStream, unlinkSync, type WriteStream } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { type CollectResult, collectOutputUntilDeadline } from "./collect.ts";
 import { HeadTailBuffer } from "./head-tail-buffer.ts";
-import { createExclusiveLog, type LogStatus, MAX_LOG_BYTES_ENV_VAR, resolveMaxLogBytes } from "./log-archive.ts";
+import {
+	createExclusiveLog,
+	type LogStatus,
+	MAX_LOG_BYTES_ENV_VAR,
+	resolveMaxLogBytes,
+	touchLiveLog,
+} from "./log-archive.ts";
 import { Gate, Notify } from "./notify.ts";
 import { type SpawnedChild, spawnChild } from "./pty.ts";
 
@@ -152,8 +158,23 @@ export class ExecSession {
 			});
 		} catch (err: any) {
 			self.markFailure(err?.message ?? String(err));
-			self.logStream?.end();
+			// No child ever ran, so the log we just created would linger empty
+			// until the TTL sweep. Close the stream FIRST, then unlink from its
+			// 'close' callback: Windows refuses to unlink a file with an open
+			// handle (POSIX tolerates it, but ordering keeps both identical).
+			const stream = self.logStream;
 			self.logStream = undefined;
+			self.logStatusValue = "unavailable";
+			if (stream) {
+				stream.once("close", () => {
+					try {
+						unlinkSync(self.logPath);
+					} catch {
+						// already gone / not permitted — harmless
+					}
+				});
+				stream.end();
+			}
 			self.exitedAc.abort();
 			self.outputClosed.close();
 			return self;
@@ -241,6 +262,19 @@ export class ExecSession {
 	/** Recoverability of the on-disk log (divergence #3, log-archive.ts). */
 	get logStatus(): LogStatus {
 		return this.logStatusValue;
+	}
+
+	/**
+	 * Keep this session's log looking recently used, so the age-based sweep in
+	 * another pi process cannot delete it while the session is merely quiet.
+	 * Uses the open fd when the stream still holds one (immune to path games),
+	 * else the path via `lutimes`. Capped/failed logs are still touched: a
+	 * partial log remains the recovery surface.
+	 */
+	touchLog(): void {
+		if (this.logStatusValue === "unavailable") return;
+		const fd = (this.logStream as unknown as { fd?: number } | undefined)?.fd;
+		touchLiveLog(typeof fd === "number" ? { fd } : { path: this.logPath });
 	}
 
 	/**
@@ -353,6 +387,16 @@ export class ExecSession {
 	kill(signal: NodeJS.Signals = "SIGTERM"): void {
 		if (this.state.hasExited) return;
 		this.child.kill(signal);
+	}
+
+	/**
+	 * Deliver an interrupt the way a terminal's Ctrl-C would: SIGINT to the
+	 * process GROUP (pipes children are group leaders), so the child and its
+	 * descendants see it. Used for pipes-mode `\x03` input, where no line
+	 * discipline exists to translate the byte (codex parity — see index.ts).
+	 */
+	interrupt(): void {
+		this.kill("SIGINT");
 	}
 
 	get hasExited(): boolean {

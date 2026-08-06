@@ -18,6 +18,25 @@ its names.
 
 ### Fixed
 
+- **`\x03` now actually interrupts a pipes-mode session** (divergence #8,
+  code review): a PTY's line discipline turns `0x03` into SIGINT, but pipes
+  have no line discipline, so upstream's literal byte-write was inert for
+  nearly every child — the model's documented "Ctrl-C" silently did nothing.
+  `chars` consisting of exactly `\x03` now sends SIGINT to the process group
+  (codex maps interrupt input to a real signal for non-tty processes).
+  Embedded `0x03` in longer input still writes, and `chars_b64` is never
+  reinterpreted, so a literal `0x03` can still be delivered as data.
+- **`original_token_count` again describes the volume the call saw**
+  (code review): after the divergence #4 bounding it was computed from the
+  capped payload, understating a burst by orders of magnitude. It now counts
+  retained + omitted bytes, as codex's `total_bytes()` does (slight
+  overcount: inline omission markers are included).
+- **Omission markers no longer promise the log holds the full stream**
+  (code review): they point at `log_path` / `log_status` instead, since the
+  log can be capped or degraded (divergence #3).
+- **A failed spawn no longer leaves an empty log file behind** (code
+  review): the log is unlinked from the stream's `close` callback (Windows
+  refuses to unlink an open handle) and `log_status` reports `unavailable`.
 - **Mid-session `/runbg off` no longer strands pi without a shell** (code
   review): with `--replace-builtin-bash`, disabling now restores the `bash`
   runbg removed — tracked with a latch so a `bash` disabled independently of
@@ -43,6 +62,15 @@ its names.
 
 ### Added
 
+- **Log liveness heartbeat and TTL floor** (divergence #3 follow-up, code
+  review): the stale-log sweep is mtime-based, so a live-but-quiet session (a
+  dev server idle for days) looked abandoned to another pi process, which
+  would delete its log while it was still open — leaving results pointing at
+  a dangling path while still claiming completeness. An hourly unref'd
+  heartbeat now refreshes open logs via the stream's fd (`futimes`) or
+  `lutimes` — never path-based `utimes`, which follows symlinks and would let
+  a planted link redirect the touch — and a positive `PI_RUNBG_LOG_TTL_DAYS`
+  is floored at 1 day so no configured TTL can undercut the heartbeat.
 - **Per-session interaction serialization** (divergence #7, code review,
   new `src/interaction-lock.ts`): pi runs a turn's tool batch in parallel, so
   two `write_stdin` calls on one session could starve each other's drain (a

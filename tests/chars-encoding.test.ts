@@ -19,6 +19,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import extensionFactory from "../src/index.ts";
+import { useIsolatedAgentEnv } from "./helpers/agent-env.ts";
+
+// Hermetic startup: pin the agent dir and scrub PI_RUNBG_* (see helper).
+useIsolatedAgentEnv();
 
 interface ToolDef {
 	name: string;
@@ -93,6 +97,9 @@ async function spawnCapture() {
 		async send(chars: string) {
 			await h.call("write_stdin", { session_id: sid, chars, yield_time_ms: 250 });
 		},
+		async sendB64(chars_b64: string) {
+			await h.call("write_stdin", { session_id: sid, chars_b64, yield_time_ms: 250 });
+		},
 		async finish(): Promise<Buffer> {
 			// Force-kill the cat session so the tmpfile is closed and flushed.
 			await h.call("kill_session", { session_id: sid });
@@ -123,11 +130,29 @@ describe("write_stdin chars encoding", () => {
 		assert.deepEqual([...buf], [0x41, 0x1b, 0x42], `bytes=${[...buf].map((b) => b.toString(16))}`);
 	});
 
-	it("writes a real Ctrl-C (0x03) when chars contains it", async () => {
+	// Divergence #8 (UPSTREAM.md): on pipes a lone 0x03 from `chars` is an
+	// INTERRUPT, not a data byte — upstream wrote the inert byte, which almost
+	// no child interprets, so the model's "Ctrl-C" silently did nothing.
+	// Codex maps interrupt input to a real signal for non-tty processes.
+	it("a lone real Ctrl-C (0x03) in chars signals instead of writing (pipes)", async () => {
 		const c = await spawnCapture();
 		await c.send("\u0003");
 		const buf = await c.finish();
+		assert.deepEqual([...buf], [], `nothing should reach stdin; bytes=${[...buf].map((b) => b.toString(16))}`);
+	});
+
+	it("chars_b64 still delivers a literal 0x03 byte (raw-bytes escape hatch)", async () => {
+		const c = await spawnCapture();
+		await c.sendB64(Buffer.from([0x03]).toString("base64"));
+		const buf = await c.finish();
 		assert.deepEqual([...buf], [0x03], `bytes=${[...buf].map((b) => b.toString(16))}`);
+	});
+
+	it("an embedded 0x03 in a longer chars payload is written, not signalled", async () => {
+		const c = await spawnCapture();
+		await c.send("A\u0003B");
+		const buf = await c.finish();
+		assert.deepEqual([...buf], [0x41, 0x03, 0x42], `bytes=${[...buf].map((b) => b.toString(16))}`);
 	});
 
 	it("decodes \\n (backslash + n) into a real LF byte", async () => {
@@ -151,11 +176,13 @@ describe("write_stdin chars encoding", () => {
 		assert.deepEqual([...buf], [0x41, 0x1b, 0x42], `bytes=${[...buf].map((b) => b.toString(16))}`);
 	});
 
-	it("decodes \\x03 (Ctrl-C) into a real 0x03 byte", async () => {
+	it("decodes \\x03 (Ctrl-C) and, alone on pipes, delivers it as a signal", async () => {
 		const c = await spawnCapture();
 		await c.send("\\x03");
 		const buf = await c.finish();
-		assert.deepEqual([...buf], [0x03], `bytes=${[...buf].map((b) => b.toString(16))}`);
+		// The escape still decodes to one 0x03 byte; divergence #8 then routes a
+		// lone interrupt byte to SIGINT rather than the child's stdin.
+		assert.deepEqual([...buf], [], `nothing should reach stdin; bytes=${[...buf].map((b) => b.toString(16))}`);
 	});
 
 	it("decodes \\\\ into a single literal backslash (0x5C)", async () => {

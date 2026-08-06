@@ -9,6 +9,10 @@ import { describe, it } from "node:test";
 import extensionFactory from "../src/index.ts";
 import { isPtyAvailable } from "../src/pty.ts";
 import { IS_WINDOWS } from "../src/shell.ts";
+import { useIsolatedAgentEnv } from "./helpers/agent-env.ts";
+
+// Hermetic startup: pin the agent dir and scrub PI_RUNBG_* (see helper).
+useIsolatedAgentEnv();
 
 /**
  * True when a real python3 exists. On Windows the "python3" on PATH may be
