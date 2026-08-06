@@ -10,6 +10,21 @@ its names.
 
 ### Changed
 
+- **Pi's built-in `bash` tool is kept by default** (divergence #1,
+  `UPSTREAM.md`): upstream removes it unless `--keep-builtin-bash`; runbg
+  keeps it unless `--replace-builtin-bash`. Templates that never mention the
+  session tools keep a working shell, and `bash`-guarding extensions are not
+  silently bypassed. Covered by `tests/builtin-bash.test.ts`.
+
+### Added
+
+- Startup warning when the upstream `pi-unified-exec` package is installed
+  alongside this fork (both register the same five tool names).
+- Headless acceptance suite (`tests/headless.test.ts`, design §9): the full
+  tool surface with `ctx.ui` undefined, process-group reaping at
+  `session_shutdown`, and wake delivery as a pure `sendMessage`
+  (`runbg-completed`, `followUp` + `triggerTurn`) with no UI involved.
+
 - **Forked from pi-unified-exec v0.9.0** (`7c8c1d8`, full history preserved;
   see `UPSTREAM.md`). Package renamed to `pi-runbg`; identity renames only,
   no tool-surface or behavior changes in this entry: env vars

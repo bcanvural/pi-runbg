@@ -178,6 +178,7 @@ interface ExtensionCtx {
 	exitUnsubscribers: Map<number, () => void>;
 	warnedShellFallback: boolean;
 	notifiedBashSource: boolean;
+	warnedForeignTools: boolean;
 	/**
 	 * Sessions spawned but not yet inserted into the store (inside the
 	 * early-exit grace window). session_shutdown must see these too —
@@ -186,6 +187,38 @@ interface ExtensionCtx {
 	pendingSessions: Set<ExecSession>;
 	/** Set on session_shutdown; new exec_commands are rejected. */
 	shuttingDown: boolean;
+}
+
+const RUNBG_TOOL_NAMES = ["exec_command", "write_stdin", "set_on_exit", "kill_session", "list_sessions"];
+
+/**
+ * The upstream package this fork derives from (pi-unified-exec) registers the
+ * same five tool names; installing both means one registration silently
+ * shadows the other and prompt guidance may drive the wrong one. Detect the
+ * known collision by source path and warn once per session.
+ * `getAllTools` is probed defensively: the peer floor (0.80.5) and the test
+ * harnesses may not provide it.
+ */
+function warnIfUpstreamPackagePresent(ctx: ExtensionCtx, pi: ExtensionAPI): void {
+	if (ctx.warnedForeignTools) return;
+	const getAllTools = (pi as { getAllTools?: () => Array<{ name: string; sourceInfo?: { path?: string } }> })
+		.getAllTools;
+	if (typeof getAllTools !== "function") return;
+	let infos: Array<{ name: string; sourceInfo?: { path?: string } }>;
+	try {
+		infos = getAllTools.call(pi);
+	} catch {
+		return;
+	}
+	const foreign = infos.filter(
+		(t) => RUNBG_TOOL_NAMES.includes(t.name) && (t.sourceInfo?.path ?? "").includes("pi-unified-exec"),
+	);
+	if (foreign.length === 0) return;
+	ctx.warnedForeignTools = true;
+	ctx.ui?.notify(
+		`runbg: pi-unified-exec is also installed and registers ${foreign.length} of the same tool name(s) — uninstall one of the two packages.`,
+		"warning",
+	);
 }
 
 type ExecCommandArgs = {
@@ -983,15 +1016,19 @@ export default function (pi: ExtensionAPI) {
 		exitUnsubscribers: new Map(),
 		warnedShellFallback: false,
 		notifiedBashSource: false,
+		warnedForeignTools: false,
 		pendingSessions: new Set(),
 		shuttingDown: false,
 	};
 
-	// By default, runbg removes pi's built-in `bash` tool so the LLM
-	// is steered toward exec_command/write_stdin. Pass --keep-builtin-bash to
-	// preserve the built-in alongside the runbg tools.
-	pi.registerFlag("keep-builtin-bash", {
-		description: "Keep pi's built-in `bash` tool alongside exec_command/write_stdin. By default it is removed.",
+	// Divergence #1 from upstream (see UPSTREAM.md): upstream removes pi's
+	// built-in `bash` unless --keep-builtin-bash is passed; runbg keeps it
+	// unless --replace-builtin-bash is. System-prompt templates that never
+	// mention the session tools — and extensions that guard `bash` calls —
+	// need a working `bash`, so exec_command stays additive by default.
+	pi.registerFlag("replace-builtin-bash", {
+		description:
+			"Remove pi's built-in `bash` tool so exec_command/write_stdin are the only shell (upstream pi-unified-exec's default). By default runbg keeps bash.",
 		type: "boolean",
 		default: false,
 	});
@@ -1018,17 +1055,18 @@ export default function (pi: ExtensionAPI) {
 		ctx.shuttingDown = false; // reload/new/resume re-arms the extension
 		ctx.coordinator.reset(); // never resurrect wakes from a previous session
 		updateRunningSessionsUi(ctx);
-		// Default behavior is to remove the built-in `bash` tool. Only keep it
-		// if --keep-builtin-bash was passed. Flag lookup uses the registered
-		// name without leading dashes.
-		const keep = pi.getFlag("keep-builtin-bash") ?? pi.getFlag("--keep-builtin-bash");
-		if (keep !== true) {
+		// Built-in `bash` stays available by default (divergence #1,
+		// UPSTREAM.md). Only --replace-builtin-bash removes it. Flag lookup
+		// uses the registered name without leading dashes.
+		const replace = pi.getFlag("replace-builtin-bash") ?? pi.getFlag("--replace-builtin-bash");
+		if (replace === true) {
 			const active = pi.getActiveTools();
 			const filtered = active.filter((name) => name !== "bash");
 			if (filtered.length !== active.length) {
 				pi.setActiveTools(filtered);
 			}
 		}
+		warnIfUpstreamPackagePresent(ctx, pi);
 		if (!isPtyAvailable() && eventCtx.hasUI) {
 			// Non-fatal: pipes mode still works.
 			eventCtx.ui.notify(

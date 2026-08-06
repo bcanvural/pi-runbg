@@ -342,13 +342,20 @@ without an extra probing call.
 
 ## Flag
 
-By default, this extension **removes pi's built-in `bash` tool** from the
-active set at session start so the LLM is steered toward `exec_command` /
-`write_stdin`.
+By default, this extension **keeps pi's built-in `bash` tool** alongside the
+session tools — quick one-shot commands stay on `bash`, long-lived or
+interactive work goes through `exec_command` / `write_stdin`. (This inverts
+the upstream default — divergence #1 in [UPSTREAM.md](./UPSTREAM.md):
+prompts and guard extensions that only know `bash` must keep working.)
 
-- `--keep-builtin-bash` — preserve the built-in `bash` alongside the
-  runbg tools. Useful if you've got skills or prompts that explicitly
-  expect `bash(cmd, timeout)`.
+- `--replace-builtin-bash` — remove the built-in `bash` at session start so
+  the session tools are the only shell (upstream pi-unified-exec's default,
+  codex parity). Use with prompts written for codex's `unified_exec`-only
+  surface.
+
+At session start the extension also warns if it detects the upstream
+`pi-unified-exec` package installed alongside — both register the same five
+tool names; uninstall one.
 
 ## TUI rendering
 
