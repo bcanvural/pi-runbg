@@ -53,7 +53,18 @@ export interface ProcessResultDetails extends OutputResultDetails {
 	status: ProcessStatus;
 	yield_time_ms?: number;
 	wait_mode?: "relative" | "absolute";
-	wait_status?: "completed" | "relative_deadline_reached" | "absolute_deadline_reached" | "cancelled";
+	/**
+	 * How the wait ended. "preempted" (divergence #7) means another
+	 * interaction wanted this session, so a progress poll returned early with
+	 * whatever it had drained — distinct from "cancelled" (the caller's own
+	 * tool call was aborted); the model may simply poll again.
+	 */
+	wait_status?:
+		| "completed"
+		| "relative_deadline_reached"
+		| "absolute_deadline_reached"
+		| "cancelled"
+		| "preempted";
 	yield_until?: string;
 	effective_wait_ms?: number;
 	on_exit?: OnExitPolicy;

@@ -33,7 +33,8 @@ import { Type, type TUnsafe } from "typebox";
 import type { CollectResult } from "./collect.ts";
 import { CompletionCoordinator, type OnExitPolicy, sanitizeMeta } from "./completion.ts";
 import { formatElapsed } from "./format-time.ts";
-import { cleanupStaleLogs } from "./log-archive.ts";
+import { InteractionCancelled, type InteractionHandle, InteractionLocks } from "./interaction-lock.ts";
+import { cleanupStaleLogs, type LogStatus } from "./log-archive.ts";
 import { type LongWaitOutcome, startRateLimitedStream, waitForExitOrDeadline } from "./long-wait.ts";
 import { sleep } from "./notify.ts";
 import { sanitizeOutputText } from "./output-safety.ts";
@@ -195,9 +196,29 @@ interface ExtensionCtx {
 	processExitHandler: (() => void) | undefined;
 	/** True only while WE removed pi's built-in bash (divergence #1 latch). */
 	removedBuiltinBash: boolean;
+	/** Per-session interaction serialization (divergence #7). */
+	locks: InteractionLocks;
+	/** Recently reaped sessions, for graceful echoes to queued callers. */
+	reaped: Map<number, ReapedSession>;
+}
+
+/** Bounded exit facts kept after a session leaves the store. */
+interface ReapedSession {
+	exitCode: number | null;
+	signal: NodeJS.Signals | null;
+	failure: string | null;
+	tty: boolean;
+	logPath: string;
+	logStatus: LogStatus;
+	cwd: string;
+	command: string;
+	totalBytes: number;
 }
 
 const RUNBG_TOOL_NAMES = ["exec_command", "write_stdin", "set_on_exit", "kill_session", "list_sessions"];
+
+/** How many just-reaped sessions keep exit facts for graceful echoes (divergence #7). */
+const MAX_REAPED_TOMBSTONES = 32;
 
 /**
  * Divergence #2 (UPSTREAM.md, design §7.2): last-resort child reaping for
@@ -620,9 +641,27 @@ async function runExecCommand(
 		// lost across turns.
 
 		// Wait until the yield deadline (or abort/exit). Stream updates meanwhile.
+		// The session is in the store now, so the picker/kill path can contend:
+		// take the lock preemptibly for the remainder of the initial yield.
 		const deadlineMs = start + yieldTimeMs;
-		const pollStream = startStreaming(session, onUpdate, deadlineMs, signal);
-		const collected = await session.collect({ deadlineMs, externalAbort: signal });
+		let initialHandle: InteractionHandle | undefined;
+		try {
+			initialHandle = await ctx.locks.for(session.id).acquire({ preemptible: true, signal });
+		} catch (err) {
+			if (!(err instanceof InteractionCancelled)) throw err;
+			// Cancelled while queued behind a kill: fall through unlocked with
+			// no drain — the terminal path below reports the session state.
+		}
+		const initialAbort = initialHandle
+			? signal
+				? AbortSignal.any([signal, initialHandle.preempt])
+				: initialHandle.preempt
+			: signal;
+		const pollStream = startStreaming(session, onUpdate, deadlineMs, initialAbort);
+		const collected = initialHandle
+			? await session.collect({ deadlineMs, externalAbort: initialAbort })
+			: { bytes: new Uint8Array(0), omittedBytes: 0 };
+		initialHandle?.release();
 		pollStream.stop();
 
 		session.touch();
@@ -694,8 +733,10 @@ async function runWriteStdin(
 ): Promise<ResponseShape> {
 	const finalizeResponse = (input: FinalizeInput): ResponseShape =>
 		finalizeProcessResult({ ...input, operation: "write_stdin" });
-	const session = ctx.store.get(args.session_id);
-	if (!session) {
+	// NOTE: the store lookup is deliberately repeated after the lock is held
+	// (below) — a call queued behind the one that observed the exit must see
+	// the reaped state, not the pre-lock snapshot.
+	if (!ctx.store.get(args.session_id) && !ctx.reaped.has(args.session_id)) {
 		throw new Error(`unknown session_id: ${args.session_id}`);
 	}
 	const writeBytes = resolveWriteInput(args);
@@ -719,7 +760,9 @@ async function runWriteStdin(
 		);
 	}
 	if (hasYieldUntil) {
-		return runAbsoluteWait(ctx, session, args.yield_until!, signal, onUpdate, toolCallId);
+		const waitSession = ctx.store.get(args.session_id);
+		if (!waitSession) return reapedEcho(ctx, args.session_id, "absolute");
+		return runAbsoluteWait(ctx, waitSession, args.yield_until!, signal, onUpdate, toolCallId);
 	}
 
 	const yieldTimeMs = isEmptyPoll
@@ -727,11 +770,37 @@ async function runWriteStdin(
 		: clampYield(args.yield_time_ms, DEFAULT_WRITE_STDIN_YIELD_MS);
 
 	const start = Date.now();
+
+	// Serialize against other interactions with this session (divergence #7).
+	// Empty polls are preemptible: they must not keep parking once anything
+	// else wants the session. Input writes are short and bounded, so they run
+	// to completion.
+	let handle: InteractionHandle;
+	try {
+		handle = await ctx.locks.for(args.session_id).acquire({ preemptible: isEmptyPoll, signal });
+	} catch (err) {
+		if (err instanceof InteractionCancelled) {
+			// Cancelled while queued: never write, never drain. Report the
+			// session as-is so the model knows nothing was delivered.
+			return cancelledWhileQueued(ctx, args.session_id, isEmptyPoll);
+		}
+		throw err;
+	}
+
+	// Re-read under the lock: a call queued behind the observer of the exit
+	// must produce a truthful terminal echo, not "unknown session_id".
+	const session = ctx.store.get(args.session_id);
+	if (!session) {
+		handle.release();
+		return reapedEcho(ctx, args.session_id, isEmptyPoll ? "relative" : undefined);
+	}
 	session.touch();
 
 	// Observation lease: while this call may return terminal status, a
 	// concurrent exit is held instead of enqueuing a wake (see completion.ts).
 	ctx.coordinator.beginObservation(session.id, toolCallId);
+	// The drain must end on the caller's cancellation OR on preemption.
+	const drainAbort = signal ? AbortSignal.any([signal, handle.preempt]) : handle.preempt;
 	try {
 		let writeFailure: string | null = null;
 		if (!isEmptyPoll && writeBytes) {
@@ -742,7 +811,7 @@ async function runWriteStdin(
 			}
 			if (!ok && session.hasExited) {
 				// Session already exited; return its final state.
-				const collected = await session.collect({ deadlineMs: Date.now() + 50, externalAbort: signal });
+				const collected = await session.collect({ deadlineMs: Date.now() + 50, externalAbort: drainAbort });
 				const armed = ctx.coordinator.isArmed(session.id);
 				removeSession(ctx, session.id);
 				ctx.coordinator.markPendingTerminal(session.id, toolCallId);
@@ -772,8 +841,8 @@ async function runWriteStdin(
 		}
 
 		const deadlineMs = start + yieldTimeMs;
-		const pollStream = startStreaming(session, onUpdate, deadlineMs, signal);
-		const collected = await session.collect({ deadlineMs, externalAbort: signal });
+		const pollStream = startStreaming(session, onUpdate, deadlineMs, drainAbort);
+		const collected = await session.collect({ deadlineMs, externalAbort: drainAbort });
 		pollStream.stop();
 		const wallSec = (Date.now() - start) / 1000;
 
@@ -825,7 +894,15 @@ async function runWriteStdin(
 				...(isEmptyPoll
 					? {
 							wait_mode: "relative" as const,
-							wait_status: signal?.aborted ? ("cancelled" as const) : ("relative_deadline_reached" as const),
+							// "preempted" is distinct from "cancelled": nobody cancelled
+							// this call — another interaction wanted the session, so this
+							// poll returned early WITH its drained output. The model may
+							// simply poll again.
+							wait_status: signal?.aborted
+								? ("cancelled" as const)
+								: handle.preempted
+									? ("preempted" as const)
+									: ("relative_deadline_reached" as const),
 						}
 					: {}),
 				tool_time_utc: nowUtcIso(),
@@ -836,7 +913,76 @@ async function runWriteStdin(
 		// Handler failure: release the lease so the wake stays eligible.
 		ctx.coordinator.releaseObservation(session.id, toolCallId);
 		throw err;
+	} finally {
+		handle.release();
 	}
+}
+
+/**
+ * Result for a call that was cancelled while queued behind another
+ * interaction: nothing was written, nothing drained.
+ */
+function cancelledWhileQueued(ctx: ExtensionCtx, sessionId: number, isEmptyPoll: boolean): ResponseShape {
+	const session = ctx.store.get(sessionId);
+	const reaped = ctx.reaped.get(sessionId);
+	return finalizeProcessResult({
+		operation: "write_stdin",
+		wallTimeSec: 0,
+		collected: new Uint8Array(0),
+		totalBytes: session?.totalBytesSeen ?? reaped?.totalBytes,
+		sessionId: session ? session.id : undefined,
+		exitCode: session ? undefined : (reaped?.exitCode ?? undefined),
+		signal: session ? null : (reaped?.signal ?? null),
+		failure: "cancelled before this interaction ran: no input was written and no output was drained",
+		tty: session?.tty ?? reaped?.tty ?? false,
+		logPath: session?.logPath ?? reaped?.logPath,
+		logStatus: session?.logStatus ?? reaped?.logStatus,
+		cwd: session?.cwd ?? reaped?.cwd,
+		command: session?.displayCommand ?? reaped?.command,
+		extra: {
+			...(isEmptyPoll ? { wait_mode: "relative" as const, wait_status: "cancelled" as const } : {}),
+			tool_time_utc: nowUtcIso(),
+		},
+	});
+}
+
+/**
+ * Terminal echo for a session that another call already observed and reaped
+ * while this one waited for the lock. Carries the exit facts and points at
+ * the log for the output that went to the concurrent call.
+ */
+function reapedEcho(
+	ctx: ExtensionCtx,
+	sessionId: number,
+	waitMode: "relative" | "absolute" | undefined,
+): ResponseShape {
+	const reaped = ctx.reaped.get(sessionId);
+	if (!reaped) {
+		throw new Error(`unknown session_id: ${sessionId}`);
+	}
+	return finalizeProcessResult({
+		operation: "write_stdin",
+		wallTimeSec: 0,
+		collected: new Uint8Array(0),
+		totalBytes: reaped.totalBytes,
+		sessionId: undefined,
+		exitCode: reaped.exitCode ?? undefined,
+		signal: reaped.signal,
+		failure:
+			reaped.failure ??
+			"session already exited; its final output was delivered to a concurrent call — full stream at log_path",
+		tty: reaped.tty,
+		logPath: reaped.logPath,
+		logStatus: reaped.logStatus,
+		cwd: reaped.cwd,
+		command: reaped.command,
+		extra: {
+			wait_mode: waitMode,
+			wait_status: waitMode ? ("completed" as const) : undefined,
+			completion_delivery: "direct",
+			tool_time_utc: nowUtcIso(),
+		},
+	});
 }
 
 /** Shared "exited" extra fields for direct terminal delivery. */
@@ -915,7 +1061,12 @@ async function runAbsoluteWait(
 		// then drain the bounded retained output once. externalAbort is
 		// deliberately NOT passed: exit won, and the bounded final drain must
 		// complete even if cancellation fired at the same instant.
-		const collected = await session.collect({ deadlineMs: Date.now() + 1000 });
+		// The park above ran lock-free (it never drains); the DRAIN takes the
+		// lock, non-preemptibly and briefly (divergence #7).
+		const drainHandle = await ctx.locks.for(session.id).acquire({ preemptible: false });
+		const collected = await session
+			.collect({ deadlineMs: Date.now() + 1000 })
+			.finally(() => drainHandle.release());
 		removeSession(ctx, session.id);
 		ctx.coordinator.markPendingTerminal(session.id, toolCallId);
 		return finalizeResponse({
@@ -968,8 +1119,12 @@ async function runAbsoluteWait(
 	}
 
 	// Absolute deadline reached while still running: one bounded drain
-	// (ordinary poll semantics), release the lease, keep the wake armed.
-	const collected = await session.collect({ deadlineMs: Date.now(), externalAbort: signal });
+	// (ordinary poll semantics, lock held briefly), release the lease, keep
+	// the wake armed.
+	const deadlineHandle = await ctx.locks.for(session.id).acquire({ preemptible: false });
+	const collected = await session
+		.collect({ deadlineMs: Date.now(), externalAbort: signal })
+		.finally(() => deadlineHandle.release());
 	session.touch();
 	ctx.coordinator.releaseObservation(session.id, toolCallId);
 	return finalizeResponse({
@@ -1036,8 +1191,14 @@ async function terminateSessionById(
 		escalated = true;
 		await waitForExitOrDeadline({ exited: session.exited, durationMs: 500 });
 	}
-	// Final drain.
-	const collected = await session.collect({ deadlineMs: Date.now() + 100 });
+	// Final drain — serialized against any live poll (divergence #7) so the
+	// trailing output lands in exactly one result. The kill/escalation above
+	// runs OUTSIDE the lock so a SIGTERM-ignoring child can never make the
+	// kill wait behind an in-flight interaction.
+	const drainHandle = await ctx.locks.for(sid).acquire({ preemptible: false });
+	const collected = await session
+		.collect({ deadlineMs: Date.now() + 100 })
+		.finally(() => drainHandle.release());
 	const killed = session.hasExited;
 	if (killed) {
 		ctx.coordinator.confirmKill(sid);
@@ -1132,7 +1293,35 @@ function unwatchSessionExit(ctx: ExtensionCtx, id: number): void {
 
 function removeSession(ctx: ExtensionCtx, id: number): ExecSession | undefined {
 	unwatchSessionExit(ctx, id);
-	return ctx.store.remove(id);
+	const removed = ctx.store.remove(id);
+	if (removed) rememberReaped(ctx, removed);
+	ctx.locks.forget(id);
+	return removed;
+}
+
+/**
+ * Remember a just-reaped session so a call that was queued behind the one
+ * that observed the exit gets a truthful `[exited]` echo instead of a thrown
+ * "unknown session_id" (which pi renders as a failed tool call and invites
+ * retry loops). Bounded ring; cleared on session_start.
+ */
+function rememberReaped(ctx: ExtensionCtx, session: ExecSession): void {
+	ctx.reaped.set(session.id, {
+		exitCode: session.exitCode,
+		signal: session.signal,
+		failure: session.failureMessage,
+		tty: session.tty,
+		logPath: session.logPath,
+		logStatus: session.logStatus,
+		cwd: session.cwd,
+		command: session.displayCommand,
+		totalBytes: session.totalBytesSeen,
+	});
+	while (ctx.reaped.size > MAX_REAPED_TOMBSTONES) {
+		const oldest = ctx.reaped.keys().next();
+		if (oldest.done) break;
+		ctx.reaped.delete(oldest.value);
+	}
 }
 
 function clearSessionExitWatchers(ctx: ExtensionCtx): void {
@@ -1235,6 +1424,8 @@ export default function (pi: ExtensionAPI) {
 		shuttingDown: false,
 		processExitHandler: undefined,
 		removedBuiltinBash: false,
+		locks: new InteractionLocks(),
+		reaped: new Map(),
 	};
 
 	// Divergence #1 from upstream (see UPSTREAM.md): upstream removes pi's
@@ -1270,6 +1461,8 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui = eventCtx.ui;
 		ctx.shuttingDown = false; // reload/new/resume re-arms the extension
 		ctx.coordinator.reset(); // never resurrect wakes from a previous session
+		ctx.locks.clear();
+		ctx.reaped.clear(); // session ids restart; stale tombstones must not echo
 		updateRunningSessionsUi(ctx);
 		// Tool gating (divergence #5) + built-in-bash policy (divergence #1):
 		// dormant unless /runbg enabled; bash removed only while enabled AND
