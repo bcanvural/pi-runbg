@@ -24,6 +24,22 @@ its names.
   than the stored setting — is the reason `bash` is gone, and
   `/runbg replace-bash off` warns instead of silently failing when the flag
   overrules it.
+- **`exec_command` guidance now tells the model not to background inside
+  `cmd`.** Reaching for `nohup cmd &` is the correct habit with a one-shot
+  `bash` tool and the wrong one here — the session already *is* the
+  background. Double-backgrounding hides the real process from its session,
+  and if the hidden child inherits the session's output pipe (which a
+  backgrounded compound list does, since bash keeps a subshell around to run
+  it) the session keeps reporting `[still running]` long after `cmd`
+  finished. Observed in the wild: an agent spent a debugging round on exactly
+  this. The completion signal is `close`, not `exit`, deliberately — see the
+  comment at `src/pty.ts:363`; the alternative loses trailing output from
+  short commands on macOS, and would also report a wrapper script's
+  backgrounded server as finished, so the guidance is the fix, not the
+  liveness rule. Two facts worth knowing either way: `kill_session` SIGTERMs
+  the whole process group, which `nohup` does not survive, and whether a
+  fire-and-forget child outlives pi depends on whether its session was
+  already reaped at shutdown — i.e. on the same shell-syntax accident.
 
 ### Fixed
 
