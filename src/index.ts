@@ -830,6 +830,23 @@ async function runExecCommand(
 	}
 }
 
+/**
+ * Drive or poll an existing session.
+ *
+ * Maintainer note: this function has five `finalizeResponse` sites (already
+ * exited before the write, interrupt-then-exited, interrupt-then-running,
+ * poll-then-exited, poll-then-running) and they are INTENTIONALLY parallel —
+ * the mechanical fields are copies of each other, while `failure`, `extra`,
+ * and the coordinator calls around them differ per path because that is where
+ * the wake exactly-once protocol lives. When editing one, check its siblings:
+ * a divergence in the copied fields is a bug, not a variation. (One such
+ * divergence silently dropped `failure_message` from the still-running path.)
+ * A `sessionResultFields(session, terminal)` spread for the mechanical fields
+ * only — leaving `failure`/`extra`/`collected`/`wallTimeSec`/`yieldTimeMs`
+ * explicit at each site — is the agreed consolidation whenever this protocol
+ * is next touched; a builder that also owns `extra` would hide that invariant
+ * and is deliberately NOT the plan.
+ */
 async function runWriteStdin(
 	ctx: ExtensionCtx,
 	args: WriteStdinArgs,

@@ -3,6 +3,7 @@ import { before, describe, it } from "node:test";
 import { initTheme, type Theme } from "@earendil-works/pi-coding-agent";
 
 import {
+	clearAllRenderTickers,
 	renderKillSessionCall,
 	renderKillSessionResult,
 	renderListSessionsResult,
@@ -237,5 +238,73 @@ describe("runbg renderers", () => {
 		assert.match(expandedText, /#7 /);
 		assert.match(expandedText, /log: \/tmp\/session-7\.log/);
 		assert.doesNotMatch(expandedText, /more sessions/);
+	});
+});
+
+describe("render ticker registry", () => {
+	// The 1 Hz elapsed-time ticker is created on a partial render and normally
+	// cleared by the final one. pi drops renderer state wholesale on several
+	// ordinary paths (thinking-block toggle, settings toggle, rewind,
+	// compaction) with no final render, orphaning it — so the extension clears
+	// the registry at session_shutdown instead.
+	//
+	// This is the ONLY observable guarantee: the tickers are unref'd, so they
+	// never appear in process.getActiveResourcesInfo() or handle counts. A
+	// probe that counts Timeout handles reports "no orphans" either way.
+	it("clears tickers whose renderer state pi dropped", () => {
+		clearAllRenderTickers(); // isolate from other suites in this file
+		const details = finalizeProcessResult({
+			operation: "exec_command",
+			wallTimeSec: 0.4,
+			collected: encoder.encode("partial output"),
+			sessionId: 7,
+			exitCode: undefined,
+			signal: null,
+			failure: null,
+			tty: false,
+			logPath: "/tmp/pi-runbg-7-abcdabcd.log",
+			cwd: "/repo",
+			command: "sleep 30",
+		});
+
+		const result = {
+			content: [{ type: "text", text: renderProcessResultText(details) }],
+			details,
+		} as any;
+
+		// Three partial renders, each with its own state object — then drop
+		// every reference to those states, exactly as pi does.
+		for (let i = 0; i < 3; i++) {
+			const state: Record<string, unknown> = { startedAt: Date.now() };
+			renderProcessResult(result, { expanded: false, isPartial: true }, plainTheme, context(state));
+		}
+
+		assert.equal(clearAllRenderTickers(), 3, "session_shutdown must clear every orphaned ticker");
+		assert.equal(clearAllRenderTickers(), 0, "clearing is idempotent");
+	});
+
+	it("a completed render clears its own ticker (nothing left for shutdown)", () => {
+		clearAllRenderTickers();
+		const state: Record<string, unknown> = { startedAt: Date.now() };
+		const details = finalizeProcessResult({
+			operation: "exec_command",
+			wallTimeSec: 0.4,
+			collected: encoder.encode("done"),
+			sessionId: undefined,
+			exitCode: 0,
+			signal: null,
+			failure: null,
+			tty: false,
+			logPath: "/tmp/pi-runbg-8-abcdabcd.log",
+			cwd: "/repo",
+			command: "echo done",
+		});
+		const result = {
+			content: [{ type: "text", text: renderProcessResultText(details) }],
+			details,
+		} as any;
+		renderProcessResult(result, { expanded: false, isPartial: true }, plainTheme, context(state));
+		renderProcessResult(result, { expanded: false, isPartial: false }, plainTheme, context(state));
+		assert.equal(clearAllRenderTickers(), 0, "the final render already cleared it");
 	});
 });

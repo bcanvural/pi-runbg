@@ -11,6 +11,12 @@
  *
  * That representation is load-bearing, not a style choice (measured):
  *
+ * Measurement note for whoever re-checks this: the retained bytes now live in
+ * large typed arrays, which V8 keeps OUTSIDE the scavenged heap, so
+ * `process.memoryUsage().heapUsed` no longer reflects them at all — a probe
+ * built on `heapUsed` will report the buffer as free whether it is or not. Use
+ * `rss`/`external`.
+ *
  *   - **Memory.** Per-chunk `Uint8Array`s cost ~150-230 B of object overhead
  *     each. A child writing 9-byte lines (an ordinary shell `echo` loop, or
  *     `python -u` progress output) filled a 1 MiB budget with ~116 k views:
@@ -43,11 +49,19 @@ export class HeadTailBuffer {
 	readonly headBudget: number;
 	readonly tailBudget: number;
 	/**
-	 * Head region; bytes [0, headLen) are retained. Allocated on first push and
-	 * the ring on the first byte that reaches the tail — `collect()` builds one
-	 * of these per tool call, and most calls drain a few hundred bytes, so
-	 * committing the full budget up front would churn ~1 MiB of young-gen heap
-	 * per call. codex's `Vec`/`VecDeque` grow on demand for the same reason.
+	 * Head region; bytes [0, headLen) are retained. The head slab is allocated
+	 * on the first push and the ring on the first byte that reaches the tail,
+	 * because `collect()` builds one of these per tool call.
+	 *
+	 * Be precise about what that buys: a call that drains NOTHING allocates
+	 * nothing, but a call that drains even one byte commits the whole head
+	 * budget (514 KiB at the production cap, measured ~18-26 µs against a
+	 * ≥250 ms tool call). Those large typed arrays land in V8's large-object
+	 * space — malloc/free rather than scavenged — so they cost page-zeroing,
+	 * not GC pressure. Geometric growth was measured as an alternative and is
+	 * a pessimization where it matters: ~0.8 µs for a small drain but ~83 µs
+	 * for a budget-filling one, i.e. 14x worse for exactly the chatty sessions
+	 * this representation exists to serve.
 	 */
 	private headBuf: Uint8Array | undefined;
 	private headLen = 0;

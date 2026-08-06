@@ -313,7 +313,12 @@ export class ExecSession {
 		if (!this.logStream) return;
 		const remaining = this.maxLogBytes - this.logBytesWritten;
 		if (remaining >= chunk.length) {
-			this.logStream.write(Buffer.from(chunk));
+			// A view, not a copy: `chunk` is already an owned (de-pooled) array —
+			// see pty.ts's onChunk. Do NOT combine this with passing pi's pooled
+			// read buffer through directly: stream.write() may QUEUE the buffer,
+			// and a queued view of a pooled buffer is rewritten by the next read,
+			// corrupting the log. Exactly one copy is required on this path.
+			this.logStream.write(Buffer.from(chunk.buffer, chunk.byteOffset, chunk.length));
 			this.logBytesWritten += chunk.length;
 			return;
 		}
@@ -321,7 +326,8 @@ export class ExecSession {
 		this.logStream = undefined;
 		this.logStatusValue = "partial";
 		if (remaining > 0) {
-			stream.write(Buffer.from(chunk.subarray(0, remaining)));
+			const boundary = chunk.subarray(0, remaining);
+			stream.write(Buffer.from(boundary.buffer, boundary.byteOffset, boundary.length));
 			this.logBytesWritten += remaining;
 		}
 		stream.write(

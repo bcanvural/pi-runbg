@@ -33,6 +33,12 @@ import type { KillResultDetails, OutputResultDetails, ProcessResultDetails } fro
  * final render that would clear them normally (see `renderOutputResult`).
  * pi's component API has no disposal callback, so this registry is the only
  * place that can guarantee they stop.
+ *
+ * Measurement note: these tickers are `unref`'d, so they do NOT appear in
+ * `process.getActiveResourcesInfo()` or handle counts — a probe that counts
+ * `Timeout` handles will report "no orphans" even for a real regression. The
+ * only observable guarantee is `clearAllRenderTickers()`'s return count, which
+ * `tests/render.test.ts` pins.
  */
 const liveRenderTickers = new Set<NodeJS.Timeout>();
 
@@ -299,6 +305,18 @@ function renderOutputResult(
 		}
 	}
 
+	// NOTE: the `container.invalidate()` below looks redundant — it clears the
+	// preview cache this function is about to populate — but it is a
+	// correctness backstop, not waste. The cache key is (body, width) and does
+	// NOT include the theme, while pi's `theme` is a MUTABLE module singleton:
+	// remove the invalidate and a `/theme` switch that leaves body and width
+	// unchanged would leave the collapsed preview in the old theme's ANSI
+	// colours indefinitely on settled scrollback (nothing calls updateResult
+	// again). The residual cost is one sanitize+style per ticker tick (~0.5 ms
+	// at 1 Hz per streaming row). If it ever needs optimizing, move the
+	// sanitize+style INTO the preview child's render(width) closure so the
+	// existing invalidate-driven cache covers them — do not drop the
+	// invalidate.
 	const container =
 		context.lastComponent instanceof OutputResultContainer ? context.lastComponent : new OutputResultContainer();
 	container.state = state;

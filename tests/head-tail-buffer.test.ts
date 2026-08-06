@@ -283,6 +283,34 @@ describe("HeadTailBuffer", () => {
 			}
 		}
 	});
+	// Explicit boundary cases. The randomized sweep above hits these for small
+	// caps, but pinning them by name documents the intent and keeps a failure
+	// diagnosable without decoding a seed.
+	it("handles exact ring boundaries", () => {
+		const cases: Array<[number, string[], string, number]> = [
+			// [maxBytes, pushes, expected retained text, expected omitted]
+			[8, ["abcd"], "abcd", 0], // exactly fills head
+			[8, ["abcd", "efgh"], "abcdefgh", 0], // exactly fills head+tail
+			[8, ["abcd", "efgh", "i"], "abcdfghi", 1], // one byte over: oldest tail byte drops
+			[8, ["abcd", "efgh1234"], "abcd1234", 4], // chunk exactly tailBudget after full head
+			[8, ["abcd", "efgh12345"], "abcd2345", 5], // one over tailBudget
+			[8, ["abc", "d"], "abcd", 0], // split across pushes into head
+			[8, ["abcdefghij"], "abcdghij", 2], // single chunk spanning both budgets
+			[9, ["abcd", "efghi"], "abcdefghi", 0], // odd cap: head 4, tail 5
+			[9, ["abcd", "efghij"], "abcdfghij", 1], // odd cap, one over
+			[1, ["abc"], "c", 2], // headBudget 0
+			[2, ["abc"], "ac", 1], // head 1, tail 1
+			[0, ["abc"], "", 3], // everything dropped
+		];
+		for (const [cap, pushes, expected, omitted] of cases) {
+			const buf = new HeadTailBuffer(cap);
+			for (const chunk of pushes) buf.pushChunk(s(chunk));
+			const label = `cap=${cap} pushes=${JSON.stringify(pushes)}`;
+			assert.equal(render(buf), expected, `content (${label})`);
+			assert.equal(buf.omittedBytes, omitted, `omitted (${label})`);
+			assert.equal(buf.retainedBytes + buf.omittedBytes, pushes.join("").length, `conservation (${label})`);
+		}
+	});
 });
 
 describe("RollingTail", () => {
