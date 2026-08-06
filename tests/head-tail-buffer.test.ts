@@ -8,6 +8,7 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 import { HeadTailBuffer } from "../src/head-tail-buffer.ts";
+import { RollingTail } from "../src/session.ts";
 
 function s(str: string): Uint8Array {
 	return new TextEncoder().encode(str);
@@ -228,5 +229,99 @@ describe("HeadTailBuffer", () => {
 		// Touching one allocates only that one's head slab.
 		bufs[0]!.pushChunk(s("x"));
 		assert.equal(bufs[0]!.retainedBytes, 1);
+	});
+	// Property test against a reference model. The ring is hand-written
+	// arithmetic (wrap, eviction, clamp), so fuzz the invariants rather than
+	// trusting hand-picked cases: for any push sequence,
+	//   head    = first min(total, headBudget) bytes
+	//   tail    = last min(rest, tailBudget) bytes of what follows the head
+	//   omitted = total - retained
+	it("matches a reference model across randomized push sequences", () => {
+		// Deterministic PRNG so a failure is reproducible from the seed.
+		let seed = 0x2f6e2b1;
+		const rand = (n: number) => {
+			seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+			return seed % n;
+		};
+		const caps = [0, 1, 2, 3, 7, 8, 16, 31, 64];
+		for (const cap of caps) {
+			for (let trial = 0; trial < 40; trial++) {
+				const buf = new HeadTailBuffer(cap);
+				let all = "";
+				const pushes = 1 + rand(12);
+				for (let i = 0; i < pushes; i++) {
+					// Chunk sizes deliberately straddle the budgets (0..2*cap+3).
+					const len = rand(2 * cap + 4);
+					let chunk = "";
+					for (let j = 0; j < len; j++) chunk += String.fromCharCode(97 + rand(26));
+					all += chunk;
+					buf.pushChunk(s(chunk));
+				}
+				const headBudget = Math.floor(cap / 2);
+				const tailBudget = Math.max(0, cap - headBudget);
+				const expectedHead = all.slice(0, Math.min(all.length, headBudget));
+				const rest = all.slice(expectedHead.length);
+				const expectedTail = rest.length > tailBudget ? rest.slice(rest.length - tailBudget) : rest;
+				const expected = expectedHead + expectedTail;
+				const label = `cap=${cap} trial=${trial} total=${all.length}`;
+
+				assert.equal(render(buf), expected, `content mismatch (${label})`);
+				assert.equal(buf.retainedBytes, expected.length, `retained mismatch (${label})`);
+				// The conservation invariant: nothing is invented or lost.
+				assert.equal(
+					buf.retainedBytes + buf.omittedBytes,
+					all.length,
+					`retained+omitted must equal pushed (${label})`,
+				);
+				// The head/tail split must land where the omission marker goes.
+				const seg = buf.drainSegments();
+				const headText = seg.head.map((c) => new TextDecoder().decode(c)).join("");
+				const tailText = seg.tail.map((c) => new TextDecoder().decode(c)).join("");
+				assert.equal(headText, expectedHead, `head segment mismatch (${label})`);
+				assert.equal(tailText, expectedTail, `tail segment mismatch (${label})`);
+				assert.equal(buf.retainedBytes, 0, `drain must reset (${label})`);
+			}
+		}
+	});
+});
+
+describe("RollingTail", () => {
+	// The TUI streaming window: keeps exactly the last `cap` bytes.
+	it("matches a reference model across randomized append sequences", () => {
+		let seed = 0x51ed270b;
+		const rand = (n: number) => {
+			seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+			return seed % n;
+		};
+		for (const cap of [0, 1, 2, 5, 8, 17, 64]) {
+			for (let trial = 0; trial < 40; trial++) {
+				const tail = new RollingTail(cap);
+				let all = "";
+				const appends = 1 + rand(12);
+				for (let i = 0; i < appends; i++) {
+					const len = rand(2 * cap + 4);
+					let chunk = "";
+					for (let j = 0; j < len; j++) chunk += String.fromCharCode(97 + rand(26));
+					all += chunk;
+					tail.append(s(chunk));
+				}
+				const expected = all.length > cap ? all.slice(all.length - cap) : all;
+				assert.equal(
+					new TextDecoder().decode(tail.snapshot()),
+					expected,
+					`cap=${cap} trial=${trial} total=${all.length}`,
+				);
+			}
+		}
+	});
+
+	it("snapshot is stable across later appends and empty before any write", () => {
+		const tail = new RollingTail(4);
+		assert.equal(tail.snapshot().length, 0);
+		tail.append(s("abcd"));
+		const snap = tail.snapshot();
+		tail.append(s("efgh"));
+		assert.equal(new TextDecoder().decode(snap), "abcd", "snapshot must not alias the ring");
+		assert.equal(new TextDecoder().decode(tail.snapshot()), "efgh");
 	});
 });

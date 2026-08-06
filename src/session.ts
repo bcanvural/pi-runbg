@@ -38,8 +38,11 @@ export const DEFAULT_STREAM_TAIL_BYTES = 32 * 1024; // 32 KiB
  * array of per-write views cost ~200 B of overhead each and made every append
  * an O(n) front-trim once full (measured 874 KiB of heap for a 32 KiB window
  * at 9-byte writes).
+ *
+ * Exported for direct testing: hand-written ring arithmetic deserves a fuzz
+ * test of its own rather than only indirect coverage through a spawned child.
  */
-class RollingTail {
+export class RollingTail {
 	private buf: Uint8Array | undefined;
 	private start = 0;
 	private len = 0;
