@@ -18,6 +18,19 @@ its names.
 
 ### Fixed
 
+- **Mid-session `/runbg off` no longer strands pi without a shell** (code
+  review): with `--replace-builtin-bash`, disabling now restores the `bash`
+  runbg removed — tracked with a latch so a `bash` disabled independently of
+  runbg is never resurrected. `/runbg on|off` also re-applies the tool policy
+  unconditionally, so a settings file flipped by another pi process takes
+  effect in the current session instead of no-op'ing with "already enabled".
+- **Tool gating is ownership-checked** (code review): gating now consults
+  `getAllTools` sourceInfo (canonical-path compare against this extension's
+  own entry) and never activates or deactivates a tool name that another
+  package's registration won. The upstream-collision warning excludes self
+  registrations, so a checkout of this fork in a directory named
+  `pi-unified-exec` no longer warns against itself; the warning is
+  best-effort and load-order-dependent (documented in UPSTREAM.md).
 - **In-call output accumulation is now bounded** (divergence #4,
   `UPSTREAM.md`): `collectOutputUntilDeadline` kept every drained chunk in an
   array for the whole call, so a chatty child inside a single long empty poll

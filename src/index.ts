@@ -23,9 +23,10 @@
  *     / 2000 lines per call and the full file is available via `read`.
  */
 
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { constants as osConstants } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Type, type TUnsafe } from "typebox";
 
@@ -192,6 +193,8 @@ interface ExtensionCtx {
 	shuttingDown: boolean;
 	/** Crash-path reaper registered on process "exit" (divergence #2). */
 	processExitHandler: (() => void) | undefined;
+	/** True only while WE removed pi's built-in bash (divergence #1 latch). */
+	removedBuiltinBash: boolean;
 }
 
 const RUNBG_TOOL_NAMES = ["exec_command", "write_stdin", "set_on_exit", "kill_session", "list_sessions"];
@@ -233,13 +236,76 @@ export function killLiveSessionsSync(
 	return killed;
 }
 
+/** Best-effort canonicalization; falls back to the input on any fs error. */
+function tryRealpath(path: string): string {
+	try {
+		return realpathSync(path);
+	} catch {
+		return path;
+	}
+}
+
+/** This extension's entry file and repo root, canonicalized once. */
+const SELF_FILE = tryRealpath(fileURLToPath(import.meta.url));
+const SELF_ROOT = dirname(dirname(SELF_FILE)); // <repo>/src/index.ts → <repo>
+
+/**
+ * Is a tool registration ours? Compares canonical paths so symlinked installs
+ * (`~/.pi` symlink conventions, npm link) resolve to the same answer, and
+ * accepts anything under our repo root in case pi records the package root
+ * rather than the entry file.
+ */
+function isSelfPath(path: string | undefined): boolean {
+	if (!path) return false;
+	const canonical = tryRealpath(path);
+	return canonical === SELF_FILE || canonical.startsWith(SELF_ROOT + sep);
+}
+
+/**
+ * Winning registration paths for our five tool names, or null when the host
+ * can't tell us (`getAllTools` is probed defensively: the peer floor (0.80.5)
+ * and the test harnesses may not provide it). pi's registry is last-wins by
+ * name, so this reflects who currently owns each name.
+ */
+function toolWinners(pi: ExtensionAPI): Map<string, string | undefined> | null {
+	const getAllTools = (pi as { getAllTools?: () => Array<{ name: string; sourceInfo?: { path?: string } }> })
+		.getAllTools;
+	if (typeof getAllTools !== "function") return null;
+	let infos: Array<{ name: string; sourceInfo?: { path?: string } }>;
+	try {
+		infos = getAllTools.call(pi);
+	} catch {
+		return null;
+	}
+	const winners = new Map<string, string | undefined>();
+	for (const info of infos) {
+		if (RUNBG_TOOL_NAMES.includes(info.name)) winners.set(info.name, info.sourceInfo?.path);
+	}
+	return winners;
+}
+
+/**
+ * Whether gating may touch this tool name. True when the host can't tell us
+ * who owns it (assume ours — the pre-ownership-check behavior), when the name
+ * has no winning registration (activating an unknown name is a no-op), or
+ * when the winning registration is ours. Never manipulate a name another
+ * package's registration won — deactivating or activating *their* live tools
+ * is worse than the collision itself.
+ */
+function ownsToolName(winners: Map<string, string | undefined> | null, name: string): boolean {
+	if (winners === null || !winners.has(name)) return true;
+	return isSelfPath(winners.get(name));
+}
+
 /**
  * The upstream package this fork derives from (pi-unified-exec) registers the
  * same five tool names; installing both means one registration silently
  * shadows the other and prompt guidance may drive the wrong one. Detect the
- * known collision by source path and warn once per session.
- * `getAllTools` is probed defensively: the peer floor (0.80.5) and the test
- * harnesses may not provide it.
+ * known collision by source path and warn once per session. Best-effort and
+ * load-order-dependent: when OUR registration won, the upstream package is
+ * invisible in the registry and no warning can fire. Self registrations are
+ * excluded by canonical path, so a checkout of this fork living in a
+ * directory named `pi-unified-exec` does not warn against itself.
  */
 function warnIfUpstreamPackagePresent(ctx: ExtensionCtx, pi: ExtensionAPI): void {
 	if (ctx.warnedForeignTools) return;
@@ -253,7 +319,10 @@ function warnIfUpstreamPackagePresent(ctx: ExtensionCtx, pi: ExtensionAPI): void
 		return;
 	}
 	const foreign = infos.filter(
-		(t) => RUNBG_TOOL_NAMES.includes(t.name) && (t.sourceInfo?.path ?? "").includes("pi-unified-exec"),
+		(t) =>
+			RUNBG_TOOL_NAMES.includes(t.name) &&
+			(t.sourceInfo?.path ?? "").includes("pi-unified-exec") &&
+			!isSelfPath(t.sourceInfo?.path),
 	);
 	if (foreign.length === 0) return;
 	ctx.warnedForeignTools = true;
@@ -306,18 +375,53 @@ function writeRunbgSettings(settings: RunbgSettings): void {
 }
 
 /**
- * Activate or deactivate the five session tools. Registration is
+ * Activate or deactivate the session tools we own. Registration is
  * unconditional (pi needs the definitions for renderers and resume), only
  * membership in the active set changes; `setActiveTools` is called only
- * when that membership actually changes.
+ * when that membership actually changes. Names whose winning registration
+ * belongs to another package are left strictly alone.
  */
 function applyToolGating(pi: ExtensionAPI, enabled: boolean): void {
+	const winners = toolWinners(pi);
+	const owned = RUNBG_TOOL_NAMES.filter((name) => ownsToolName(winners, name));
 	const active = pi.getActiveTools();
 	const target = enabled
-		? [...active, ...RUNBG_TOOL_NAMES.filter((name) => !active.includes(name))]
-		: active.filter((name) => !RUNBG_TOOL_NAMES.includes(name));
+		? [...active, ...owned.filter((name) => !active.includes(name))]
+		: active.filter((name) => !owned.includes(name));
 	if (target.length !== active.length) {
 		pi.setActiveTools(target);
+	}
+}
+
+/**
+ * The full session-tool policy, applied at session_start AND on every
+ * `/runbg on|off` (unconditionally — a settings file another pi process
+ * already flipped must still take effect in THIS session):
+ *   1. gate our tools by the persisted enabled state;
+ *   2. while enabled with --replace-builtin-bash, remove pi's built-in
+ *      `bash` (divergence #1) and LATCH that we did;
+ *   3. otherwise restore `bash` only if the latch says we removed it —
+ *      never resurrect a bash the user or another extension disabled
+ *      independently of us.
+ * The latch is what keeps the "never leave pi shell-less" invariant true
+ * across mid-session `/runbg off`.
+ */
+function applySessionToolPolicy(ctx: ExtensionCtx, pi: ExtensionAPI): void {
+	const enabled = readRunbgSettings().enabled;
+	applyToolGating(pi, enabled);
+	const replace = pi.getFlag("replace-builtin-bash") ?? pi.getFlag("--replace-builtin-bash");
+	if (enabled && replace === true) {
+		const active = pi.getActiveTools();
+		if (active.includes("bash")) {
+			pi.setActiveTools(active.filter((name) => name !== "bash"));
+			ctx.removedBuiltinBash = true;
+		}
+	} else if (ctx.removedBuiltinBash) {
+		const active = pi.getActiveTools();
+		if (!active.includes("bash")) {
+			pi.setActiveTools([...active, "bash"]);
+		}
+		ctx.removedBuiltinBash = false;
 	}
 }
 
@@ -1130,6 +1234,7 @@ export default function (pi: ExtensionAPI) {
 		pendingSessions: new Set(),
 		shuttingDown: false,
 		processExitHandler: undefined,
+		removedBuiltinBash: false,
 	};
 
 	// Divergence #1 from upstream (see UPSTREAM.md): upstream removes pi's
@@ -1166,23 +1271,10 @@ export default function (pi: ExtensionAPI) {
 		ctx.shuttingDown = false; // reload/new/resume re-arms the extension
 		ctx.coordinator.reset(); // never resurrect wakes from a previous session
 		updateRunningSessionsUi(ctx);
-		// Tool gating (divergence #5): the session tools are dormant unless
-		// /runbg enabled them (persisted in runbg.json).
-		const enabled = readRunbgSettings().enabled;
-		applyToolGating(pi, enabled);
-		// Built-in `bash` stays available by default (divergence #1,
-		// UPSTREAM.md). Only --replace-builtin-bash removes it — and only
-		// while runbg is enabled: a dormant runbg must never leave pi
-		// without any shell at all. Flag lookup uses the registered name
-		// without leading dashes.
-		const replace = pi.getFlag("replace-builtin-bash") ?? pi.getFlag("--replace-builtin-bash");
-		if (enabled && replace === true) {
-			const active = pi.getActiveTools();
-			const filtered = active.filter((name) => name !== "bash");
-			if (filtered.length !== active.length) {
-				pi.setActiveTools(filtered);
-			}
-		}
+		// Tool gating (divergence #5) + built-in-bash policy (divergence #1):
+		// dormant unless /runbg enabled; bash removed only while enabled AND
+		// --replace-builtin-bash, restored only if we removed it (latch).
+		applySessionToolPolicy(ctx, pi);
 		warnIfUpstreamPackagePresent(ctx, pi);
 		// Stale-log cleanup (divergence #3): age-based and best-effort, so a
 		// concurrent pi process's fresh logs are never touched. Fire and
@@ -1280,26 +1372,32 @@ export default function (pi: ExtensionAPI) {
 			switch (sub) {
 				case "on":
 				case "enable": {
-					if (settings.enabled) {
-						notify("runbg: already enabled");
-						return;
+					const already = settings.enabled;
+					if (!already) {
+						writeRunbgSettings({ ...settings, enabled: true });
 					}
-					writeRunbgSettings({ ...settings, enabled: true });
-					applyToolGating(pi, true);
-					notify("runbg: session tools enabled (persists across sessions) — disable with /runbg off");
+					// Unconditionally: another pi process may have flipped the
+					// file while this session's tools are still in the old state.
+					applySessionToolPolicy(ctx, pi);
+					notify(
+						already
+							? "runbg: already enabled — tool state re-applied for this session"
+							: "runbg: session tools enabled (persists across sessions) — disable with /runbg off",
+					);
 					return;
 				}
 				case "off":
 				case "disable": {
-					if (!settings.enabled) {
-						notify("runbg: already disabled");
-						return;
+					const already = !settings.enabled;
+					if (!already) {
+						writeRunbgSettings({ ...settings, enabled: false });
 					}
-					writeRunbgSettings({ ...settings, enabled: false });
-					applyToolGating(pi, false);
+					applySessionToolPolicy(ctx, pi);
 					notify(
-						`runbg: session tools disabled (persists)${live ? ` — ${live} live session(s) keep running; /runbg-sessions to manage them` : ""}`,
-						live ? "warning" : "info",
+						already
+							? "runbg: already disabled — tool state re-applied for this session"
+							: `runbg: session tools disabled (persists)${live ? ` — ${live} live session(s) keep running; /runbg-sessions to manage them` : ""}`,
+						!already && live ? "warning" : "info",
 					);
 					return;
 				}

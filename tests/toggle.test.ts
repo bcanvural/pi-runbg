@@ -29,7 +29,10 @@ beforeEach(() => {
 
 const RUNBG_TOOLS = ["exec_command", "write_stdin", "set_on_exit", "kill_session", "list_sessions"];
 
-function makeHarness(initialActive: string[]) {
+function makeHarness(
+	initialActive: string[],
+	opts: { flags?: Record<string, unknown>; allTools?: Array<{ name: string; sourceInfo?: { path?: string } }> } = {},
+) {
 	const handlers: Record<string, Array<(event: any, ctx: any) => any>> = {};
 	const commands: Record<string, { description?: string; getArgumentCompletions?: (p: string) => any; handler: (args: string, ctx: any) => Promise<void> }> = {};
 	const notifications: Array<{ message: string; type?: string }> = [];
@@ -51,7 +54,7 @@ function makeHarness(initialActive: string[]) {
 		registerShortcut: () => {},
 		registerFlag: () => {},
 		registerMessageRenderer: () => {},
-		getFlag: () => false,
+		getFlag: (name: string) => opts.flags?.[name],
 		getActiveTools: () => [...active],
 		setActiveTools: (names: string[]) => {
 			setActiveToolsCalls.push([...names]);
@@ -59,6 +62,9 @@ function makeHarness(initialActive: string[]) {
 		},
 		sendMessage: () => {},
 	};
+	if (opts.allTools) {
+		pi.getAllTools = () => opts.allTools;
+	}
 	(extensionFactory as any)(pi);
 	return {
 		commands,
@@ -147,6 +153,64 @@ describe("/runbg settings command", () => {
 		const last = h.notifications.at(-1)!;
 		assert.equal(last.type, "warning");
 		assert.ok(last.message.includes("unknown setting"));
+		await h.shutdown();
+	});
+
+	it("mid-session /runbg off restores the bash WE removed (--replace-builtin-bash)", async () => {
+		writeFileSync(SETTINGS, JSON.stringify({ enabled: true }));
+		const h = makeHarness(["bash", "read", ...RUNBG_TOOLS], { flags: { "replace-builtin-bash": true } });
+		await h.emit("session_start");
+		assert.ok(!h.activeTools().includes("bash"), "enabled+flag removes bash at start");
+		assert.ok(h.activeTools().includes("exec_command"));
+
+		await h.invokeCommand("runbg", "off");
+		assert.ok(h.activeTools().includes("bash"), "off must restore the bash we removed");
+		assert.ok(!h.activeTools().includes("exec_command"), "off must deactivate session tools");
+
+		await h.invokeCommand("runbg", "on");
+		assert.ok(!h.activeTools().includes("bash"), "on re-removes bash while the flag is set");
+		assert.ok(h.activeTools().includes("exec_command"));
+		await h.shutdown();
+	});
+
+	it("never resurrects a bash it did not remove (latch negative)", async () => {
+		writeFileSync(SETTINGS, JSON.stringify({ enabled: true }));
+		// bash absent from the start — someone else disabled it.
+		const h = makeHarness(["read", ...RUNBG_TOOLS], { flags: { "replace-builtin-bash": true } });
+		await h.emit("session_start");
+		assert.ok(!h.activeTools().includes("bash"));
+		await h.invokeCommand("runbg", "off");
+		assert.ok(!h.activeTools().includes("bash"), "off must not add a bash we never removed");
+		await h.shutdown();
+	});
+
+	it("/runbg on re-applies gating even when another process already enabled the setting", async () => {
+		const h = makeHarness(["bash", ...RUNBG_TOOLS]);
+		await h.emit("session_start"); // no settings file → dormant
+		assert.ok(!h.activeTools().includes("exec_command"));
+
+		writeFileSync(SETTINGS, JSON.stringify({ enabled: true })); // flipped by "another window"
+		await h.invokeCommand("runbg", "on");
+		assert.ok(h.activeTools().includes("exec_command"), "on must activate tools in THIS session too");
+		assert.ok(h.notifications.at(-1)?.message.includes("already enabled"), JSON.stringify(h.notifications.at(-1)));
+		await h.shutdown();
+	});
+
+	it("leaves tool names alone when another package's registration won them", async () => {
+		const foreign = { path: "/home/u/.pi/agent/node_modules/pi-unified-exec/src/index.ts" };
+		const allTools = [
+			{ name: "exec_command", sourceInfo: foreign },
+			...RUNBG_TOOLS.filter((n) => n !== "exec_command").map((name) => ({
+				name,
+				sourceInfo: { path: "/nonexistent/pi-runbg/src/index.ts" },
+			})),
+		];
+		// Note: our four use a non-self path too — but ownsToolName treats only
+		// *listed* names as gated-by-ownership; exec_command must be skipped.
+		writeFileSync(SETTINGS, JSON.stringify({ enabled: false }));
+		const h = makeHarness(["bash", ...RUNBG_TOOLS], { allTools });
+		await h.emit("session_start");
+		assert.ok(h.activeTools().includes("exec_command"), "foreign-won name must not be deactivated");
 		await h.shutdown();
 	});
 

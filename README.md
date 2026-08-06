@@ -359,11 +359,13 @@ interactive work goes through `exec_command` / `write_stdin`. (This inverts
 the upstream default — divergence #1 in [UPSTREAM.md](./UPSTREAM.md):
 prompts and guard extensions that only know `bash` must keep working.)
 
-- `--replace-builtin-bash` — remove the built-in `bash` at session start so
-  the session tools are the only shell (upstream pi-unified-exec's default,
-  codex parity). Use with prompts written for codex's `unified_exec`-only
-  surface. Only acts while runbg is enabled (`/runbg on`) — a dormant runbg
-  never leaves pi without a shell.
+- `--replace-builtin-bash` — remove the built-in `bash` so the session tools
+  are the only shell (upstream pi-unified-exec's default, codex parity). Use
+  with prompts written for codex's `unified_exec`-only surface. Only acts
+  while runbg is enabled, and is applied at session start *and* on every
+  `/runbg on|off`: disabling restores `bash` — but only if runbg was the one
+  that removed it (it never resurrects a `bash` you disabled yourself). A
+  dormant runbg never leaves pi without a shell.
 
 At session start the extension also warns if it detects the upstream
 `pi-unified-exec` package installed alongside — both register the same five
