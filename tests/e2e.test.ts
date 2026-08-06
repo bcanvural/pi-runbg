@@ -14,9 +14,12 @@ import { DEFAULT_MAX_BYTES } from "@earendil-works/pi-coding-agent";
 import extensionFactory, { MAX_EMPTY_POLL_ENV_VAR, resolveMaxEmptyPollMs } from "../src/index.ts";
 import { IS_WINDOWS } from "../src/shell.ts";
 import { useIsolatedAgentEnv } from "./helpers/agent-env.ts";
+import { trackHarness, useHarnessCleanup } from "./helpers/harness-cleanup.ts";
 
 // Hermetic startup: pin the agent dir and scrub PI_RUNBG_* (see helper).
 useIsolatedAgentEnv();
+// Anti-hang net: shut every spawned harness down after each test (see helper).
+useHarnessCleanup();
 
 interface ToolDef {
 	name: string;
@@ -79,7 +82,7 @@ function makeHarness() {
 	// run the factory synchronously
 	(extensionFactory as any)(pi);
 
-	return {
+	return trackHarness({
 		async call(toolName: string, params: any, signal?: AbortSignal, onUpdate?: (partial: any) => void) {
 			const def = tools[toolName];
 			if (!def) throw new Error(`no such tool: ${toolName}`);
@@ -98,7 +101,7 @@ function makeHarness() {
 			for (const h of handlers[event] ?? []) results.push(await h(evt, stubCtx));
 			return results;
 		},
-	};
+	});
 }
 
 /** Poll until `cond` is true or the deadline passes (CI runners are slow). */

@@ -112,6 +112,9 @@ function makeHarness() {
 	return harness;
 }
 
+// Equivalent to tests/helpers/harness-cleanup.ts (kept local because this
+// suite's net predates the helper and its wake assertions are timing-
+// sensitive). New suites should use the shared helper instead.
 const liveHarnesses = new Set<{ shutdown: () => Promise<void> }>();
 
 afterEach(async () => {

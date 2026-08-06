@@ -399,3 +399,26 @@ prior commits gives a sense of scope.
   `@earendil-works/pi-coding-agent/docs/extensions.md`.
 
 Both source trees are worth keeping open in split panes while you work.
+
+## Test hygiene helpers
+
+Two helpers under `tests/helpers/` exist because both problems they solve
+were found the hard way (see the code-review commits):
+
+- **`useIsolatedAgentEnv()`** (`agent-env.ts`) — call once at module scope in
+  any suite that emits `session_start`. It pins `PI_CODING_AGENT_DIR` to a
+  fresh temp dir and scrubs every `PI_RUNBG_*` variable, then restores them.
+  Without it, `npm test` reads the developer's real `runbg.json` (so their
+  `/runbg on` changes assertions) and sweeps the real tmpdir honoring their
+  `PI_RUNBG_LOG_TTL_DAYS` — deleting real session logs.
+- **`useHarnessCleanup()` + `trackHarness(...)`** (`harness-cleanup.ts`) —
+  call the first once at module scope, and wrap each harness's returned object
+  in the second. A spawned child keeps Node's event loop alive, so a test that
+  fails before its cleanup line turns a reportable failure into a whole-file
+  hang with no output. The net shuts every tracked harness down after each
+  test, pass or fail. Verify it still works by temporarily injecting
+  `assert.equal(1, 2)` after a spawn: the run must report the failure and
+  finish in seconds.
+
+`tests/wake-e2e.test.ts` keeps an equivalent local net that predates the
+helper; new suites should use the shared one.

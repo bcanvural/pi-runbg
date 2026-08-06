@@ -14,9 +14,12 @@ import { describe, it } from "node:test";
 import extensionFactory from "../src/index.ts";
 import { IS_WINDOWS } from "../src/shell.ts";
 import { useIsolatedAgentEnv } from "./helpers/agent-env.ts";
+import { trackHarness, useHarnessCleanup } from "./helpers/harness-cleanup.ts";
 
 // Hermetic startup: pin the agent dir and scrub PI_RUNBG_* (see helper).
 useIsolatedAgentEnv();
+// Anti-hang net: shut every spawned harness down after each test (see helper).
+useHarnessCleanup();
 
 interface ToolDef {
 	name: string;
@@ -60,7 +63,7 @@ function makeHeadlessHarness() {
 
 	let nextCallId = 1;
 	let shutDown = false;
-	const harness = {
+	return trackHarness({
 		async call(toolName: string, params: any) {
 			const def = tools[toolName];
 			if (!def) throw new Error(`no such tool: ${toolName}`);
@@ -77,12 +80,8 @@ function makeHeadlessHarness() {
 			await this.emit("session_shutdown");
 		},
 		sentMessages,
-	};
-	liveHarnesses.add(harness);
-	return harness;
+	});
 }
-
-const liveHarnesses = new Set<{ shutdown: () => Promise<void> }>();
 
 async function waitFor(cond: () => boolean, timeoutMs = 8000): Promise<boolean> {
 	const deadline = Date.now() + timeoutMs;
@@ -186,9 +185,4 @@ describe("headless acceptance", () => {
 		await h.shutdown();
 		assert.equal(h.sentMessages.length, 1, "shutdown must not emit further wakes");
 	});
-});
-
-// Safety net mirroring wake-e2e: never leak children if an assertion throws.
-process.on("beforeExit", () => {
-	for (const h of liveHarnesses) void h.shutdown();
 });

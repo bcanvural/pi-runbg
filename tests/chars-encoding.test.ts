@@ -20,9 +20,12 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import extensionFactory from "../src/index.ts";
 import { useIsolatedAgentEnv } from "./helpers/agent-env.ts";
+import { trackHarness, useHarnessCleanup } from "./helpers/harness-cleanup.ts";
 
 // Hermetic startup: pin the agent dir and scrub PI_RUNBG_* (see helper).
 useIsolatedAgentEnv();
+// Anti-hang net: shut every spawned harness down after each test (see helper).
+useHarnessCleanup();
 
 interface ToolDef {
 	name: string;
@@ -62,7 +65,7 @@ function makeHarness() {
 		setActiveTools: () => {},
 	};
 	(extensionFactory as any)(pi);
-	return {
+	return trackHarness({
 		async call(toolName: string, params: any, signal?: AbortSignal) {
 			const def = tools[toolName];
 			if (!def) throw new Error(`no such tool: ${toolName}`);
@@ -71,7 +74,7 @@ function makeHarness() {
 		async emit(event: string, evt: any = {}) {
 			for (const h of handlers[event] ?? []) await h(evt, stubCtx);
 		},
-	};
+	});
 }
 
 /**

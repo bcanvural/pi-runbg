@@ -13,8 +13,11 @@ import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { beforeEach, describe, it } from "node:test";
 import extensionFactory from "../src/index.ts";
 import { useIsolatedAgentEnv } from "./helpers/agent-env.ts";
+import { trackHarness, useHarnessCleanup } from "./helpers/harness-cleanup.ts";
 
 const { settingsPath: SETTINGS } = useIsolatedAgentEnv();
+// Anti-hang net: shut every spawned harness down after each test (see helper).
+useHarnessCleanup();
 beforeEach(() => {
 	rmSync(SETTINGS, { force: true });
 });
@@ -58,7 +61,7 @@ function makeHarness(
 		pi.getAllTools = () => opts.allTools;
 	}
 	(extensionFactory as any)(pi);
-	return {
+	return trackHarness({
 		commands,
 		notifications,
 		setActiveToolsCalls,
@@ -72,7 +75,7 @@ function makeHarness(
 		async shutdown() {
 			await this.emit("session_shutdown");
 		},
-	};
+	});
 }
 
 describe("/runbg settings command", () => {

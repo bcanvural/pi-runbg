@@ -15,8 +15,11 @@ import { describe, it } from "node:test";
 import extensionFactory, { MAX_SESSIONS_ENV_VAR } from "../src/index.ts";
 import { IS_WINDOWS } from "../src/shell.ts";
 import { useIsolatedAgentEnv } from "./helpers/agent-env.ts";
+import { trackHarness, useHarnessCleanup } from "./helpers/harness-cleanup.ts";
 
 const env = useIsolatedAgentEnv();
+// Anti-hang net: shut every spawned harness down after each test (see helper).
+useHarnessCleanup();
 env.setEnv(MAX_SESSIONS_ENV_VAR, "2"); // tiny cap keeps the test fast
 
 interface ToolDef {
@@ -57,7 +60,7 @@ function makeHarness() {
 		sendMessage: () => {},
 	};
 	(extensionFactory as any)(pi);
-	return {
+	return trackHarness({
 		notifications,
 		async call(toolName: string, params: any) {
 			return tools[toolName].execute(`cap-${n++}`, params, undefined, undefined, stubCtx);
@@ -68,7 +71,7 @@ function makeHarness() {
 		async shutdown() {
 			await this.emit("session_shutdown");
 		},
-	};
+	});
 }
 
 function alive(pid: number): boolean {

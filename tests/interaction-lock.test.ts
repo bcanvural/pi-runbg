@@ -11,14 +11,17 @@
 
 import { strict as assert } from "node:assert";
 import { readFileSync } from "node:fs";
-import { afterEach, describe, it } from "node:test";
+import { describe, it } from "node:test";
 import extensionFactory from "../src/index.ts";
 import { InteractionCancelled, InteractionLock } from "../src/interaction-lock.ts";
 import { IS_WINDOWS } from "../src/shell.ts";
 import { useIsolatedAgentEnv } from "./helpers/agent-env.ts";
+import { trackHarness, useHarnessCleanup } from "./helpers/harness-cleanup.ts";
 
 // Hermetic startup: pin the agent dir and scrub PI_RUNBG_* (see helper).
 useIsolatedAgentEnv();
+// Anti-hang net: shut every spawned harness down after each test (see helper).
+useHarnessCleanup();
 
 describe("InteractionLock", () => {
 	it("grants immediately when idle and serializes a second acquirer", async () => {
@@ -141,7 +144,7 @@ function makeHarness() {
 	};
 	(extensionFactory as any)(pi);
 	let shutDown = false;
-	const harness = {
+	return trackHarness({
 		async call(toolName: string, params: any, signal?: AbortSignal) {
 			return tools[toolName].execute(`lock-${nextId++}`, params, signal, undefined, stubCtx);
 		},
@@ -153,21 +156,8 @@ function makeHarness() {
 			shutDown = true;
 			await this.emit("session_shutdown");
 		},
-	};
-	liveHarnesses.add(harness);
-	return harness;
+	});
 }
-
-/**
- * Safety net: a spawned child keeps Node's event loop alive, so a failed
- * assertion that skips cleanup would hang the whole file instead of reporting
- * the failure. Shut every harness down after each test.
- */
-const liveHarnesses = new Set<{ shutdown: () => Promise<void> }>();
-afterEach(async () => {
-	for (const h of liveHarnesses) await h.shutdown();
-	liveHarnesses.clear();
-});
 
 describe("serialized session interactions (e2e)", () => {
 	it("two overlapping empty polls: neither starves, exactly one reports the exit", async () => {

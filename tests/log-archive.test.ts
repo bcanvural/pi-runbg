@@ -39,10 +39,13 @@ import {
 import { IS_WINDOWS } from "../src/shell.ts";
 import { truncationMarker } from "../src/tool-result.ts";
 import { useIsolatedAgentEnv } from "./helpers/agent-env.ts";
+import { trackHarness, useHarnessCleanup } from "./helpers/harness-cleanup.ts";
 
 // Hermetic startup: pin the agent dir and scrub PI_RUNBG_* so the developer's
 // own cap/TTL settings cannot change these assertions (see helper).
 const env = useIsolatedAgentEnv();
+// Anti-hang net: shut every spawned harness down after each test (see helper).
+useHarnessCleanup();
 
 interface ToolDef {
 	name: string;
@@ -76,14 +79,14 @@ function makeHarness() {
 		sendMessage: () => {},
 	};
 	(extensionFactory as any)(pi);
-	return {
+	return trackHarness({
 		async call(toolName: string, params: any) {
 			return tools[toolName].execute(`log-${Math.random()}`, params, undefined, undefined, stubCtx);
 		},
 		async emit(event: string, evt: any = {}) {
 			for (const h of handlers[event] ?? []) await h(evt, stubCtx);
 		},
-	};
+	});
 }
 
 describe("log archive safety", () => {
