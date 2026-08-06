@@ -9,11 +9,12 @@ drives across turns with writes and polls, instead of a single blocking
 
 ## Approach
 
-Build on [pi-unified-exec](https://github.com/iamwrm/pi-unified-exec) (MIT,
-unmaintained — we fork it). It is a faithful port of codex's `unified_exec`
-with a proven tool surface and 250+ tests. Our additions: the system-prompt
-integration that fixes the long-running-loop failure mode, headless-safety
-review, and ongoing hardening.
+Fork [pi-unified-exec](https://github.com/iamwrm/pi-unified-exec) (MIT,
+actively developed but closed to external contributions — forks invited). It
+is a faithful port of codex's `unified_exec` with a proven tool surface and
+271 passing tests. Our additions: the system-prompt integration that fixes
+the long-running-loop failure mode, a flipped built-in-`bash` default (keep
+it), headless verification, and hardening from upstream's own backlog.
 
 See [docs/design.md](docs/design.md) for the full design.
 
@@ -22,7 +23,7 @@ See [docs/design.md](docs/design.md) for the full design.
 ```
 pi-runbg/
 ├── README.md          ← you are here
-├── docs/design.md     ← full design (v2: aligned with pi-unified-exec)
+├── docs/design.md     ← full design (v3: verified against upstream v0.9.0 + pi 0.83)
 └── .gitignore
 ```
 

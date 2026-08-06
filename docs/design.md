@@ -1,13 +1,16 @@
-# pi-runbg — design doc (v2, aligned with pi-unified-exec)
+# pi-runbg — design doc (v3, verified against upstream v0.9.0 and pi 0.83)
 
 **Status:** design only — nothing implemented yet.
-**Companion repos:** `pi-sysprompt` (template wiring, §11), `pi-webfetch` (sibling web-tool design).
+**Companion repos:** `pi-sysprompt` (template wiring, §14), `pi-webfetch` (sibling web-tool design).
 
-> **v2 change:** this design now builds on the existing community extension
-> **pi-unified-exec** (MIT, faithful port of codex's `unified_exec` session
-> model) instead of inventing a fresh tool set. The repo's job is to carry
-> that design forward: fork it, keep its proven tool surface, and add the
-> system-prompt integration that fixes the long-running-loop failure mode.
+> **v3 change:** full design review against the actual upstream source
+> (pi-unified-exec v0.9.0, 2026-08-04), the pi 0.83.0 extension API
+> (`@earendil-works/pi-coding-agent` typings + runtime), and the live
+> template/extension setup. Corrects v2's tool table (wrong param names and
+> caps), adds the **built-in-bash removal decision v2 missed entirely**,
+> session-lifetime semantics, an upstream-sync strategy, a hardening plan
+> drawn from upstream's own backlog, and headless acceptance criteria.
+> Decisions that changed are marked **[v3 decision]**.
 
 ---
 
@@ -17,192 +20,365 @@ Pi's built-in `bash` tool blocks until the process exits. Long-running work
 (dev servers, `tail -f`, REPLs, builds, migrations) either burns context
 waiting, hits tool timeouts, or dies with the turn. There is no way to start a
 process and drive it across turns — which is exactly what codex's prompt
-philosophy ("start a job, poll it, react to it") assumes.
+philosophy ("start a job, poll it, react to it") assumes. Pi core is explicit
+that this is extension territory: *"pi intentionally does not include …
+background bash"* (pi docs/usage.md).
 
 **The loop failure mode we hit in practice:** an agent given a long-running
-process tends to tight-loop — poll → returns "still running" → poll again —
-burning turns and thrashing the prompt cache, or arming `wake` "just in case"
-and getting stale resumes. The upstream project already diagnosed this
-(docs/IV-0001): agents used `yield_until` to bypass the 290 s empty-poll cap,
-and tool guidance over-promoted `on_exit: "wake"`. Root cause is *agent
-guidance*, not the tooling — which matches the observation that the loop
-problem disappeared once the system prompt was prepared for it.
+process tends to tight-loop — poll → "still running" → poll again — burning
+turns and thrashing the prompt cache, or arming `wake` "just in case" and
+getting stale resumes. Upstream already diagnosed this (docs/IV-0001): agents
+used `yield_until` to bypass the 290 s empty-poll cap, and tool guidance
+over-promoted `on_exit: "wake"`. Root cause is *agent guidance*, not the
+tooling — the fix is prompt-side discipline (§6) plus the disarm tool upstream
+added (`set_on_exit`).
 
-## 2. What already exists
+## 2. Upstream: pi-unified-exec (verified at v0.9.0)
 
-**pi-unified-exec** ([iamwrm/pi-unified-exec](https://github.com/iamwrm/pi-unified-exec),
-MIT, `pi install npm:pi-unified-exec`):
-- Ports codex's `unified_exec` session model verbatim ("faithful port... with
-  codex's constants preserved").
-- Tool surface: `exec_command`, `write_stdin`, `set_on_exit`, `kill_session`,
-  `list_sessions`.
-- Long-lived sessions with two-way I/O: every byte mirrored to an on-disk log
-  (recoverable via `read(log_path)`), in-memory tail capped at 50 KiB /
-  2000 lines.
-- Bounded waits so the agent never stalls: 30 s interactive yield, 290 s
-  background-poll cap, `yield_until` absolute-UTC attached waits (multi-day,
-  safe timer re-arming).
-- `on_exit: "wake"` (default `"none"`) — exactly one follow-up model prompt on
-  background exit, consumed by direct observation, disarmed via `set_on_exit`
-  without killing.
-- PTY mode for interactive programs (Python REPL, ssh, sudo, TUIs);
-  `write_stdin` decodes C-style escapes (`\x03` Ctrl-C, `\x04` EOF…).
-- 250+ tests, real design docs (DC-0001 workspace doctrine, IV-0001
-  long-wait/wake control), CI, published to npm.
-- **Maintenance notice:** unmaintained; issues disabled; PRs not accepted →
-  fork it (MIT).
+[iamwrm/pi-unified-exec](https://github.com/iamwrm/pi-unified-exec), MIT,
+`pi install npm:pi-unified-exec`.
 
-**Codex itself** confirms the direction: its config exposes
-`experimental_use_unified_exec_tool`, `background_terminal_max_timeout`,
-`job_max_runtime_seconds`, `max_concurrent_threads_per_session` — the same
-session/background concepts.
+**Maintenance reality (v2 called it "unmaintained" — wrong):** it is actively
+developed (0.9.0 shipped 2026-08-04) but **closed to external contributions**
+— issues disabled, PRs not accepted, forks explicitly invited. Consequence:
+it's a *moving target* that will keep shipping fixes we want; the fork needs a
+sync strategy (§10), not a one-time copy.
+
+Verified facts (source review + local test run, 2026-08-06):
+
+- Faithful port of codex's `unified_exec` session model: long-lived sessions,
+  two-way I/O, every byte mirrored to an on-disk log (`log_path`), bounded
+  in-memory retention (1 MiB head+tail per session), model-visible output
+  tail-capped per call at 50 KiB / 2000 lines (pi's `DEFAULT_MAX_BYTES/LINES`).
+- Bounded waits: `exec_command` / `write_stdin`-with-input attach ≤ 30 s
+  (defaults 10 s / 250 ms); empty polls clamp to [5 s, 290 s] — above-cap
+  values are *rejected*, not clamped; `yield_until` absolute-UTC waits
+  (multi-day, timers chunked at 2^31−1 ms). 290 s cap exists for Anthropic
+  prompt-cache friendliness.
+- `on_exit: "wake"` (default `"none"`): exactly one follow-up model prompt on
+  unobserved background exit, delivered via core
+  `pi.sendMessage(…, { triggerTurn: true, deliverAs: "followUp" })`; consumed
+  by direct observation; disarmed via `set_on_exit` (tombstones survive store
+  eviction). Wake content is bounded metadata, sanitized, with anti-injection
+  framing.
+- PTY mode (`tty: true`, optional `@homebridge/node-pty-prebuilt-multiarch`,
+  exact-pinned) for REPLs/ssh/TUIs; `write_stdin` decodes C-style escapes;
+  `chars_b64` for raw bytes.
+- **Removes pi's built-in `bash` tool at `session_start` unless
+  `--keep-builtin-bash` is set** — full codex parity where `exec_command` *is*
+  the shell. v2 missed this; it drives §7.1.
+- Output safety (0.9.0, IV-0002): all five tools have explicit renderers;
+  model/details/TUI text is terminal-inert (CSI/OSC/DCS/C0/C1 stripped); raw
+  bytes only in the log file.
+- Quality: 274 tests (271 pass, 3 platform-skips) in ~32 s locally on
+  macOS/Node 26; self-contained `ExtensionAPI` stub harness (no live pi
+  needed); CI matrix ubuntu/macos/windows × Node 22/24; credible security-fix
+  history (cwd-hijackable taskkill, shutdown-vs-spawn races, EPIPE host
+  crash…). ~5.0 k LOC src, ~4.5 k LOC tests. No required runtime deps.
+- **Known gaps upstream itself documents** (IV-0001/IV-0002 backlogs): session
+  logs are unbounded, never cleaned, default perms, non-exclusive create;
+  renderer ticker has no disposal contract; wake TTL unshipped. These seed our
+  hardening plan (§7).
 
 ## 3. Decision
 
-v1 = **fork pi-unified-exec** (MIT) into this repo, keeping its tool surface,
-constants, and tests, and add:
+v1 = **fork pi-unified-exec at the v0.9.0 tag, preserving git history** (not a
+source copy — keeps upstream cherry-picks cheap, §10), rename the package to
+`pi-runbg`, and keep the **tool names, schemas, and constants verbatim**
+(prompt text stays portable; codex-trained models recognize the surface).
 
-1. **System-prompt integration** — the actual fix for the loop problem. Teach
-   the model the session discipline (see §6) via the `-pi` templates.
-2. **Headless-safety review** — verify every tool behaves in `pi -p` mode.
-3. **Hardening/fixes** we find while using it (cache-friendliness of the
-   default poll path is already handled upstream — 0.7.2).
+Rename inventory (~37 string sites, nothing structural): package/repo
+metadata; env vars `PI_UNIFIED_EXEC_MAX_EMPTY_POLL_MS` → `PI_RUNBG_MAX_EMPTY_POLL_MS`,
+`PI_UNIFIED_EXEC_BASH` → `PI_RUNBG_BASH`; log prefix `pi-unified-exec-` →
+`pi-runbg-`; wake `customType: "unified-exec-completed"` → `"runbg-completed"`;
+`/unified-exec-sessions` → `/runbg-sessions`; UI key; user-facing strings;
+docs/tests. Drop upstream-specific CI (`interaction-limit-reminder.yml`,
+npm Trusted Publisher config — publishing is deferred, §12).
 
-## 4. Tool surface (preserved from upstream)
+Our additions on top of the fork:
 
-| Tool | Params | Returns |
+1. **System-prompt integration** (§6, §14) — the actual loop fix.
+2. **Documented behavior divergences** (§7) — starting with the
+   built-in-bash default.
+3. **Headless verification** (§9) and **hardening** (§7.2–7.5).
+
+## 4. Tool surface (corrected from source — v2's table was wrong)
+
+Source of truth once forked: the fork's README. Summary:
+
+| Tool | Params | Returns (`details`) |
 |---|---|---|
-| `exec_command` | `command`, `workdir?`, `interactive?` (pty), `yield_time_ms?` (≤ 290 000), `yield_until?` (RFC 3339 UTC), `on_exit?` (`"none"` \| `"wake"`), `vars?` | `{ session_id, state, exit_code?, tail, output_size, tool_time_utc, … , log_path }` |
-| `write_stdin` | `session_id`, `chars` (C-escapes decoded), `chars_b64?`, `yield_time_ms?` | session snapshot + tail |
-| `set_on_exit` | `session_id`, `on_exit: "none"\|"wake"` | `{ session_id, on_exit, state, wake_armed }` |
-| `kill_session` | `session_id` | final snapshot (tail-capped) |
-| `list_sessions` | — | sessions + `wake_armed` / `[wake]` audit |
+| `exec_command` | `cmd` (required), `workdir?`, `shell?`, `tty?` (PTY), `cols?`/`rows?` (PTY), `yield_time_ms?` (clamp **[250, 30 000]**, default 10 000), `on_exit?` (`"none"`\|`"wake"`) | `operation`, `status: "running"\|"exited"`, `running`, `session_id?` XOR `exit_code?`, `signal?`, bounded `output`, `output_bytes_total`, `truncation?`/`omitted_bytes?`, `wall_time_seconds`, `tty`, `cwd`, `command`, `log_path`, `tool_time_utc`, wake/wait metadata |
+| `write_stdin` | `session_id`, `chars?` (**optional — omit for a pure poll**; C-escapes decoded), `chars_b64?`, `yield_time_ms?` (with input [250, 30 000] def. 250; empty poll [5 000, 290 000], above cap **rejected**), `yield_until?` (RFC 3339 UTC, **empty polls only**, no max horizon) | session snapshot + bounded `output` |
+| `set_on_exit` | `session_id`, `on_exit` | `{ session_id, found, on_exit, status, running, wake_armed, … }` |
+| `kill_session` | `session_id`, `signal?` (default SIGTERM; SIGKILL escalation after 2 s) | bounded output envelope + `killed`, `escalated`, `status` |
+| `list_sessions` | — | per-session `{ session_id, command, pid, running, wake_armed, elapsed_ms, exit info, output_bytes_total, log_path }` + counts. **Side effect: reporting an exit consumes a pending wake** |
 
-Constants (preserve): interactive yield 30 s; background poll cap 290 s;
-`yield_until` human-explicit only (see §6); output caps 50 KiB / 2000 lines
-with full stream at `log_path`; terminal-control sequences stripped from
-model/TUI text; `on_exit` default `"none"`.
+v2 errors, recorded so they don't resurface in prompts or code: params are
+`cmd`/`tty`, not `command`/`interactive`; **there is no `vars` param**
+(children inherit pi's full `process.env`); `yield_until` is `write_stdin`-only;
+`exec_command`'s yield ceiling is 30 s, not 290 s; result fields are
+`status`/`output`/`output_bytes_total`, not `state`/`tail`/`output_size`;
+commands finishing < 150 ms never enter the session store (return
+`exit_code`, no `session_id`).
 
-## 5. Process & state model
+Constants preserved verbatim: yield clamps above; 50 KiB / 2000-line
+model caps; 1 MiB in-memory retention; `MAX_SESSIONS` 64 (LRU, 8 MRU
+protected); `on_exit` default `"none"`; control-sequence stripping; the
+`StringEnum`/`Type.Unsafe` schema workaround (Google-model compat — keep).
 
-- One long-lived session per `exec_command`, keyed by `session_id`, driving
-  the same process across turns via `write_stdin` + polls.
-- On-disk log mirror (complete history) + bounded in-memory tail.
-- Wake delivery: exactly one follow-up model prompt with bounded exit metadata
-  when a backgrounded process exits unobserved; consumed if observation saw
-  the exit; disarmed via `set_on_exit` (tombstones); `kill_session` suppresses
-  wake. A disarmed wake cannot recall an already-queued follow-up
-  (`pi.sendMessage`).
-- Timers chunked at `MAX_TIMER_ARM_MS` (`2^31-1`) for multi-day `yield_until`.
+## 5. Session lifetime & process model
+
+Facts the design must be honest about (v2 was silent on all of these):
+
+- **Sessions are in-memory and conversation-scoped.** Nothing persists across
+  pi restarts; ids are monotonic per pi process.
+- **Graceful shutdown kills everything.** `session_shutdown` (reasons `quit`,
+  `reload`, `new`, `resume`, `fork` — i.e. also `/new` and `/fork`) SIGTERMs
+  all sessions, SIGKILLs after 1 s, and cancels pending wakes. A dev server
+  does **not** survive `/new`. This matches codex; survival across restarts is
+  an explicit **non-goal for v1** (v2 candidate: on-disk session manifest +
+  startup adoption/reaper, only if a real workflow demands it — §13.5).
+- **Restart is invisible to extensions.** A fresh `pi -c`/`pi --session …`
+  fires `session_start` with reason `"startup"`, *not* `"resume"` (that's only
+  for in-process `/resume`). The transcript may reference dead session ids;
+  stale-id calls fail gracefully ("unknown session"). The template therefore
+  teaches: **after any restart, `list_sessions` is ground truth** (§6).
+- **Crash paths orphan children.** `uncaughtException`/dead-terminal exits skip
+  `session_shutdown` (pi only kills *its own* tracked bash children), and
+  SIGKILL kills nothing. POSIX children live in detached process groups →
+  silent orphans (lingering dev-server ports). Mitigation in §7.2.
+- **LRU eviction can kill live processes** — at 64 sessions the oldest
+  unprotected *live* session is terminated (wake suppressed, UI warning only).
+  Candidate divergence §7.5.
+- **Logs**: `${tmpdir()}/pi-runbg-<id>-<hex>.log`, complete raw stream,
+  unbounded, never deleted, default permissions, non-exclusive create; on
+  log-write failure upstream silently stops mirroring while results still
+  claim full recoverability. Hardening §7.3.
 
 ## 6. Turn-model integration & agent guidance (the loop fix)
 
-Upstream's shipped guidance, adopted verbatim — this is the discipline the
-system prompt must teach:
+Upstream's shipped discipline, adopted with one correction — **polling an
+existing session goes through `write_stdin`** (v2's draft implied
+`exec_command` can poll; it always *starts a new session* — teaching that
+would spawn duplicate processes, the exact failure class this section exists
+to fix):
 
 ```text
-yield_time_ms ≤ 290s     → default progress polls (repeat OK, cache-friendly)
-yield_until              → ONLY if human explicitly asks for long attach / UTC deadline
-on_exit default          → "none"
-on_exit "wake"           → ONLY if human explicitly wants auto-resume
-mistaken / abandoned wake → set_on_exit(session_id, on_exit: "none")  # does not kill
-kill_session             → kill process AND suppress wake
-list_sessions            → includes wake_armed for audit
+exec_command                → start a session (attach ≤ 30 s)
+write_stdin, chars omitted  → poll it (yield_time_ms ≤ 290 s; repeat OK, cache-friendly)
+write_stdin, chars set      → drive it (input / \x03 Ctrl-C / …)
+yield_until                 → ONLY if human explicitly asks for a long attach / UTC deadline
+on_exit default             → "none"
+on_exit "wake"              → ONLY if human explicitly wants auto-resume
+mistaken / abandoned wake   → set_on_exit(session_id, "none")   # does not kill
+kill_session                → kill process AND suppress wake
+list_sessions               → audit (wake_armed); consumes pending wakes for exited sessions
 ```
 
-Plus session hygiene for the model:
+Session hygiene the template must teach:
 
 - **Never tight-loop a poll.** If a session is running and there's nothing
   useful to do until it exits, end the turn and report the `session_id` with
   how to resume ("ask me to check session `<id>`").
 - Prefer `on_exit: "wake"` over polling when the human asked to be resumed.
-- When resuming, start from `list_sessions` + `read(log_path)` — do not
-  restart the process.
+- When resuming work, start from `list_sessions` + `read(log_path)` — do not
+  restart the process blindly.
+- **Sessions die with the pi process** (`/new`, `/resume`, restart): a
+  session id from earlier transcript is dead after restart; `list_sessions`
+  is ground truth.
+- Boundary vs `bash`: quick one-shot commands → `bash`; anything long-lived,
+  interactive, or worth backgrounding → `exec_command`.
 
-## 7. Safety
+**Guidance carriers — two, not one** (verified in pi's `system-prompt.js`):
+tool `promptSnippet`/`promptGuidelines` are injected **only in pi's default
+prompt branch** and dropped by every replace-mode template. So: (a) upstream's
+shipped tool guidance already covers default-prompt users automatically —
+keep it; (b) replace-mode templates (`codex-pi`) must carry the discipline
+text themselves (§14). Audit/extend the tool *descriptions* during the fork —
+they are the only carrier that reaches the model in **every** configuration.
 
-- **Pi extension constraint (from pi docs):** extension factories must not
-  start background resources (processes, sockets, watchers, timers). Defer
-  startup to `session_start` or the first tool call; register an idempotent
-  `session_shutdown` handler. Upstream complies; preserve this in the fork.
-- Upstream already handles: process groups / kill semantics, output caps,
-  terminal-control stripping, PTY isolation.
-- Fork hygiene: keep upstream's test suite green; no silent behavior changes.
+## 7. Divergences from upstream **[v3 decision]**
 
-## 8. Why not the alternatives
+Fork hygiene rule: divergences are fine but **loud** — each gets a Changelog
+entry, a README note, and a line in `UPSTREAM.md` (§10). Never silent.
 
-- **tmux / `nohup ... &` via `bash`:** no state tracking; the model can't
+1. **Keep pi's built-in `bash` by default.** Upstream removes it
+   (codex-parity: `exec_command` becomes the shell). For us that would break
+   the whole §14 gating model — opencode templates that never mention session
+   tools would be left with *no shell at all* — and would silently bypass the
+   user-side `bash-guard` extension. Flip the default; offer
+   `--replace-builtin-bash` for codex-parity setups. This change alone
+   justifies forking over pinning (upstream accepts no PRs).
+2. **Best-effort crash cleanup.** Register a `process.on("exit")` handler (at
+   `session_start`, per the factory constraint) that synchronously
+   group-kills live sessions. Covers `uncaughtException`/EIO exits that skip
+   `session_shutdown`; SIGKILL remains unrecoverable (documented).
+3. **Log archive safety** (adopts upstream's own IV-0002 backlog): create
+   logs `0600` + `O_EXCL`; per-session size cap with explicit unlimited
+   opt-in; `log_status: complete|partial|unavailable` in results — stop
+   claiming "Full output" after a degraded archive; prefix-scoped age/size
+   cleanup of old `pi-runbg-*` logs at `session_start`.
+4. **Bound relative-poll memory.** `collectOutputUntilDeadline` accumulates
+   every drained chunk in an array for the whole call — a chatty child during
+   a 290 s empty poll can accumulate GBs in-process before truncation to
+   50 KiB (absolute waits already avoid this; relative polls don't). Drain
+   into a head/tail buffer instead. Top robustness fix for a
+   background-exec tool.
+5. *(candidate, later)* **Refuse new sessions at the 64-cap** with a clear
+   error instead of LRU-killing a live one (keep prefer-exited eviction).
+
+## 8. Safety
+
+- **Pi extension constraint (verified in pi docs):** factories must not start
+  background resources; defer to `session_start` / first tool call; register
+  an idempotent `session_shutdown` handler. Upstream complies; preserve.
+- **Env inheritance:** children get pi's full environment (incl. any secrets
+  in it) — same trust model as built-in `bash`, so acceptable for v1; a
+  `vars`/env-scrubbing param is a candidate addition (§13.4), not a port
+  requirement (v2's table invented it).
+- **bash-guard coverage (user-setup task, not this repo):** the existing
+  `~/.pi/agent/extensions/bash-guard.ts` matches only the `bash` tool;
+  once runbg ships, dangerous-command patterns should also be checked for
+  `exec_command` via the custom-tool-call event (`event.input.cmd`).
+- **Mutual exclusion with upstream:** both packages registering
+  `exec_command` is a conflict. README warns to uninstall
+  `pi-unified-exec`; cheap runtime guard: at `session_start`, scan
+  `pi.getAllTools()` and warn on duplicates.
+- Inherited and kept: process-group kill semantics (POSIX pipes),
+  absolute-path `taskkill`/PowerShell, fail-closed Windows shell resolution,
+  output caps, terminal-control stripping, wake-message sanitization +
+  anti-injection framing. Known inherited limitation: PTY-mode kill signals
+  the shell pid only (grandchildren rely on SIGHUP on master close).
+
+## 9. Headless (`pi -p`) — verified behavior + acceptance criteria
+
+Resolves v2 open question 2 from source: the wake path uses core
+`pi.sendMessage` (not a UI API); every `ctx.ui` use is optional-chained or
+`hasUI`-guarded, and pi supplies a no-op UI context in print/json modes.
+Print mode **drains queued steer/followUp/triggerTurn messages before
+settling**, so a wake that fires while the run is live does start a follow-up
+turn; after the last prompt resolves, dispose → `session_shutdown` kills all
+sessions. Cross-invocation background work is impossible by design (§5).
+
+Acceptance tests to add in the fork (upstream's stub harness makes these
+cheap):
+
+1. `pi -p` one-shot `exec_command` completes; after exit, no orphaned
+   children (probe process group).
+2. Background job exits mid-run with wake armed → follow-up turn delivered
+   before settle.
+3. Sessions still running at settle → killed; the pi process exits promptly
+   (audit that long-wait timers/tickers are cleared or `unref`'d — upstream
+   IV-0002 flags ticker ownership as unresolved).
+4. All five tools behave with `hasUI: false` (headless harness run of the
+   e2e suite).
+
+## 10. Upstream sync strategy **[v3 addition]**
+
+- Fork on GitHub from the `v0.9.0` tag with full history; keep an `upstream`
+  remote.
+- `UPSTREAM.md` records: fork point, the §7 divergence list, and the sync
+  procedure (`git fetch upstream && git log upstream/main --oneline`,
+  cherry-pick wanted commits, full test suite green before merge).
+- Review upstream releases opportunistically — it is active and ships fixes
+  we want (0.9.0 landed two days before this doc).
+- Keep diffs outside §7 minimal so cherry-picks stay clean.
+
+## 11. Why not the alternatives
+
+- **tmux / `nohup … &` via `bash`:** no state tracking; the model can't
   reliably find or resume its own jobs; leaves orphans by default.
-- **Pi built-in:** verified absent (tools: read, bash, edit, edit-diff, find,
-  grep, index, ls, write).
-- **Greenfield tool set (v1 of this doc):** reimplements ~250 tests of proven
-  design for no benefit.
-- **pi-unified-exec as-is, unmodified:** unmaintained; loop UX needs the
-  prompt-side discipline (§6) we're adding; headless behavior needs review.
+- **Pi built-in:** confirmed absent by design — *"pi intentionally does not
+  include … background bash"* (usage.md); core has no process registry,
+  scheduler, or wake API to reuse.
+- **Pin upstream unmodified via npm:** rejected — the built-in-bash default
+  (§7.1) alone requires a code change upstream won't take (no PRs), and the
+  headless tests + hardening need to live somewhere.
+- **Greenfield tool set (v1 of this doc):** reimplements ~9.5 k LOC of proven
+  design and tests for no benefit.
 
-## 9. Open questions
+## 12. Implementation plan (phased)
 
-1. **Fork mechanics:** fork-and-rename package to `pi-runbg`, or copy the
-   source in and keep the name `pi-unified-exec`? (Recommend rename; keeps npm
-   installs unambiguous.)
-2. **Wake in headless mode:** does `pi.sendMessage`-based wake work in `pi -p`
-   (non-interactive) sessions, or is it interactive-only? Must test early.
-3. **TUI widgets:** keep upstream's running-session UI? (Likely yes —
-   `list_sessions` in the status bar.)
-4. **Config surface:** upstream uses env + constants; do we add a config file
-   (e.g. `~/.pi/runbg.json`) for yield caps / log retention?
-5. **Template scope:** resolved — only `codex-pi` carries the session
-   guidance (and `bg: true`); opencode prompts stay oblivious.
-6. **Retention:** log rotation/TTL for on-disk session logs.
+- **P0 — fork:** fork at `v0.9.0` w/ history; rename (inventory in §3); tests
+  green locally (baseline: 271 pass / ~32 s, Node ≥ 22.19); CI ubuntu+macos ×
+  Node 22/24 (keep the Windows lane as long as it stays green — the support
+  is real and tested; drop only if it starts costing); remove
+  upstream-specific workflows. Install via symlink like the sibling repos
+  (`npm i && npx tsc --noEmit`; entry stays `src/index.ts` — moving it to
+  `extensions/` buys nothing and complicates cherry-picks). npm publish
+  deferred (§13.1).
+- **P1 — behavior:** §7.1 bash-default flip (+ flag rename), §8 duplicate-tool
+  guard, §9 acceptance tests.
+- **P2 — prompt integration (in `pi-sysprompt`):** §14 template work,
+  including the two `codex-pi.md` conflicts.
+- **P3 — hardening:** §7.2 crash hook → §7.4 poll memory → §7.3 log safety
+  (order: cheap/high-value first). Then use it in anger and revisit §13.
 
-## 10. Implementation sketch (fork layout)
+## 13. Open questions (remaining)
 
-```
-pi-runbg/
-├── extensions/index.ts        ← fork of upstream src (exec_command, write_stdin,
-│                                set_on_exit, kill_session, list_sessions)
-├── src/…                      ← upstream modules (pty, long-wait, completion,
-│                                session-store, head-tail-buffer, render, …)
-├── docs/DC-0001…, IV-0001…    ← upstream design docs preserved
-├── tests/…                    ← upstream suite (250+) kept green
-├── package.json               ← renamed package; MIT
-└── README.md                  ← fork notice + our additions
-```
+1. **npm publish** under `pi-runbg`, or stay symlink/git-install only?
+   (Defer past P3; publishing means npm provenance setup and a support
+   surface.)
+2. **Windows** long-term: keep the lane or declare best-effort?
+3. **Wake TTL** (upstream's open item): adopt only if stale resumes still
+   appear despite §6 discipline.
+4. **`vars` / env scrubbing** on `exec_command`: add if a need appears.
+5. **Restart-surviving sessions** (on-disk manifest + adoption/reaper): v2
+   feature, only with a demonstrated workflow need.
 
-Typecheck workflow identical to `pi-sysprompt` (`npm i`, `npx tsc --noEmit`),
-symlinked into `~/.pi/agent/extensions/`.
+## 14. Template wiring (in `pi-sysprompt`)
 
-## 11. Template wiring (in `pi-sysprompt`)
+**The prompt text is the gate — no extension-to-extension mechanism.**
+Verified against the sysprompt implementation: templates re-read from disk
+every prompt; frontmatter YAML-parsed with only `description`/`mode`
+consumed, so **`bg: true` is genuinely inert** (already present in
+`codex-pi.md`); selection state is `~/.pi/agent/sysprompt.json`
+(`{"active": <name>|null}`), written atomically at `/sysprompt` time.
 
-**The prompt text is the gate — no extension-to-extension mechanism.** The
-sysprompt extension stays a pure prompt manager; it has no knowledge of runbg's
-tools. Instead:
+- **codex-pi** carries the session guidance (draft below); opencode templates
+  never mention the tools. **Caveat v3 adds:** with the *default* prompt
+  active (`active: null` — the current state of this machine), pi injects the
+  tools' own `promptSnippet`/`promptGuidelines` automatically, so the model
+  is *not* oblivious there. That's accepted — the gate applies to
+  replace-mode templates, and default-prompt users get upstream's shipped
+  guidance, which encodes the same discipline.
+- **Shipping tasks in `codex-pi.md`** (both found in review): add the
+  "Long-running tasks" section; **rewrite the "Monitor or wait" bullet**
+  ("pi has no background monitor, so continuous watching that outlives a turn
+  is not possible") — with runbg it is wrong and actively fights the tools;
+  update the frontmatter description ("bash instead of exec_command" is
+  stale once runbg ships).
+- **Future availability gating (if ever needed) stays inside runbg:**
+  `before_agent_start` reads `sysprompt.json` → template frontmatter (`bg:`)
+  and calls `pi.setActiveTools()`. Verified feasible (precedents:
+  `zz-read-only-mode` does setActiveTools with save/restore; `advisor` reads
+  others' config files; `parseFrontmatter` is exported by pi). Recorded
+  caveats: setActiveTools is session-wide, not per-turn → save/restore
+  required; a dangling active-template name must read as `bg: false`; and
+  toggling snippet-bearing tools rebuilds the system prompt and invalidates
+  the provider cache prefix — one more reason gating stays deferred.
 
-- **codex-pi** carries the session guidance below, so its model is taught the
-  `exec_command` / `write_stdin` / `set_on_exit` / `kill_session` /
-  `list_sessions` discipline. The opencode templates never mention them, so
-  their models stay oblivious (they simply never call the tools).
-- **`bg: true` frontmatter convention:** codex-pi declares `bg: true` in its
-  frontmatter. Nothing reads it today — it is inert documentation and the
-  future contract if strict availability gating is ever wanted.
-- **Future availability gating (if ever needed) happens *inside runbg*, not
-  sysprompt:** runbg's `before_agent_start` can read the active template's
-  frontmatter (`~/.pi/agent/sysprompt.json` → `active` → template file →
-  `bg:`) and call `pi.setActiveTools()` on its own tool names. That keeps the
-  dependency one-way (runbg → template data) and sysprompt fully ignorant.
+Draft "Long-running tasks" section for codex-pi (param names corrected):
 
-Draft "Long-running tasks" section for codex-pi:
+> Long-running or interactive commands (dev servers, `tail -f`, REPLs,
+> builds, migrations): start a session with `exec_command` (`cmd`; `tty: true`
+> for REPLs/ssh/TUIs) instead of blocking `bash`. Keep the returned
+> `session_id`. Drive or poll it with `write_stdin`: send input via `chars`
+> (C-escapes decoded, e.g. `\x03` = Ctrl-C), or omit `chars` for a pure poll
+> with `yield_time_ms` up to 290000. Repeat polls are fine, but never
+> tight-loop: if it's still running and nothing else needs doing, end the
+> turn and tell the user the `session_id` and how to resume. Full history is
+> recoverable with `read` on the session's `log_path`. Use `yield_until`
+> (absolute UTC) or `on_exit: "wake"` only when the user explicitly asks to
+> stay attached or be auto-resumed; disarm an unwanted wake with
+> `set_on_exit(session_id, "none")` (does not kill). Clean up with
+> `kill_session`; audit with `list_sessions`. Sessions die with the pi
+> process (`/new`, restart): after a restart, `list_sessions` is ground
+> truth — ids from earlier transcript are dead. Quick one-shot commands still
+> go through `bash`.
 
-> Long-running commands: start them with `exec_command` (session), not a
-> blocking `bash` call. Then do other work and poll with `write_stdin` /
-> `exec_command(yield_time_ms)`; wait up to 290 s per poll. Never tight-loop:
-> if the process is still running and there's nothing else to do, end the
-> turn and tell the user the session id and how to resume. Use
-> `on_exit: "wake"` only when the user explicitly wants to be resumed; disarm
-> with `set_on_exit` if a wake is no longer wanted. Kill + confirm cleanup
-> with `kill_session` / `list_sessions` when done.
-
-Reminder: pi injects `promptSnippet` / `promptGuidelines` only in the default
-(non-custom) prompt branch — custom templates must carry this guidance
-themselves. Since the guidance lives in the template text, the opencode
-prompts simply don't include it and never learn the session tools.
+Reminder (verified in pi source): pi injects `promptSnippet` /
+`promptGuidelines` only in the default (non-custom) prompt branch — custom
+templates must carry this guidance themselves. `appendSystemPrompt` survives
+both branches, but the template-carried text is the chosen mechanism.
