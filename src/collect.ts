@@ -151,9 +151,16 @@ export async function collectOutputUntilDeadline(inputs: CollectInputs): Promise
 
 			// 1) Drain whatever is currently buffered.
 			const drained = buffer.drainSegments();
-			const drainedCount = drained.head.length + drained.tail.length;
+			// Count BYTES, not segments. The buffer never returns zero-length
+			// segments, but if it ever did, a segment-count test would read as
+			// "not empty" forever and this loop — whose collected-bytes branch
+			// contains no `await` — would spin synchronously until the deadline,
+			// occupying the event loop for up to the full 290 s poll cap.
+			let drainedBytes = 0;
+			for (const chunk of drained.head) drainedBytes += chunk.length;
+			for (const chunk of drained.tail) drainedBytes += chunk.length;
 
-			if (drainedCount === 0 && drained.omittedBytes === 0) {
+			if (drainedBytes === 0 && drained.omittedBytes === 0) {
 				if (exited.aborted) exitSignalReceived = true;
 				if (exitSignalReceived && outputClosed.isClosed) break;
 

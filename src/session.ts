@@ -32,6 +32,53 @@ export const DEFAULT_HEAD_TAIL_MAX_BYTES = 1024 * 1024; // 1 MiB
 /** Default rolling tail window used for TUI streaming (independent of the head+tail buffer). */
 export const DEFAULT_STREAM_TAIL_BYTES = 32 * 1024; // 32 KiB
 
+/**
+ * Fixed-size rolling byte window: keeps the last `cap` bytes with no
+ * per-chunk objects and no shifting. Same reasoning as `HeadTailBuffer` — an
+ * array of per-write views cost ~200 B of overhead each and made every append
+ * an O(n) front-trim once full (measured 874 KiB of heap for a 32 KiB window
+ * at 9-byte writes).
+ */
+class RollingTail {
+	private buf: Uint8Array | undefined;
+	private start = 0;
+	private len = 0;
+	constructor(readonly cap: number) {}
+
+	append(chunk: Uint8Array): void {
+		if (this.cap === 0 || chunk.length === 0) return;
+		const ring = (this.buf ??= new Uint8Array(this.cap));
+		if (chunk.length >= this.cap) {
+			// A single write larger than the window replaces it outright.
+			ring.set(chunk.subarray(chunk.length - this.cap));
+			this.start = 0;
+			this.len = this.cap;
+			return;
+		}
+		const free = this.cap - this.len;
+		if (chunk.length > free) {
+			const drop = chunk.length - free;
+			this.start = (this.start + drop) % this.cap;
+			this.len -= drop;
+		}
+		const writeAt = (this.start + this.len) % this.cap;
+		const firstLen = Math.min(chunk.length, this.cap - writeAt);
+		ring.set(chunk.subarray(0, firstLen), writeAt);
+		if (firstLen < chunk.length) ring.set(chunk.subarray(firstLen), 0);
+		this.len += chunk.length;
+	}
+
+	/** Owned copy of the retained window, oldest byte first. */
+	snapshot(): Uint8Array {
+		const out = new Uint8Array(this.len);
+		if (!this.buf || this.len === 0) return out;
+		const firstLen = Math.min(this.len, this.cap - this.start);
+		out.set(this.buf.subarray(this.start, this.start + firstLen), 0);
+		if (firstLen < this.len) out.set(this.buf.subarray(0, this.len - firstLen), firstLen);
+		return out;
+	}
+}
+
 export interface SessionSpawnOptions {
 	command: string[];
 	cwd: string;
@@ -87,9 +134,7 @@ export class ExecSession {
 	}
 
 	/** Running tail window for TUI streaming; independent of outputBuffer. */
-	private streamTail: Uint8Array[] = [];
-	private streamTailBytes = 0;
-	private readonly streamTailCap: number;
+	private readonly streamTail: RollingTail;
 	private totalOutputBytes = 0;
 
 	private state: SessionState = {
@@ -111,7 +156,7 @@ export class ExecSession {
 		this.startedAt = Date.now();
 		this.lastUsedAt = this.startedAt;
 		this.outputBuffer = new HeadTailBuffer(opts.headTailMaxBytes ?? DEFAULT_HEAD_TAIL_MAX_BYTES);
-		this.streamTailCap = opts.streamTailBytes ?? DEFAULT_STREAM_TAIL_BYTES;
+		this.streamTail = new RollingTail(opts.streamTailBytes ?? DEFAULT_STREAM_TAIL_BYTES);
 		this.maxLogBytes = opts.maxLogBytes ?? resolveMaxLogBytes();
 		this.pid = undefined; // set in `start`
 		this.logPath = join(tmpdir(), `pi-runbg-${id}-${randomBytes(4).toString("hex")}.log`);
@@ -234,29 +279,7 @@ export class ExecSession {
 	}
 
 	private appendStreamTail(chunk: Uint8Array): void {
-		// A single chunk larger than the whole window replaces it outright —
-		// the trim loop below never shrinks a lone chunk, and shipping a
-		// multi-megabyte "tail" to the TUI every tick defeats the cap.
-		if (chunk.length >= this.streamTailCap) {
-			this.streamTail = [chunk.subarray(chunk.length - this.streamTailCap)];
-			this.streamTailBytes = this.streamTailCap;
-			return;
-		}
-		this.streamTail.push(chunk);
-		this.streamTailBytes += chunk.length;
-		while (this.streamTailBytes > this.streamTailCap && this.streamTail.length > 1) {
-			const front = this.streamTail[0]!;
-			if (this.streamTailBytes - front.length >= this.streamTailCap) {
-				this.streamTail.shift();
-				this.streamTailBytes -= front.length;
-			} else {
-				// Trim the front of the leading chunk just enough.
-				const drop = this.streamTailBytes - this.streamTailCap;
-				this.streamTail[0] = front.subarray(drop);
-				this.streamTailBytes -= drop;
-				break;
-			}
-		}
+		this.streamTail.append(chunk);
 	}
 
 	/** Recoverability of the on-disk log (divergence #3, log-archive.ts). */
@@ -349,15 +372,7 @@ export class ExecSession {
 
 	/** Snapshot the current rolling tail (for streaming updates). */
 	snapshotStreamTail(): Uint8Array {
-		let total = 0;
-		for (const c of this.streamTail) total += c.length;
-		const out = new Uint8Array(total);
-		let offset = 0;
-		for (const c of this.streamTail) {
-			out.set(c, offset);
-			offset += c.length;
-		}
-		return out;
+		return this.streamTail.snapshot();
 	}
 
 	/**

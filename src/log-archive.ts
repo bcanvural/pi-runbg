@@ -38,6 +38,11 @@ export const LOG_TTL_ENV_VAR = "PI_RUNBG_LOG_TTL_DAYS";
 export const DEFAULT_MAX_LOG_BYTES = 256 * 1024 * 1024;
 export const DEFAULT_LOG_TTL_DAYS = 7;
 
+/** Interval between liveness touches of open session logs. */
+export const LOG_HEARTBEAT_INTERVAL_MS = 60 * 60 * 1000;
+/** Floor for a positive TTL — comfortably above the heartbeat interval. */
+export const MIN_LOG_TTL_DAYS = 1;
+
 /** Names this extension creates: pi-runbg-<session id>-<8 hex>.log */
 const LOG_FILE_PATTERN = /^pi-runbg-\d+-[0-9a-f]{8}\.log$/;
 
@@ -67,10 +72,6 @@ export function resolveLogTtlDays(env: Record<string, string | undefined> = proc
 	return Math.max(MIN_LOG_TTL_DAYS, parsed);
 }
 
-/** Interval between liveness touches of open session logs. */
-export const LOG_HEARTBEAT_INTERVAL_MS = 60 * 60 * 1000;
-/** Floor for a positive TTL — comfortably above the heartbeat interval. */
-export const MIN_LOG_TTL_DAYS = 1;
 
 /**
  * Mark a live session's log as recently used so the age-based sweep in other

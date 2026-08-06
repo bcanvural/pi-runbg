@@ -27,6 +27,34 @@ import { formatDurationSeconds, formatRemainingLater } from "./format-time.ts";
 import { sanitizeOutputText } from "./output-safety.ts";
 import type { KillResultDetails, OutputResultDetails, ProcessResultDetails } from "./tool-result.ts";
 
+/**
+ * Live 1 Hz elapsed-time tickers, owned by the module so the extension can
+ * clear them at `session_shutdown` regardless of whether pi ever delivers the
+ * final render that would clear them normally (see `renderOutputResult`).
+ * pi's component API has no disposal callback, so this registry is the only
+ * place that can guarantee they stop.
+ */
+const liveRenderTickers = new Set<NodeJS.Timeout>();
+
+export function registerRenderTicker(timer: NodeJS.Timeout): NodeJS.Timeout {
+	liveRenderTickers.add(timer);
+	return timer;
+}
+
+export function clearRenderTicker(timer: NodeJS.Timeout): void {
+	clearInterval(timer);
+	liveRenderTickers.delete(timer);
+}
+
+/** Stop every live ticker. Called from `session_shutdown`. */
+export function clearAllRenderTickers(): number {
+	const count = liveRenderTickers.size;
+	for (const timer of liveRenderTickers) clearInterval(timer);
+	liveRenderTickers.clear();
+	return count;
+}
+
+
 type ExportedRenderCall<TState> = NonNullable<ToolDefinition<any, any, TState>["renderCall"]>;
 type ToolRenderContext<TState = any, TArgs = any> = Parameters<ExportedRenderCall<TState>>[2] & {
 	args: TArgs;
@@ -252,12 +280,21 @@ function renderOutputResult(
 	const state = context.state;
 
 	if (state.startedAt !== undefined && options.isPartial && !state.liveTicker) {
-		state.liveTicker = setInterval(() => context.invalidate(), 1000);
+		// Registered so `session_shutdown` can clear it even if pi never gives
+		// us a final render: the ticker's only other handle is `state`, which
+		// pi drops wholesale on a thinking-block toggle, a settings toggle, a
+		// rewind/navigate, or a compaction (all `chatContainer.clear()` +
+		// `pendingTools.clear()` with no final `updateResult`). An orphan would
+		// otherwise force a full TUI redraw at 1 Hz for the rest of the process
+		// and retain the whole component. `unref` keeps it from holding the
+		// event loop open in the meantime.
+		state.liveTicker = registerRenderTicker(setInterval(() => context.invalidate(), 1000));
+		state.liveTicker.unref?.();
 	}
 	if (!options.isPartial || context.isError) {
 		state.endedAt ??= Date.now();
 		if (state.liveTicker) {
-			clearInterval(state.liveTicker);
+			clearRenderTicker(state.liveTicker);
 			state.liveTicker = undefined;
 		}
 	}

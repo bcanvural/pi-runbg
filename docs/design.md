@@ -336,8 +336,10 @@ cheap):
 **The prompt text is the gate — no extension-to-extension mechanism.**
 Verified against the sysprompt implementation: templates re-read from disk
 every prompt; frontmatter YAML-parsed with only `description`/`mode`
-consumed, so **`bg: true` is genuinely inert** (already present in
-`codex-pi.md`); selection state is `~/.pi/agent/sysprompt.json`
+consumed, so **`bg: true` is genuinely inert** — the marker was removed from
+`codex-pi.md` on 2026-08-06 (its `(bg: true)` parenthetical in the unquoted
+description broke frontmatter parsing entirely, hiding the template from
+`/sysprompt`); it returns only if the deferred auto-gating below ships.
 (`{"active": <name>|null}`), written atomically at `/sysprompt` time.
 
 - **codex-pi** carries the session guidance (draft below); opencode templates
@@ -359,8 +361,8 @@ consumed, so **`bg: true` is genuinely inert** (already present in
   (a settings namespace for future runbg options — unknown keys preserved).
   The human pairs `/runbg on` with `/sysprompt codex-pi` by hand — no
   extension reads another's state. *Automatic* template-frontmatter gating
-  (`before_agent_start` reads `sysprompt.json` → `bg:` frontmatter) remains
-  designed-but-deferred; verified feasible (precedents: `zz-read-only-mode`
+  (`before_agent_start` reads `sysprompt.json` → a re-added `bg:` marker)
+  remains designed-but-deferred; verified feasible (precedents: `zz-read-only-mode`
   setActiveTools save/restore; `advisor` reads others' config files;
   `parseFrontmatter` exported by pi), with recorded caveats: setActiveTools
   is session-wide, not per-turn; a dangling active-template name must read

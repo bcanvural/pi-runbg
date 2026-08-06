@@ -40,6 +40,7 @@ import { sleep } from "./notify.ts";
 import { sanitizeOutputText } from "./output-safety.ts";
 import { getPtyLoadError, isPtyAvailable, killWindowsTreeSync } from "./pty.ts";
 import {
+	clearAllRenderTickers,
 	renderExecCommandCall,
 	renderKillSessionCall,
 	renderKillSessionResult,
@@ -212,6 +213,8 @@ interface ExtensionCtx {
 	processExitHandler: (() => void) | undefined;
 	/** Liveness-touch timer for open session logs (divergence #3). */
 	logHeartbeat: NodeJS.Timeout | undefined;
+	/** True while a stale-log sweep is running, so reloads don't stack them. */
+	logSweepInFlight: boolean;
 	/** True only while WE removed pi's built-in bash (divergence #1 latch). */
 	removedBuiltinBash: boolean;
 	/** Per-session interaction serialization (divergence #7). */
@@ -878,6 +881,11 @@ async function runWriteStdin(
 	// Empty polls are preemptible: they must not keep parking once anything
 	// else wants the session. Input writes are short and bounded, so they run
 	// to completion.
+	// A reaped id needs no lock (nothing to serialize against) and creating one
+	// would outlive every `forget()`, so answer the tombstone before acquiring.
+	if (!ctx.store.get(args.session_id) && ctx.reaped.has(args.session_id)) {
+		return reapedEcho(ctx, args.session_id, isEmptyPoll ? "relative" : undefined);
+	}
 	let handle: InteractionHandle;
 	try {
 		handle = await ctx.locks.for(args.session_id).acquire({ preemptible: isEmptyPoll, signal });
@@ -946,8 +954,8 @@ async function runWriteStdin(
 					sessionId: undefined,
 					exitCode: session.exitCode,
 					signal: session.signal,
-					failure: session.failureMessage,
-					tty: false,
+					failure: session.failureMessage ?? writeFailure,
+					tty: session.tty,
 					logPath: session.logPath,
 					logStatus: session.logStatus,
 					cwd: session.cwd,
@@ -966,8 +974,8 @@ async function runWriteStdin(
 				sessionId: session.id,
 				exitCode: undefined,
 				signal: null,
-				failure: null,
-				tty: false,
+				failure: session.failureMessage,
+				tty: session.tty,
 				logPath: session.logPath,
 				logStatus: session.logStatus,
 				cwd: session.cwd,
@@ -1022,8 +1030,15 @@ async function runWriteStdin(
 
 		const deadlineMs = start + yieldTimeMs;
 		const pollStream = startStreaming(session, onUpdate, deadlineMs, streamAbort);
-		const collected = await session.collect({ deadlineMs, externalAbort: signal, preemptAbort: handle.preempt });
-		pollStream.stop();
+		// Stop in `finally`: a rejection here would otherwise leave the
+		// self-rescheduling 250 ms streamer emitting partial updates into an
+		// already-failed tool call until the deadline (up to 290 s of them).
+		let collected: CollectResult;
+		try {
+			collected = await session.collect({ deadlineMs, externalAbort: signal, preemptAbort: handle.preempt });
+		} finally {
+			pollStream.stop();
+		}
 		const wallSec = (Date.now() - start) / 1000;
 
 		if (session.hasExited) {
@@ -1063,7 +1078,10 @@ async function runWriteStdin(
 			sessionId: session.id,
 			exitCode: undefined,
 			signal: null,
-			failure: writeFailure,
+			// A LIVE session can carry a failure too: recordFailure sets it when
+			// log mirroring breaks without killing the child. Report both, same
+			// precedence as the exited sibling below.
+			failure: session.failureMessage ?? writeFailure,
 			tty: session.tty,
 			logPath: session.logPath,
 			logStatus: session.logStatus,
@@ -1479,7 +1497,12 @@ function removeSession(ctx: ExtensionCtx, id: number): ExecSession | undefined {
 }
 
 /**
- * Bookkeeping every removal path owes, whoever performed the store delete:
+ * Bookkeeping every per-session removal path owes, whoever performed the
+ * store delete. `session_shutdown` is the deliberate exception: it tears the
+ * whole instance down with `terminateAll()` and then clears `locks`/`reaped`
+ * wholesale, so per-session tombstones there would be created and discarded in
+ * the same breath.
+ *
  * drop the UI exit watcher, leave an exit tombstone so a call queued behind
  * the observer can still echo the truth, and forget the interaction lock.
  * (`unwatchSessionExit` only detaches OUR ui watcher — the completion
@@ -1559,12 +1582,25 @@ function startStreaming(
 	if (!onUpdate) return { stop: () => {} };
 	let stopped = false;
 	let timer: NodeJS.Timeout | undefined;
+	// Emit only when the child actually produced something since the last tick.
+	// An unconditional 250 ms cadence sent a byte-identical update ~1160 times
+	// over a full 290 s poll, and every one costs a snapshot + sanitize here
+	// plus a full renderCall/renderResult/TUI diff in the host (measured
+	// ~164 µs + ~425-710 µs each). Elapsed time in the row is refreshed by the
+	// renderer's own 1 Hz ticker, so a quiet tick has nothing to say.
+	// `-1` guarantees the first tick emits, preserving the "session started"
+	// update even for a child that never writes.
+	let lastBytesSeen = -1;
 	const tick = () => {
 		if (stopped) return;
-		try {
-			onUpdate(buildStreamUpdate(session));
-		} catch {
-			// ignore transient errors
+		const seen = session.totalBytesSeen;
+		if (seen !== lastBytesSeen) {
+			lastBytesSeen = seen;
+			try {
+				onUpdate(buildStreamUpdate(session));
+			} catch {
+				// ignore transient errors
+			}
 		}
 		if (stopped) return;
 		if (Date.now() >= deadlineMs) return;
@@ -1617,6 +1653,7 @@ export default function (pi: ExtensionAPI) {
 		shuttingDown: false,
 		processExitHandler: undefined,
 		logHeartbeat: undefined,
+		logSweepInFlight: false,
 		removedBuiltinBash: false,
 		locks: new InteractionLocks(),
 		reaped: new Map(),
@@ -1665,8 +1702,15 @@ export default function (pi: ExtensionAPI) {
 		warnIfUpstreamPackagePresent(ctx, pi);
 		// Stale-log cleanup (divergence #3): age-based and best-effort, so a
 		// concurrent pi process's fresh logs are never touched. Fire and
-		// forget — session start must not block on tmpdir scanning.
-		void cleanupStaleLogs();
+		// forget — session start must not block on tmpdir scanning — but never
+		// stack sweeps: each one is a readdir plus an lstat per matching file,
+		// and reloads can fire session_start repeatedly in quick succession.
+		if (!ctx.logSweepInFlight) {
+			ctx.logSweepInFlight = true;
+			void cleanupStaleLogs().finally(() => {
+				ctx.logSweepInFlight = false;
+			});
+		}
 		// Crash-path reaper (divergence #2): removed again on session_shutdown,
 		// so graceful teardowns never stack listeners across /reload cycles and
 		// the handler can only ever fire while this instance owns sessions.
@@ -1749,6 +1793,14 @@ export default function (pi: ExtensionAPI) {
 			clearInterval(ctx.logHeartbeat);
 			ctx.logHeartbeat = undefined;
 		}
+		// Renderer tickers: pi has no component-disposal callback, so a partial
+		// render whose component pi dropped would otherwise keep invalidating
+		// forever (see render.ts).
+		clearAllRenderTickers();
+		// Hygiene: session_start clears these, so shutdown should too — ids are
+		// never reused, and a fresh instance builds its own.
+		ctx.locks.clear();
+		ctx.reaped.clear();
 	});
 
 	// Configuration surface for the extension. `on`/`off` (enable/disable the

@@ -94,10 +94,9 @@ export async function waitForExitOrDeadline(inputs: LongWaitInputs): Promise<Lon
 			if (which === "exit" || which === "cancelled") return which;
 			// Timer fired: trust only the monotonic clock.
 			if (monotonicNow() >= monotonicDeadline) return "deadline";
-			if (timerHandle !== undefined) {
-				clearTimeoutFn(timerHandle);
-				timerHandle = undefined;
-			}
+			// No clear needed: the timer callback already ran and cleared
+			// `timerHandle` before resolving, so the next armTimer() starts a
+			// fresh chunk. (A defensive clear here was dead code.)
 		}
 	} finally {
 		for (const cleanup of cleanups) cleanup();

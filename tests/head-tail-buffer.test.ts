@@ -165,4 +165,68 @@ describe("HeadTailBuffer", () => {
 		// Our retained state should still see '0', not 'X'.
 		assert.equal(render(buf), "01234");
 	});
+	// Representation regressions (the buffer is a byte ring, not a chunk array).
+
+	// Load-bearing for collect.ts: it tests emptiness via segment count, so a
+	// zero-length segment would make an empty drain look non-empty forever and
+	// spin the drain loop synchronously until its deadline.
+	it("never returns zero-length segments", () => {
+		const buf = new HeadTailBuffer(64);
+		assert.deepEqual(buf.drainSegments().head, []);
+		assert.deepEqual(buf.drainSegments().tail, []);
+		buf.pushChunk(s("abc"));
+		const first = buf.drainSegments();
+		assert.equal([...first.head, ...first.tail].every((c) => c.length > 0), true);
+		// Drained state must be empty again, with no leftover empty slices.
+		const second = buf.drainSegments();
+		assert.equal(second.head.length + second.tail.length, 0);
+		// Same after the tail ring has wrapped.
+		const wrap = new HeadTailBuffer(8);
+		for (let i = 0; i < 20; i++) wrap.pushChunk(s("xy"));
+		wrap.drainSegments();
+		const after = wrap.drainSegments();
+		assert.equal(after.head.length + after.tail.length, 0);
+	});
+
+	it("keeps byte order across many ring wraps", () => {
+		// tailBudget = 8; feed 3-byte chunks so writes straddle the wrap point.
+		const buf = new HeadTailBuffer(16);
+		let all = "";
+		for (let i = 0; i < 40; i++) {
+			const chunk = `${i % 10}${(i + 1) % 10}${(i + 2) % 10}`;
+			all += chunk;
+			buf.pushChunk(s(chunk));
+		}
+		const text = render(buf);
+		// Head holds the first 8 bytes; the tail holds the last 8, in order.
+		assert.equal(text.slice(0, 8), all.slice(0, 8), `head: ${text}`);
+		assert.equal(text.slice(-8), all.slice(-8), `tail: ${text}`);
+		assert.equal(buf.retainedBytes, 16);
+		assert.equal(buf.omittedBytes, all.length - 16);
+	});
+
+	it("snapshots are stable across later pushes (no aliasing into the ring)", () => {
+		const buf = new HeadTailBuffer(8);
+		buf.pushChunk(s("AAAA"));
+		buf.pushChunk(s("BBBB"));
+		const snap = buf.snapshotChunks();
+		const before = snap.map((c) => new TextDecoder().decode(c)).join("");
+		// Overwrite the ring several times over.
+		for (let i = 0; i < 10; i++) buf.pushChunk(s("ZZZZ"));
+		assert.equal(snap.map((c) => new TextDecoder().decode(c)).join(""), before, "snapshot must not alias the ring");
+	});
+
+	it("does not allocate its budget until first use", () => {
+		// 64 MiB budget: if allocation were eager this would be visible in heap.
+		const before = process.memoryUsage().heapUsed;
+		const bufs = Array.from({ length: 8 }, () => new HeadTailBuffer(64 * 1024 * 1024));
+		const afterCreate = process.memoryUsage().heapUsed;
+		assert.ok(
+			afterCreate - before < 8 * 1024 * 1024,
+			`8x64MiB budgets must not allocate on construction (grew ${afterCreate - before} bytes)`,
+		);
+		// Touching one allocates only that one's head slab.
+		bufs[0]!.pushChunk(s("x"));
+		assert.equal(bufs[0]!.retainedBytes, 1);
+	});
 });

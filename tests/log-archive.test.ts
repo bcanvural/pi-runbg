@@ -206,7 +206,14 @@ describe("log archive safety", () => {
 			assert.ok(r.details.output.includes("0123456789ABCDEF"));
 			assert.equal(r.details.log_status, "partial");
 			assert.ok(r.content[0].text.includes("log_status: partial"), r.content[0].text);
-			const logged = readFileSync(r.details.log_path, "utf8");
+			// The mirror write is issued synchronously but flushed by the OS
+			// asynchronously, so under parallel test load the file can lag the
+			// tool result by a tick or two. Wait for the note rather than racing.
+			let logged = readFileSync(r.details.log_path, "utf8");
+			for (let i = 0; i < 100 && !logged.includes("log truncated here"); i++) {
+				await new Promise((res) => setTimeout(res, 20));
+				logged = readFileSync(r.details.log_path, "utf8");
+			}
 			assert.ok(logged.startsWith("01234567"), `first 8 bytes mirrored: ${logged}`);
 			assert.ok(!logged.includes("9ABCDEF"), `bytes past the cap must not be mirrored: ${logged}`);
 			assert.ok(logged.includes("log truncated here"), `explicit note in the log: ${logged}`);

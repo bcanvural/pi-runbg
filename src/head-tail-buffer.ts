@@ -3,7 +3,33 @@
  * dropping the middle once it exceeds the configured maximum. The buffer is
  * symmetric: 50% of the capacity is allocated to the head and 50% to the tail.
  *
- * Direct port of codex's HeadTailBuffer (codex-rs/core/src/unified_exec/head_tail_buffer.rs).
+ * Port of codex's HeadTailBuffer (codex-rs/core/src/unified_exec/head_tail_buffer.rs),
+ * matching its *representation* as well as its behavior: codex uses flat byte
+ * containers (`head: Vec<u8>`, `tail: VecDeque<u8>`), so this holds two
+ * preallocated `Uint8Array`s — the head plus a circular tail ring — instead of
+ * an array of per-chunk views.
+ *
+ * That representation is load-bearing, not a style choice (measured):
+ *
+ *   - **Memory.** Per-chunk `Uint8Array`s cost ~150-230 B of object overhead
+ *     each. A child writing 9-byte lines (an ordinary shell `echo` loop, or
+ *     `python -u` progress output) filled a 1 MiB budget with ~116 k views:
+ *     26 MiB of heap for 1 MiB of retained data, ~26x amplification. Flat
+ *     containers make the footprint exactly the budget.
+ *   - **Latency.** Trimming the old tail meant `Array.prototype.shift()` on a
+ *     10 k-65 k element array per push: 26-158 µs per chunk. Because ingestion
+ *     runs synchronously inside the child's `data` handler, that blocked pi's
+ *     event loop — 3.25 MB of small-chunk output produced a single 1260 ms
+ *     stall with 49% of wall time blocked, during which the host renders no
+ *     frame, accepts no keystroke, and fires no timer (including other
+ *     sessions' deadlines). The ring is O(chunk length) with no per-chunk
+ *     allocation: ~50-100 ns regardless of chunk size.
+ *
+ * Ownership: bytes are copied IN on push (so later caller mutations cannot
+ * poison retained state, matching codex's by-value semantics) and copied OUT
+ * on drain/snapshot (so a returned slice cannot be overwritten by a later
+ * push into the ring). Both copies are single `set()` memcpys into or out of
+ * preallocated space.
  */
 
 /** Result of `drainSegments()`: retained head/tail plus the dropped-middle count. */
@@ -16,10 +42,19 @@ export class HeadTailBuffer {
 	readonly maxBytes: number;
 	readonly headBudget: number;
 	readonly tailBudget: number;
-	private head: Uint8Array[] = [];
-	private tail: Uint8Array[] = [];
-	private headBytesInternal = 0;
-	private tailBytesInternal = 0;
+	/**
+	 * Head region; bytes [0, headLen) are retained. Allocated on first push and
+	 * the ring on the first byte that reaches the tail — `collect()` builds one
+	 * of these per tool call, and most calls drain a few hundred bytes, so
+	 * committing the full budget up front would churn ~1 MiB of young-gen heap
+	 * per call. codex's `Vec`/`VecDeque` grow on demand for the same reason.
+	 */
+	private headBuf: Uint8Array | undefined;
+	private headLen = 0;
+	/** Circular tail ring holding `tailLen` bytes from `tailStart`. */
+	private tailBuf: Uint8Array | undefined;
+	private tailStart = 0;
+	private tailLen = 0;
 	private omittedBytesInternal = 0;
 
 	/**
@@ -37,9 +72,21 @@ export class HeadTailBuffer {
 		this.tailBudget = Math.max(0, this.maxBytes - this.headBudget);
 	}
 
+	/** Head slab, allocated on first use. */
+	private head(): Uint8Array {
+		this.headBuf ??= new Uint8Array(this.headBudget);
+		return this.headBuf;
+	}
+
+	/** Tail ring, allocated on first use. */
+	private tail(): Uint8Array {
+		this.tailBuf ??= new Uint8Array(this.tailBudget);
+		return this.tailBuf;
+	}
+
 	/** Total bytes currently retained by the buffer (head + tail). */
 	get retainedBytes(): number {
-		return this.headBytesInternal + this.tailBytesInternal;
+		return this.headLen + this.tailLen;
 	}
 
 	/** Total bytes that were dropped from the middle due to the size cap. */
@@ -61,31 +108,22 @@ export class HeadTailBuffer {
 		}
 		if (chunk.length === 0) return;
 
-		// Always store an owned copy so later caller mutations to the input
-		// buffer cannot poison our retained state (matches codex's `Vec<u8>`
-		// by-value ownership semantics).
-		const owned = copyOf(chunk);
-
 		// Fill the head budget first, then keep a capped tail.
-		if (this.headBytesInternal < this.headBudget) {
-			const remainingHead = this.headBudget - this.headBytesInternal;
-			if (owned.length <= remainingHead) {
-				this.headBytesInternal += owned.length;
-				this.head.push(owned);
+		if (this.headLen < this.headBudget) {
+			const remainingHead = this.headBudget - this.headLen;
+			if (chunk.length <= remainingHead) {
+				this.head().set(chunk, this.headLen);
+				this.headLen += chunk.length;
 				return;
 			}
 			// Split the chunk: part goes to head, remainder goes to tail.
-			const headPart = owned.subarray(0, remainingHead);
-			const tailPart = owned.subarray(remainingHead);
-			if (headPart.length > 0) {
-				this.headBytesInternal += headPart.length;
-				this.head.push(copyOf(headPart));
-			}
-			this.pushToTail(copyOf(tailPart));
+			this.head().set(chunk.subarray(0, remainingHead), this.headLen);
+			this.headLen += remainingHead;
+			this.pushToTail(chunk.subarray(remainingHead));
 			return;
 		}
 
-		this.pushToTail(owned);
+		this.pushToTail(chunk);
 	}
 
 	/**
@@ -93,18 +131,14 @@ export class HeadTailBuffer {
 	 * Omitted bytes are not represented. Non-destructive.
 	 */
 	snapshotChunks(): Uint8Array[] {
-		return [...this.head, ...this.tail];
+		return [...this.headSegments(), ...this.tailSegments()];
 	}
 
 	/** Return the retained output as a single Buffer (head then tail). */
 	toBytes(): Uint8Array {
 		const out = new Uint8Array(this.retainedBytes);
 		let offset = 0;
-		for (const c of this.head) {
-			out.set(c, offset);
-			offset += c.length;
-		}
-		for (const c of this.tail) {
+		for (const c of this.snapshotChunks()) {
 			out.set(c, offset);
 			offset += c.length;
 		}
@@ -126,68 +160,82 @@ export class HeadTailBuffer {
 	 * Drain the buffer preserving the head/tail split and the omitted-byte
 	 * count, so callers can splice an omission marker at the exact position
 	 * where middle bytes were dropped. Resets all state.
+	 *
+	 * Note: the returned segments are byte ranges, NOT the original write
+	 * boundaries — head is at most one segment and tail at most two (a ring
+	 * wrap). Callers only concatenate them, and the head/tail split (the one
+	 * boundary that carries meaning, because the omission marker is spliced
+	 * there) is preserved exactly.
 	 */
 	drainSegments(): DrainedSegments {
 		const out: DrainedSegments = {
-			head: this.head,
-			tail: this.tail,
+			head: this.headSegments(),
+			tail: this.tailSegments(),
 			omittedBytes: this.omittedBytesInternal,
 		};
-		this.head = [];
-		this.tail = [];
-		this.headBytesInternal = 0;
-		this.tailBytesInternal = 0;
+		this.headLen = 0;
+		this.tailStart = 0;
+		this.tailLen = 0;
 		this.omittedBytesInternal = 0;
 		return out;
 	}
 
-	private pushToTail(chunk: Uint8Array): void {
-		if (this.tailBudget === 0) {
-			this.omittedBytesInternal += chunk.length;
-			return;
-		}
-
-		if (chunk.length >= this.tailBudget) {
-			// This single chunk is larger than the whole tail budget. Keep only the last
-			// tailBudget bytes and drop everything else.
-			const start = chunk.length - this.tailBudget;
-			const kept = copyOf(chunk.subarray(start));
-			const dropped = chunk.length - kept.length;
-			this.omittedBytesInternal += this.tailBytesInternal + dropped;
-			this.tail = [];
-			this.tailBytesInternal = kept.length;
-			this.tail.push(kept);
-			return;
-		}
-
-		this.tailBytesInternal += chunk.length;
-		this.tail.push(chunk);
-		this.trimTailToBudget();
+	/** Retained head as ≤1 owned segment. */
+	private headSegments(): Uint8Array[] {
+		// Zero-length segments are NEVER returned: callers use
+		// `head.length + tail.length === 0` as their emptiness test, so an empty
+		// slice here would make a drain look non-empty forever (see collect.ts).
+		if (this.headLen === 0 || !this.headBuf) return [];
+		return [copyOf(this.headBuf.subarray(0, this.headLen))];
 	}
 
-	private trimTailToBudget(): void {
-		let excess = this.tailBytesInternal - this.tailBudget;
-		while (excess > 0 && this.tail.length > 0) {
-			const front = this.tail[0]!;
-			if (excess >= front.length) {
-				excess -= front.length;
-				this.tailBytesInternal -= front.length;
-				this.omittedBytesInternal += front.length;
-				this.tail.shift();
-			} else {
-				// Drop `excess` bytes from the start of the front chunk.
-				this.tail[0] = copyOf(front.subarray(excess));
-				this.tailBytesInternal -= excess;
-				this.omittedBytesInternal += excess;
-				break;
-			}
+	/** Retained tail as ≤2 owned segments, in order (2 when the ring wraps). */
+	private tailSegments(): Uint8Array[] {
+		if (this.tailLen === 0 || !this.tailBuf) return [];
+		const firstLen = Math.min(this.tailLen, this.tailBudget - this.tailStart);
+		const first = copyOf(this.tailBuf.subarray(this.tailStart, this.tailStart + firstLen));
+		if (firstLen === this.tailLen) return [first];
+		return [first, copyOf(this.tailBuf.subarray(0, this.tailLen - firstLen))];
+	}
+
+	private pushToTail(bytes: Uint8Array): void {
+		if (this.tailBudget === 0) {
+			this.omittedBytesInternal += bytes.length;
+			return;
 		}
+
+		if (bytes.length >= this.tailBudget) {
+			// This single chunk is larger than the whole tail budget. Keep only the last
+			// tailBudget bytes and drop everything else.
+			const dropped = bytes.length - this.tailBudget;
+			this.omittedBytesInternal += this.tailLen + dropped;
+			this.tail().set(bytes.subarray(dropped));
+			this.tailStart = 0;
+			this.tailLen = this.tailBudget;
+			return;
+		}
+
+		// Evict exactly as many oldest bytes as needed to fit, then append.
+		const free = this.tailBudget - this.tailLen;
+		if (bytes.length > free) {
+			const drop = bytes.length - free;
+			this.tailStart = (this.tailStart + drop) % this.tailBudget;
+			this.tailLen -= drop;
+			this.omittedBytesInternal += drop;
+		}
+		const ring = this.tail();
+		const writeAt = (this.tailStart + this.tailLen) % this.tailBudget;
+		const firstLen = Math.min(bytes.length, this.tailBudget - writeAt);
+		ring.set(bytes.subarray(0, firstLen), writeAt);
+		if (firstLen < bytes.length) {
+			ring.set(bytes.subarray(firstLen), 0);
+		}
+		this.tailLen += bytes.length;
 	}
 }
 
 function copyOf(view: Uint8Array): Uint8Array {
-	// Produce an owned copy so later mutations of the source buffer cannot
-	// poison our retained state.
+	// Produce an owned copy so later ring writes cannot mutate handed-out data.
 	const out = new Uint8Array(view.length);
 	out.set(view);
 	return out;
