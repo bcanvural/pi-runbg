@@ -1,6 +1,10 @@
 # pi-runbg — design doc (v3, verified against upstream v0.9.0 and pi 0.83)
 
-**Status:** design only — nothing implemented yet.
+**Status:** implemented (2026-08-06) — fork landed with P0–P3 complete:
+rename from upstream v0.9.0, bash-default flip (§7.1), crash reaper (§7.2),
+log archive safety (§7.3), bounded poll accumulation (§7.4), headless
+acceptance suite (§9), and the codex-pi template wiring (§14, applied to
+`~/.pi/agent/sysprompts/codex-pi.md`). Divergence log: `../UPSTREAM.md`.
 **Companion repos:** `pi-sysprompt` (template wiring, §14), `pi-webfetch` (sibling web-tool design).
 
 > **v3 change:** full design review against the actual upstream source
