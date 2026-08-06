@@ -1,3 +1,5 @@
 node_modules/
+local_data/
+.pi-workflow-runs/
 *.log
 .DS_Store
