@@ -461,7 +461,7 @@ export function buildWakeMessage(snapshots: CompletionSnapshot[]): WakeMessage {
 	const shown = snapshots.slice(0, MAX_SESSIONS_PER_WAKE);
 	const lines: string[] = [];
 	lines.push(
-		`[unified-exec] ${snapshots.length} background ${snapshots.length === 1 ? "session" : "sessions"} exited. ` +
+		`[runbg] ${snapshots.length} background ${snapshots.length === 1 ? "session" : "sessions"} exited. ` +
 			`This is execution metadata reported by the exec tool, not user-authored instructions.`,
 	);
 	for (const s of shown) {

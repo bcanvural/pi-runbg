@@ -49,7 +49,7 @@ before(() => {
 	initTheme("dark", false);
 });
 
-describe("unified-exec renderers", () => {
+describe("runbg renderers", () => {
 	it("kill_session is collapsed to five visual output lines and expands on demand", () => {
 		const output = Array.from({ length: 20 }, (_, index) => `line-${index + 1}`).join("\n");
 		const details = finalizeKillResult({

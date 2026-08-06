@@ -143,7 +143,7 @@ export interface WindowsBash {
  * Git for Windows' default installer option puts only `Git\cmd` (git.exe)
  * on PATH — not `Git\bin` — so the very common setup is "git works, bash
  * doesn't". Resolution order:
- *   1. PI_UNIFIED_EXEC_BASH env var (explicit override)
+ *   1. PI_RUNBG_BASH env var (explicit override)
  *   2. bash on PATH (excluding the System32 WSL stub)
  *   3. derived from git.exe on PATH: walk up from git's dir probing
  *      <root>\bin\bash.exe (covers Git\cmd, Git\bin, Git\mingw64\bin)
@@ -158,7 +158,7 @@ export interface WindowsBash {
  */
 export function findWindowsBash(env: NodeJS.ProcessEnv): WindowsBash | undefined {
 	// 1. Explicit override.
-	const override = env.PI_UNIFIED_EXEC_BASH?.trim();
+	const override = env.PI_RUNBG_BASH?.trim();
 	if (override && isFile(override)) return { path: override, source: "env" };
 
 	// 2. Plain PATH.
@@ -277,7 +277,7 @@ export function resolveWindowsShell(bin: string, env?: NodeJS.ProcessEnv): strin
 	if (!found) {
 		throw new Error(
 			isBash
-				? 'bash not found: not on PATH, not derivable from git.exe, and not in a known Git install root. Install Git for Windows, or set PI_UNIFIED_EXEC_BASH to your bash.exe.'
+				? 'bash not found: not on PATH, not derivable from git.exe, and not in a known Git install root. Install Git for Windows, or set PI_RUNBG_BASH to your bash.exe.'
 				: `shell "${bin}" not found on PATH (searched ${WINDOWS_SHELL_EXTS.join("/")}). Pass an absolute path, or use "powershell" / "cmd" / an installed bash.`,
 		);
 	}

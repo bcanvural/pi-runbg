@@ -52,7 +52,7 @@ function makeHarness() {
 	};
 }
 
-describe("unified-exec PTY mode", { skip: !isPtyAvailable() }, () => {
+describe("runbg PTY mode", { skip: !isPtyAvailable() }, () => {
 	// NOTE: every test runs its body in try/finally with session_shutdown in
 	// the finally. A failed assertion mid-test must not leak a live PTY
 	// session: on Windows, ConPTY's conout worker keeps the event loop alive

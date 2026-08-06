@@ -97,7 +97,7 @@ export class ExecSession {
 		this.outputBuffer = new HeadTailBuffer(opts.headTailMaxBytes ?? DEFAULT_HEAD_TAIL_MAX_BYTES);
 		this.streamTailCap = opts.streamTailBytes ?? DEFAULT_STREAM_TAIL_BYTES;
 		this.pid = undefined; // set in `start`
-		this.logPath = join(tmpdir(), `pi-unified-exec-${id}-${randomBytes(4).toString("hex")}.log`);
+		this.logPath = join(tmpdir(), `pi-runbg-${id}-${randomBytes(4).toString("hex")}.log`);
 	}
 
 	static spawn(id: number, opts: SessionSpawnOptions): ExecSession {

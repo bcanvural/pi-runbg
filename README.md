@@ -1,29 +1,25 @@
-# unified-exec
+# pi-runbg
 
-[![npm version](https://img.shields.io/npm/v/pi-unified-exec.svg?logo=npm&label=npm)](https://www.npmjs.com/package/pi-unified-exec)
-[![npm downloads](https://img.shields.io/npm/dm/pi-unified-exec.svg)](https://www.npmjs.com/package/pi-unified-exec)
-[![License](https://img.shields.io/npm/l/pi-unified-exec.svg)](./LICENSE)
-[![CI](https://github.com/iamwrm/pi-unified-exec/actions/workflows/ci.yml/badge.svg)](https://github.com/iamwrm/pi-unified-exec/actions/workflows/ci.yml)
-[![Publish to npm](https://github.com/iamwrm/pi-unified-exec/actions/workflows/publish.yml/badge.svg)](https://github.com/iamwrm/pi-unified-exec/actions/workflows/publish.yml)
-
-A pi extension that ports codex's `unified_exec` session model: every bash
-command becomes a long-lived session the LLM drives with writes and polls,
-instead of a single blocking call the agent waits on.
+A pi extension for long-lived background sessions, porting codex's
+`unified_exec` session model: every command becomes a session the LLM drives
+with writes and polls, instead of a single blocking call the agent waits on.
 
 Mirrors codex's `exec_command` + `write_stdin` tool surface, with small
 pi-flavor additions (`set_on_exit`, `kill_session`, `list_sessions`).
 
 > [!IMPORTANT]
-> **Maintenance notice:** We don't have the bandwidth to maintain this
-> repository for the community. Issues are disabled and external pull
-> requests are not accepted. If you'd like to improve or build on this
-> project, please **fork it** — it's [MIT licensed](./LICENSE), so you're
-> free to use, modify, and redistribute it.
-
-> **Install:**
-> ```bash
-> pi install npm:pi-unified-exec
-> ```
+> **Fork notice:** this is a fork of
+> [iamwrm/pi-unified-exec](https://github.com/iamwrm/pi-unified-exec) v0.9.0
+> (MIT, by Ren Wang — closed to external contributions, forks invited).
+> Tool names, schemas, and constants are preserved verbatim; the package,
+> env vars, log prefix, and slash command are renamed to `runbg`.
+> Deliberate behavior divergences are documented in
+> [UPSTREAM.md](./UPSTREAM.md) — the headline one: **pi's built-in `bash`
+> tool is kept by default** (upstream removes it); pass
+> `--replace-builtin-bash` for upstream's codex-parity behavior.
+> Design rationale lives in [docs/design.md](./docs/design.md).
+> Do not install this alongside `pi-unified-exec` — both register the same
+> tool names.
 
 ## Highlights
 
@@ -76,27 +72,29 @@ preserved.
 
 ## Install
 
-Published on npm as [`pi-unified-exec`](https://www.npmjs.com/package/pi-unified-exec).
-Install via pi's package manager:
+Not published to npm (deliberately — see design §13). Install from a local
+clone via pi's package manager:
 
 ```bash
-pi install npm:pi-unified-exec            # global (~/.pi/agent/settings.json)
-pi install -l npm:pi-unified-exec         # project-local (.pi/settings.json)
+git clone <this repo> && cd pi-runbg && npm install
+pi install -l ./path/to/pi-runbg      # project-local (.pi/settings.json)
+pi install ./path/to/pi-runbg         # global (~/.pi/agent/settings.json)
 ```
 
-`pi install` runs `npm install` under the hood, which fetches
-`@homebridge/node-pty-prebuilt-multiarch` (prebuilt binaries for
-linux/macOS/Windows — no compilation). If the install fails on your
-platform, pipe mode (`tty: false`) still works, but PTY mode (`tty: true`)
-will error with a clear message.
+The `npm install` fetches `@homebridge/node-pty-prebuilt-multiarch`
+(prebuilt binaries for linux/macOS/Windows — no compilation). If it fails on
+your platform, pipe mode (`tty: false`) still works, but PTY mode
+(`tty: true`) will error with a clear message.
 
 To try without installing:
 
 ```bash
-pi -e npm:pi-unified-exec
+pi -e ./path/to/pi-runbg
 ```
 
-Reload a running pi with `/reload`.
+Reload a running pi with `/reload`. If `pi-unified-exec` is also installed,
+remove it first (duplicate tool names); runbg warns at startup if it detects
+the upstream package alongside itself.
 
 ## Tools
 
@@ -122,7 +120,7 @@ Response body (short output, no truncation):
 session_id: 1                       (mutually exclusive with exit_code)
 exit_code: 0                        (mutually exclusive with session_id)
 signal: SIGTERM                     (optional, if killed)
-log_path: /tmp/pi-unified-exec-1-5cc5e104.log
+log_path: /tmp/pi-runbg-1-5cc5e104.log
 cwd: /home/you/project
 wall_time_seconds: 0.502
 chunk_id: a4f2c1
@@ -147,7 +145,7 @@ When output exceeds the caps (50 KiB / 2000 lines), a footer is appended:
 ```
 ...tail of output...
 
-[Showing lines 3900-4120 of 4500 (50.0KB limit). Full output: /tmp/pi-unified-exec-1-5cc5e104.log]
+[Showing lines 3900-4120 of 4500 (50.0KB limit). Full output: /tmp/pi-runbg-1-5cc5e104.log]
 ```
 
 ### `write_stdin`
@@ -196,7 +194,7 @@ stretch or shrink an in-progress wait.
 
 | Env var | Default | Notes |
 |---|---|---|
-| `PI_UNIFIED_EXEC_MAX_EMPTY_POLL_MS` | `290_000` | Cap for empty `write_stdin` polls. May be **lowered** but never raises the effective cache-friendly maximum above 290 s. Positive values below `5_000` are raised to `5_000`; invalid values use the default. |
+| `PI_RUNBG_MAX_EMPTY_POLL_MS` | `290_000` | Cap for empty `write_stdin` polls. May be **lowered** but never raises the effective cache-friendly maximum above 290 s. Positive values below `5_000` are raised to `5_000`; invalid values use the default. |
 
 #### Control bytes and escapes in `chars`
 
@@ -288,7 +286,7 @@ Mechanics:
   failure info) — never raw stdout/stderr. The exited session remains
   drainable via an empty `write_stdin` afterwards, and consuming that
   output never triggers a second wake.
-- Suppression: `kill_session`, the `/unified-exec-sessions` command, LRU
+- Suppression: `kill_session`, the `/runbg-sessions` command, LRU
   eviction of a live process, and `session_shutdown` all suppress the wake
   (before signaling). A kill that fails to land restores eligibility. A
   naturally-exited wake session that gets evicted before notification keeps
@@ -337,7 +335,7 @@ without an extra probing call.
 
 ## Command
 
-- `/unified-exec-sessions` — human-facing escape hatch: lists live sessions in
+- `/runbg-sessions` — human-facing escape hatch: lists live sessions in
   a selector (armed wakes show `[wake]`) and kills the chosen one (or all of
   them) without going through the model. Uses the same SIGTERM → 2s → SIGKILL
   escalation as `kill_session`.
@@ -349,7 +347,7 @@ active set at session start so the LLM is steered toward `exec_command` /
 `write_stdin`.
 
 - `--keep-builtin-bash` — preserve the built-in `bash` alongside the
-  unified-exec tools. Useful if you've got skills or prompts that explicitly
+  runbg tools. Useful if you've got skills or prompts that explicitly
   expect `bash(cmd, timeout)`.
 
 ## TUI rendering
@@ -366,17 +364,17 @@ $ for i in {1..12}; do echo round $i; sleep 0.5; done (yield 2.5s · cwd: ~/proj
   round 4
   round 5
 
-  elapsed 1.3s · session_id=2 · log: /tmp/pi-unified-exec-2-86b3f006.log
+  elapsed 1.3s · session_id=2 · log: /tmp/pi-runbg-2-86b3f006.log
 ```
 
 **After yield, session still alive:**
 ```
-  yielded 2.5s · session_id=2 · log: /tmp/pi-unified-exec-2-86b3f006.log
+  yielded 2.5s · session_id=2 · log: /tmp/pi-runbg-2-86b3f006.log
 ```
 
 **After process exits:**
 ```
-  took 4.2s · exit_code=0 · log: /tmp/pi-unified-exec-1-5cc5e104.log
+  took 4.2s · exit_code=0 · log: /tmp/pi-runbg-1-5cc5e104.log
 ```
 
 **write_stdin:**
@@ -412,8 +410,8 @@ last output line 5
 **list_sessions** shows up to five compact entries while collapsed and all
 bounded entries plus log paths when expanded.
 
-**Running-session UI:** while any unified-exec process is still alive, the TUI
-footer shows `unified-exec: N sessions running`. After `/tree` navigation, a
+**Running-session UI:** while any runbg process is still alive, the TUI
+footer shows `runbg: N sessions running`. After `/tree` navigation, a
 widget above the editor lists the live `session_id`s and commands (with
 `[wake]` when auto-resume is armed) so the human sees that processes survived
 branch navigation. The footer/widget refreshes as soon as a background session
@@ -447,7 +445,7 @@ LRU_PROTECTED_COUNT          = 8
 # Diverges from codex — codex allows 30 min; capped at 290 s to stay under
 # Anthropic's 5-minute prompt-cache TTL. The env override can only LOWER it;
 # longer waits use write_stdin's yield_until (absolute deadline):
-DEFAULT_MAX_BACKGROUND_POLL_MS = 290_000  (env: PI_UNIFIED_EXEC_MAX_EMPTY_POLL_MS, lower-only)
+DEFAULT_MAX_BACKGROUND_POLL_MS = 290_000  (env: PI_RUNBG_MAX_EMPTY_POLL_MS, lower-only)
 LONG_WAIT_UPDATE_INTERVAL_MS   = 30_000  (rate limit for absolute-wait TUI updates)
 MAX_TIMER_ARM_MS               = 2^31-1   (setTimeout chunk size for multi-day yield_until)
 
@@ -649,7 +647,7 @@ chars_b64 binary-safety, and mutual-exclusion errors), signal-name mapping,
 full e2e pipes (45+ scenarios incl. log-file retention, byte/line truncation,
 a delayed 4000-line kill drain, renderer registration, spawn-failure
 diagnostics, EPIPE safety, exited-session reporting, shutdown SIGKILL
-escalation, onUpdate streaming, and the `/unified-exec-sessions` command), pure
+escalation, onUpdate streaming, and the `/runbg-sessions` command), pure
 output-envelope, terminal-control, cache-refresh, and collapse/expand/re-collapse
 renderer coverage, PTY mode (3 scenarios: simple command, Python REPL drive, Ctrl-C
 injection, cmd.exe verbatim payload), shell selection (per-shell argv
@@ -669,7 +667,7 @@ built-in `bash` tool that codex itself treats as unsolved:
 **1. Full output retained on disk, not just head+tail in memory.**
 Codex caps each session's in-memory buffer at 1 MiB and silently drops middle
 bytes once it fills. We mirror every byte the child writes to
-`/tmp/pi-unified-exec-<sid>-<random>.log` in parallel with the in-memory
+`/tmp/pi-runbg-<sid>-<random>.log` in parallel with the in-memory
 buffer. The file has the complete, unaltered stream across the entire
 session's lifetime; nothing is lost.
 
@@ -708,7 +706,7 @@ completion and never revisit the log, it'll linger until your next reboot.
 
 - `set_on_exit`, `kill_session`, and `list_sessions` tools (codex has none of
   these). `list_sessions` exposes `wake_armed`; the running-session widget and
-  `/unified-exec-sessions` picker mark armed wakes with `[wake]`.
+  `/runbg-sessions` picker mark armed wakes with `[wake]`.
 - `write_stdin` also works in pipe mode (`tty: false`), not just PTY.
   Useful for feeding lines to `jq`, `sort`, etc.
 - Streaming `onUpdate` tail window for TUI rendering during yields, plus
@@ -740,7 +738,7 @@ Supported — both pipes and PTY mode:
   (win32 prebuilds — no compilation).
 - **Default shell**: `bash`, located with an extended probe (first hit
   wins, cached):
-  1. `PI_UNIFIED_EXEC_BASH` env var (explicit override)
+  1. `PI_RUNBG_BASH` env var (explicit override)
   2. `bash` on PATH — System32's `bash.exe` (the WSL stub) is deliberately
      excluded: it runs commands inside a WSL distro's filesystem view, not
      Windows'
@@ -761,7 +759,7 @@ Supported — both pipes and PTY mode:
   (`-NoProfile -NonInteractive -NoLogo -Command`) are supported. Bare shell names are resolved to
   an absolute path before spawning (failing closed if unresolvable), so a
   binary planted in an untrusted workdir can't shadow the real shell.
-- **No POSIX signals.** Every kill — `kill_session`, `/unified-exec-sessions`,
+- **No POSIX signals.** Every kill — `kill_session`, `/runbg-sessions`,
   LRU eviction, `session_shutdown` — is a force tree-kill
   (`taskkill /pid <pid> /T /F`), regardless of the requested signal name.
   Killed processes report `exit_code: 1` rather than `signal: SIGTERM`, and
@@ -789,7 +787,7 @@ Supported — both pipes and PTY mode:
 
 ## Source map vs codex
 
-| unified-exec (TS) | codex (Rust) |
+| runbg (TS) | codex (Rust) |
 |---|---|
 | `src/head-tail-buffer.ts` | `codex-rs/core/src/unified_exec/head_tail_buffer.rs` |
 | `src/collect.ts` | `codex-rs/core/src/unified_exec/process_manager.rs::collect_output_until_deadline` |

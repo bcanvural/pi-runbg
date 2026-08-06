@@ -187,7 +187,7 @@ export function spawnChild(opts: SpawnOptions): SpawnedChild {
 		if (!ptyModule) {
 			throw new Error(
 				`tty: true requires @homebridge/node-pty-prebuilt-multiarch, but it failed to load: ${ptyLoadError ?? "unknown error"}.\n` +
-					`Install it with:  cd .pi/extensions/unified-exec && npm install\n` +
+					`Install it with:  cd .pi/extensions/runbg && npm install\n` +
 					`Or call with tty: false to use pipes instead.`,
 			);
 		}

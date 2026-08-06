@@ -1,22 +1,19 @@
 {
-	"name": "pi-unified-exec",
-	"version": "0.9.0",
-	"description": "Codex-style unified_exec for pi: long-lived shell sessions the LLM polls and drives with write_stdin (Ctrl-C, arrow keys, PTY, REPLs, ssh, dev servers). Full output logged to disk.",
+	"name": "pi-runbg",
+	"version": "0.10.0",
+	"description": "Long-lived background exec sessions for pi (codex unified_exec model): the LLM starts a session and drives it across turns with write_stdin polls, Ctrl-C, PTY, REPLs, dev servers. Full output logged to disk. Fork of pi-unified-exec v0.9.0.",
 	"keywords": [
 		"pi-package",
 		"pi-extension",
 		"codex",
 		"unified-exec",
+		"runbg",
+		"background",
 		"bash",
 		"pty"
 	],
 	"license": "MIT",
 	"author": "Ren Wang <iamwrm@gmail.com>",
-	"repository": {
-		"type": "git",
-		"url": "git+https://github.com/iamwrm/pi-unified-exec.git"
-	},
-	"homepage": "https://github.com/iamwrm/pi-unified-exec#readme",
 	"type": "module",
 	"scripts": {
 		"check": "tsc --noEmit",
@@ -34,9 +31,6 @@
 		"extensions": [
 			"./src/index.ts"
 		]
-	},
-	"publishConfig": {
-		"access": "public"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": ">=0.80.5",

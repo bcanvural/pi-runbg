@@ -329,7 +329,7 @@ describe("exec_command on_exit", () => {
 
 		assert.ok(await waitFor(() => h.sentMessages.length === 1), "expected one wake");
 		const { message, options } = h.sentMessages[0];
-		assert.equal(message.customType, "unified-exec-completed");
+		assert.equal(message.customType, "runbg-completed");
 		assert.equal(message.display, true);
 		assert.deepEqual(options, { triggerTurn: true, deliverAs: "followUp" });
 		assert.match(message.content, new RegExp(`session_id=${sid}`));
@@ -507,7 +507,7 @@ describe("exec_command on_exit", () => {
 		const r1 = await h.call("exec_command", { cmd: "sleep 30", yield_time_ms: 250, on_exit: "wake" });
 		const sid = r1.details.session_id;
 		h.uiEvents.selectResponses.push((options) => options.find((o) => o.startsWith(`#${sid} `)));
-		await h.invokeCommand("unified-exec-sessions");
+		await h.invokeCommand("runbg-sessions");
 		assert.ok(!(await waitFor(() => h.sentMessages.length > 0, 600)));
 		assert.equal(h.sentMessages.length, 0);
 	});
@@ -548,7 +548,7 @@ describe("exec_command on_exit", () => {
 		await h.emit("session_start");
 		// Both processes block on the same marker file so their exits land within
 		// a few tens of ms of each other — inside the wake debounce window.
-		const marker = `${process.env.TMPDIR || "/tmp"}/unified-exec-batch-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+		const marker = `${process.env.TMPDIR || "/tmp"}/runbg-batch-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 		const waitCmd = `while [ ! -f "${marker}" ]; do sleep 0.05; done`;
 		const a = await h.call("exec_command", { cmd: waitCmd, yield_time_ms: 250, on_exit: "wake" });
 		const b = await h.call("exec_command", { cmd: waitCmd, yield_time_ms: 250, on_exit: "wake" });

@@ -13,7 +13,7 @@ and tool reference, see [../README.md](../README.md).
   fall back to `powershell`). PTY mode uses ConPTY via the
   `@homebridge/node-pty-prebuilt-multiarch` win32 prebuilds.
 - **pi** installed and runnable (`pi --version`). End users install with
-  `pi install npm:pi-unified-exec`; for development you want a local clone
+  `pi install npm:pi-runbg`; for development you want a local clone
   of this repo (see below).
 
 ## First-time setup
@@ -21,8 +21,8 @@ and tool reference, see [../README.md](../README.md).
 Clone the repo and install dev dependencies:
 
 ```bash
-git clone https://github.com/iamwrm/pi-unified-exec
-cd pi-unified-exec
+git clone <this repo>   # fork of github.com/iamwrm/pi-unified-exec
+cd pi-runbg
 npm install
 ```
 
@@ -30,13 +30,13 @@ To have pi load your working copy for interactive testing, either symlink it
 into pi's auto-discovery path:
 
 ```bash
-ln -s "$PWD" .pi/extensions/unified-exec      # from the project you want it in
+ln -s "$PWD" .pi/extensions/runbg      # from the project you want it in
 ```
 
 or install directly from the local path (writes into pi's settings):
 
 ```bash
-pi install -l ./path/to/pi-unified-exec
+pi install -l ./path/to/pi-runbg
 ```
 
 `npm install` fetches `@homebridge/node-pty-prebuilt-multiarch` prebuilds. If your
@@ -218,7 +218,7 @@ for a real interactive smoke test.
 
 ## Debugging aids
 
-- **Per-session log files** at `/tmp/pi-unified-exec-<sid>-*.log`
+- **Per-session log files** at `/tmp/pi-runbg-<sid>-*.log`
   capture the complete raw byte stream the child wrote. Tail them to
   diagnose ANSI / control-sequence issues.
 - **`details.output` vs `content[0].text`**: the LLM reads
@@ -229,7 +229,7 @@ for a real interactive smoke test.
 - **`list_sessions` tool** (invokable from the LLM side) is the
   quickest way to audit what's live.
 - **Pi's `/reload` output** echoes the extensions it loaded — check
-  that `unified-exec` (or `src/index.ts` under it) is listed.
+  that `runbg` (or `src/index.ts` under it) is listed.
 
 ## Checking upstream compatibility
 
@@ -353,7 +353,7 @@ npm install --save-dev @earendil-works/pi-coding-agent@<new-version> \
                          @earendil-works/pi-tui@<new-version>
 npm test
 git add package.json package-lock.json Changelog.md
-git commit -m "unified-exec: verify compat with pi-coding-agent <new-version>"
+git commit -m "runbg: verify compat with pi-coding-agent <new-version>"
 ```
 
 The coding-agent peer minimum stays at the oldest version whose lifecycle and
@@ -362,95 +362,19 @@ the host version we typecheck and test against.
 
 ## Releasing to npm
 
-Every `v*` tag push publishes to
-[npm](https://www.npmjs.com/package/pi-unified-exec) via
-[`.github/workflows/publish.yml`](../.github/workflows/publish.yml).
-Fully automatic — no clicks, no secrets, no OTP prompts.
-
-### Authentication model
-
-The workflow uses **npm Trusted Publisher (OIDC)**. The job declares
-`id-token: write`, GitHub Actions mints a short-lived token tied to
-the run's identity, and npm validates it against the Trusted Publisher
-config at
-[npmjs.com/package/pi-unified-exec/access](https://www.npmjs.com/package/pi-unified-exec/access).
-No `NPM_TOKEN` secret exists in this repo and none should be created.
-
-Publishes include a [sigstore provenance
-attestation](https://docs.npmjs.com/generating-provenance-statements)
-(`--provenance` in the workflow) that gives each version a verified
-badge on npm linking back to the exact commit and CI run that produced
-the tarball.
-
-### Release flow
-
-```bash
-npm version patch                  # 0.1.0 → 0.1.1, commits + creates v0.1.1 tag
-git push && git push --tags
-```
-
-That's the whole thing. The tag push triggers the workflow; ~2 minutes
-later the new version is live on npm. Use `patch` / `minor` / `major`
-as appropriate for semver.
-
-### What CI does on tag push
-
-1. `npm ci` — reproducible install from `package-lock.json`
-2. `npm test` — strict typecheck + full test suite
-4. **Version-vs-tag guard**: fails CI if `package.json` version doesn't
-   match the git tag. Catches the "forgot to bump" footgun.
-   `npm version` does both atomically so this normally passes.
-5. `npm publish --provenance` — publishes the tarball.
-
-Tarball contents are controlled by `files` in `package.json`:
-`src/`, `README.md`, `LICENSE`. Tests, `local_data/`, `tsconfig.json`,
-`.github/`, `AGENTS.md` are all excluded. Verify with
-`npm pack --dry-run`.
-
-### Troubleshooting
-
-- **Tag pushed but workflow didn't fire**: confirm the tag starts with
-  `v` (trigger is `tags: ["v*"]`). `v0.1.1` ✓, `0.1.1` ✗,
-  `release-0.1.1` ✗.
-- **Publish failed, tag is now "wasted"**: fix-forward with another
-  `npm version patch && git push --tags` is usually simplest. To
-  recycle the same version: `git tag -d v0.1.1 && git push origin
-  :refs/tags/v0.1.1`, fix, retag, push.
-- **OIDC auth error** (e.g. `Unable to authenticate, your
-  authentication token seems to be invalid`): verify the Trusted
-  Publisher config on npmjs.com matches exactly:
-  - Provider: GitHub Actions
-  - Organization/user: `iamwrm`
-  - Repository: `pi-unified-exec`
-  - Workflow filename: `publish.yml`
-- **Provenance badge missing on new version**: confirm
-  `permissions: id-token: write` is still present in
-  `.github/workflows/publish.yml`.
-
-### Escape hatches
-
-- **`workflow_dispatch`**: the workflow also accepts manual triggers
-  from [Actions → Publish to
-  npm](https://github.com/iamwrm/pi-unified-exec/actions/workflows/publish.yml)
-  → **Run workflow**. Useful for re-runs after a transient npm outage.
-  Note: the publish step still tries to ship whatever version is in
-  `package.json`, so only use this if that version isn't already on
-  npm.
-- **Local publish** (fallback, requires 2FA OTP from your npm account):
-  ```bash
-  npm login
-  npm publish --no-provenance
-  ```
-  `--no-provenance` is needed because provenance only works inside a
-  recognized CI provider. Only use this if CI is broken; every CI
-  publish is better.
+**Deferred for this fork** (design doc §13.1). The package is installed from
+a local clone (`pi install ./path/to/pi-runbg`), so there is no publish
+workflow; upstream's Trusted-Publisher setup was removed with it. If
+publishing is ever revisited, re-register a Trusted Publisher for the
+`pi-runbg` npm name and restore a `publish.yml` — upstream's version
+(pre-fork history) is the template.
 
 ## Commit conventions
 
 Match the existing history:
 
 ```
-unified-exec: <terse present-tense summary>
+runbg: <terse present-tense summary>
 
 <paragraph(s) of what and why, wrapped to ~72 cols>
 

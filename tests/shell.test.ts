@@ -138,15 +138,15 @@ describe("findOnPath", () => {
 });
 
 describe("findWindowsBash", () => {
-	it("PI_UNIFIED_EXEC_BASH override wins when it points at a file", () => {
+	it("PI_RUNBG_BASH override wins when it points at a file", () => {
 		const dir = makePathDir("envbash", ["custom-bash.exe"]);
-		const r = findWindowsBash({ PATH: "", PI_UNIFIED_EXEC_BASH: join(dir, "custom-bash.exe") });
+		const r = findWindowsBash({ PATH: "", PI_RUNBG_BASH: join(dir, "custom-bash.exe") });
 		assert.deepEqual(r, { path: join(dir, "custom-bash.exe"), source: "env" });
 	});
 
-	it("PI_UNIFIED_EXEC_BASH pointing at a nonexistent file is ignored", () => {
+	it("PI_RUNBG_BASH pointing at a nonexistent file is ignored", () => {
 		const dir = makePathDir("envbash2", ["bash.exe"]);
-		const r = findWindowsBash({ PATH: dir, PI_UNIFIED_EXEC_BASH: "C:\\nope\\bash.exe" });
+		const r = findWindowsBash({ PATH: dir, PI_RUNBG_BASH: "C:\\nope\\bash.exe" });
 		assert.deepEqual(r, { path: join(dir, "bash.exe"), source: "path" });
 	});
 
@@ -243,7 +243,7 @@ describe("resolveWindowsShell", () => {
 	});
 
 	it("unresolvable bash throws the bash-specific guidance", () => {
-		assert.throws(() => resolveWindowsShell("bash", { PATH: "" }), /PI_UNIFIED_EXEC_BASH/);
+		assert.throws(() => resolveWindowsShell("bash", { PATH: "" }), /PI_RUNBG_BASH/);
 	});
 });
 

@@ -1,5 +1,5 @@
 /**
- * Custom TUI renderers for every unified-exec tool.
+ * Custom TUI renderers for every runbg tool.
  *
  * Child output has three independent layers:
  *   1. the complete session log on disk;

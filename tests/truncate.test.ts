@@ -2,7 +2,7 @@
  * Unit tests for truncateTail — re-exported from `@earendil-works/pi-coding-agent`.
  *
  * These tests pin the behavior we depend on. If pi-coding-agent ever
- * changes truncation semantics in a way that breaks unified-exec, these
+ * changes truncation semantics in a way that breaks runbg, these
  * tests will surface it before the LLM does.
  */
 

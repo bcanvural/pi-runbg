@@ -1,5 +1,5 @@
 /**
- * End-to-end tests for unified-exec.
+ * End-to-end tests for runbg.
  *
  * Exercises the full tool pipeline by instantiating the extension with a stub
  * ExtensionAPI and calling the registered tools' `execute` functions directly.
@@ -106,7 +106,7 @@ async function waitFor(cond: () => boolean, timeoutMs = 8000): Promise<boolean> 
 	return cond();
 }
 
-describe("unified-exec e2e", () => {
+describe("runbg e2e", () => {
 	it("resolveMaxEmptyPollMs reads the empty-poll cap env var (lower-only)", () => {
 		assert.equal(resolveMaxEmptyPollMs({}), 290_000);
 		// The env var may LOWER the cap but never raise the cache-friendly
@@ -117,7 +117,7 @@ describe("unified-exec e2e", () => {
 		assert.equal(resolveMaxEmptyPollMs({ [MAX_EMPTY_POLL_ENV_VAR]: "not-a-number" }), 290_000);
 	});
 
-	it("registers explicit call/result renderers for every unified-exec tool", () => {
+	it("registers explicit call/result renderers for every runbg tool", () => {
 		const h = makeHarness();
 		for (const name of ["exec_command", "write_stdin", "set_on_exit", "kill_session", "list_sessions"]) {
 			assert.equal(typeof h.tools[name]?.renderCall, "function", `${name} renderCall missing`);
@@ -460,8 +460,8 @@ describe("unified-exec e2e", () => {
 		assert.ok(typeof sid === "number");
 
 		await h.emit("session_tree", { oldLeafId: "old", newLeafId: "new" });
-		assert.equal(h.uiEvents.statuses.get("unified-exec.sessions"), "unified-exec: 1 session running");
-		const widget = h.uiEvents.widgets.get("unified-exec.sessions");
+		assert.equal(h.uiEvents.statuses.get("runbg.sessions"), "runbg: 1 session running");
+		const widget = h.uiEvents.widgets.get("runbg.sessions");
 		const widgetContent = widget?.content;
 		if (!widgetContent) assert.fail(`widget=${JSON.stringify(widget)}`);
 		assert.ok(widgetContent[0].includes("1 session still running"), `widget=${JSON.stringify(widget)}`);
@@ -473,8 +473,8 @@ describe("unified-exec e2e", () => {
 		);
 
 		await h.call("kill_session", { session_id: sid });
-		assert.equal(h.uiEvents.statuses.get("unified-exec.sessions"), undefined);
-		assert.equal(h.uiEvents.widgets.get("unified-exec.sessions")?.content, undefined);
+		assert.equal(h.uiEvents.statuses.get("runbg.sessions"), undefined);
+		assert.equal(h.uiEvents.widgets.get("runbg.sessions")?.content, undefined);
 		await h.emit("session_shutdown");
 	});
 
@@ -484,13 +484,13 @@ describe("unified-exec e2e", () => {
 		const r1 = await h.call("exec_command", { cmd: "sleep 0.4", yield_time_ms: 250 });
 		const sid = r1.details.session_id;
 		assert.ok(typeof sid === "number", `details=${JSON.stringify(r1.details)}`);
-		assert.equal(h.uiEvents.statuses.get("unified-exec.sessions"), "unified-exec: 1 session running");
+		assert.equal(h.uiEvents.statuses.get("runbg.sessions"), "runbg: 1 session running");
 
 		// Poll, don't fixed-sleep: `sleep 0.4` can take >700ms wall time on a
 		// loaded CI runner (observed on windows-latest).
 		assert.ok(
-			await waitFor(() => h.uiEvents.statuses.get("unified-exec.sessions") === undefined),
-			`status did not clear: ${h.uiEvents.statuses.get("unified-exec.sessions")}`,
+			await waitFor(() => h.uiEvents.statuses.get("runbg.sessions") === undefined),
+			`status did not clear: ${h.uiEvents.statuses.get("runbg.sessions")}`,
 		);
 
 		const r2 = await h.call("write_stdin", { session_id: sid, chars: "", yield_time_ms: 5000 });
@@ -507,12 +507,12 @@ describe("unified-exec e2e", () => {
 		assert.ok(typeof sid === "number", `details=${JSON.stringify(r1.details)}`);
 
 		await h.emit("session_tree", { oldLeafId: "old", newLeafId: "new" });
-		assert.ok(h.uiEvents.widgets.get("unified-exec.sessions")?.content?.[0].includes("1 session still running"));
+		assert.ok(h.uiEvents.widgets.get("runbg.sessions")?.content?.[0].includes("1 session still running"));
 
 		// Poll, don't fixed-sleep (slow CI runners).
 		assert.ok(
-			await waitFor(() => h.uiEvents.widgets.get("unified-exec.sessions")?.content === undefined),
-			`widget did not clear: ${JSON.stringify(h.uiEvents.widgets.get("unified-exec.sessions"))}`,
+			await waitFor(() => h.uiEvents.widgets.get("runbg.sessions")?.content === undefined),
+			`widget did not clear: ${JSON.stringify(h.uiEvents.widgets.get("runbg.sessions"))}`,
 		);
 
 		const r2 = await h.call("write_stdin", { session_id: sid, chars: "", yield_time_ms: 5000 });
@@ -531,14 +531,14 @@ describe("unified-exec e2e", () => {
 		assert.ok(typeof longSid === "number", `long=${JSON.stringify(long.details)}`);
 
 		await h.emit("session_tree", { oldLeafId: "old", newLeafId: "new" });
-		assert.equal(h.uiEvents.statuses.get("unified-exec.sessions"), "unified-exec: 2 sessions running");
+		assert.equal(h.uiEvents.statuses.get("runbg.sessions"), "runbg: 2 sessions running");
 
 		// Poll for the short session's exit instead of a fixed 1.1s sleep.
 		assert.ok(
-			await waitFor(() => h.uiEvents.statuses.get("unified-exec.sessions") === "unified-exec: 1 session running"),
-			`status did not decrement: ${h.uiEvents.statuses.get("unified-exec.sessions")}`,
+			await waitFor(() => h.uiEvents.statuses.get("runbg.sessions") === "runbg: 1 session running"),
+			`status did not decrement: ${h.uiEvents.statuses.get("runbg.sessions")}`,
 		);
-		const widget = h.uiEvents.widgets.get("unified-exec.sessions")?.content?.join("\n") ?? "";
+		const widget = h.uiEvents.widgets.get("runbg.sessions")?.content?.join("\n") ?? "";
 		assert.ok(widget.includes(`#${longSid}`), `widget=${widget}`);
 		assert.ok(!widget.includes(`#${shortSid}`), `widget=${widget}`);
 
@@ -899,7 +899,7 @@ describe("unified-exec e2e", () => {
 		await h.emit("session_shutdown");
 	});
 
-	it("/unified-exec-sessions command kills a selected session", async () => {
+	it("/runbg-sessions command kills a selected session", async () => {
 		const h = makeHarness();
 		await h.emit("session_start");
 		const r1 = await h.call("exec_command", { cmd: "sleep 30", yield_time_ms: 250 });
@@ -907,7 +907,7 @@ describe("unified-exec e2e", () => {
 		assert.ok(typeof sid === "number");
 
 		h.uiEvents.selectResponses.push((options) => options.find((o) => o.startsWith(`#${sid} `)));
-		await h.invokeCommand("unified-exec-sessions");
+		await h.invokeCommand("runbg-sessions");
 
 		const l = await h.call("list_sessions", {});
 		assert.equal(l.details.active_count, 0, JSON.stringify(l.details));
@@ -918,24 +918,24 @@ describe("unified-exec e2e", () => {
 		await h.emit("session_shutdown");
 	});
 
-	it("/unified-exec-sessions command can kill all sessions", async () => {
+	it("/runbg-sessions command can kill all sessions", async () => {
 		const h = makeHarness();
 		await h.emit("session_start");
 		await h.call("exec_command", { cmd: "sleep 30", yield_time_ms: 250 });
 		await h.call("exec_command", { cmd: "sleep 31", yield_time_ms: 250 });
 
 		h.uiEvents.selectResponses.push((options) => options.find((o) => o.startsWith("Kill all")));
-		await h.invokeCommand("unified-exec-sessions");
+		await h.invokeCommand("runbg-sessions");
 
 		const l = await h.call("list_sessions", {});
 		assert.equal(l.details.active_count, 0, JSON.stringify(l.details));
 		await h.emit("session_shutdown");
 	});
 
-	it("/unified-exec-sessions notifies when there is nothing to kill", async () => {
+	it("/runbg-sessions notifies when there is nothing to kill", async () => {
 		const h = makeHarness();
 		await h.emit("session_start");
-		await h.invokeCommand("unified-exec-sessions");
+		await h.invokeCommand("runbg-sessions");
 		assert.ok(
 			h.uiEvents.notifications.some((n) => n.message.includes("no live sessions")),
 			JSON.stringify(h.uiEvents.notifications),

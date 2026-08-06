@@ -2,6 +2,25 @@
 
 All notable changes to this project. **Newest entries go on top.**
 
+Entries up to and including 0.9.0 are the upstream
+[pi-unified-exec](https://github.com/iamwrm/pi-unified-exec) history and keep
+its names.
+
+## Unreleased — 0.10.0 (fork: pi-runbg)
+
+### Changed
+
+- **Forked from pi-unified-exec v0.9.0** (`7c8c1d8`, full history preserved;
+  see `UPSTREAM.md`). Package renamed to `pi-runbg`; identity renames only,
+  no tool-surface or behavior changes in this entry: env vars
+  `PI_RUNBG_MAX_EMPTY_POLL_MS` / `PI_RUNBG_BASH`, log prefix `pi-runbg-`,
+  wake customType `runbg-completed`, message prefix `[runbg]`, slash command
+  `/runbg-sessions`, UI key `runbg.sessions`, user-facing `runbg:` strings.
+  Tool names, schemas, and constants are unchanged.
+- Removed upstream-repo-specific workflows (`publish.yml` npm Trusted
+  Publisher, `interaction-limit-reminder.yml`); publishing is deferred
+  (design §13.1) — install from a local clone.
+
 ## 2026-08-04 — 0.9.0
 
 ### Fixed

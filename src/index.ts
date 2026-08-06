@@ -1,5 +1,5 @@
 /**
- * unified-exec — pi extension that ports codex's unified_exec session model,
+ * runbg — pi extension that ports codex's unified_exec session model,
  * with pi's built-in `bash` tool's on-disk retention layered on top.
  *
  * Tools exposed to the LLM:
@@ -19,7 +19,7 @@
  *     session; the next turn can still drive it.
  *   - Sessions are terminated on session_shutdown (codex parity).
  *   - Every byte the child writes goes to a per-session log file at
- *     /tmp/pi-unified-exec-<sid>-<random>.log. The LLM sees the last ~50 KiB
+ *     /tmp/pi-runbg-<sid>-<random>.log. The LLM sees the last ~50 KiB
  *     / 2000 lines per call and the full file is available via `read`.
  */
 
@@ -69,7 +69,7 @@ const MIN_EMPTY_YIELD_TIME_MS = 5_000;
 // HARD cache-friendly ceiling: the env override below may lower it but never
 // raise the relative cap above 290 s — longer waits must use `yield_until`.
 const DEFAULT_MAX_BACKGROUND_POLL_MS = 290_000;
-export const MAX_EMPTY_POLL_ENV_VAR = "PI_UNIFIED_EXEC_MAX_EMPTY_POLL_MS";
+export const MAX_EMPTY_POLL_ENV_VAR = "PI_RUNBG_MAX_EMPTY_POLL_MS";
 const DEFAULT_EXEC_YIELD_MS = 10_000;
 const DEFAULT_WRITE_STDIN_YIELD_MS = 250;
 const EARLY_EXIT_GRACE_PERIOD_MS = 150;
@@ -85,7 +85,7 @@ const MAX_PTY_ROWS = 300;
 // Absolute (`yield_until`) waits must not run the 250 ms heartbeat for hours;
 // output-driven TUI updates are rate-limited to this interval instead.
 const LONG_WAIT_UPDATE_INTERVAL_MS = 30_000;
-const SESSION_UI_KEY = "unified-exec.sessions";
+const SESSION_UI_KEY = "runbg.sessions";
 
 /**
  * Google-compatible string enum schema (plain `type: "string"` + `enum`,
@@ -242,13 +242,13 @@ async function runExecCommand(
 	const finalizeResponse = (input: FinalizeInput): ResponseShape =>
 		finalizeProcessResult({ ...input, operation: "exec_command" });
 	if (ctx.shuttingDown) {
-		throw new Error("unified-exec: session is shutting down; not starting new commands.");
+		throw new Error("runbg: session is shutting down; not starting new commands.");
 	}
 	const tty = args.tty ?? false;
 	if (tty && !isPtyAvailable()) {
 		throw new Error(
 			`tty: true requires @homebridge/node-pty-prebuilt-multiarch but it failed to load: ${getPtyLoadError() ?? "unknown"}.\n` +
-				`Run:  cd .pi/extensions/unified-exec && npm install\n` +
+				`Run:  cd .pi/extensions/runbg && npm install\n` +
 				`Or call with tty: false (default).`,
 		);
 	}
@@ -260,7 +260,7 @@ async function runExecCommand(
 		if (resolved.fellBack && !ctx.warnedShellFallback) {
 			ctx.warnedShellFallback = true;
 			ctx.ui?.notify(
-				"unified-exec: no bash found (PATH, git-derived, or known install roots); falling back to powershell. Install Git Bash or set PI_UNIFIED_EXEC_BASH.",
+				"runbg: no bash found (PATH, git-derived, or known install roots); falling back to powershell. Install Git Bash or set PI_RUNBG_BASH.",
 				"warning",
 			);
 		} else if (
@@ -273,7 +273,7 @@ async function runExecCommand(
 			// bash located off PATH (derived from git.exe or a known install
 			// root) — say so once, so shell selection is never mysterious.
 			ctx.notifiedBashSource = true;
-			ctx.ui?.notify(`unified-exec: using bash at ${resolved.shell} (not on PATH)`, "info");
+			ctx.ui?.notify(`runbg: using bash at ${resolved.shell} (not on PATH)`, "info");
 		}
 	} else if (IS_WINDOWS) {
 		// Resolve bare names to the absolute PATH match, failing closed —
@@ -370,10 +370,10 @@ async function runExecCommand(
 			// Suppresses the wake for live victims; keeps a tombstone for a
 			// naturally-exited wake session so its completion is not silently lost.
 			ctx.coordinator.handleEviction(pruned);
-			ctx.ui?.notify(`unified-exec: evicted session ${pruned.id} (LRU, over cap ${ctx.store.maxSessions})`, "warning");
+			ctx.ui?.notify(`runbg: evicted session ${pruned.id} (LRU, over cap ${ctx.store.maxSessions})`, "warning");
 		}
 		if (count >= WARNING_SESSIONS) {
-			ctx.ui?.notify(`unified-exec: ${count}/${ctx.store.maxSessions} sessions open`, "warning");
+			ctx.ui?.notify(`runbg: ${count}/${ctx.store.maxSessions} sessions open`, "warning");
 		}
 		// Note: sessions stay in the store until a later tool call observes the
 		// exit: write_stdin returns the final exit_code/output, and list_sessions
@@ -766,7 +766,7 @@ interface TerminateOutcome {
  * exit. A kill that doesn't land (taskkill failure, access denied,
  * unkillable state) keeps the session in the store and returns
  * killed: false, so ownership of a live process is never silently dropped.
- * Shared by the kill_session tool and the /unified-exec-sessions command.
+ * Shared by the kill_session tool and the /runbg-sessions command.
  */
 async function terminateSessionById(
 	ctx: ExtensionCtx,
@@ -826,7 +826,7 @@ function formatRunningSessionsWidget(ctx: ExtensionCtx, sessions: ExecSession[])
 	const now = Date.now();
 	const shown = sessions.slice(0, 5);
 	const lines = [
-		`⚠ unified-exec: ${sessions.length} ${plural(sessions.length, "session")} still running`,
+		`⚠ runbg: ${sessions.length} ${plural(sessions.length, "session")} still running`,
 		...shown.map((s) => {
 			const wake = ctx.coordinator.isArmed(s.id) ? " [wake]" : "";
 			return `  #${s.id} ${formatElapsed(now - s.startedAt)}${wake} ${oneLineCommand(s.displayCommand, 72)} (${s.cwd})`;
@@ -841,12 +841,12 @@ function updateRunningSessionsUi(ctx: ExtensionCtx, opts: { showWidget?: boolean
 	const ui = ctx.ui;
 	if (!ui) return;
 	const sessions = runningSessions(ctx);
-	const status = sessions.length ? `unified-exec: ${sessions.length} ${plural(sessions.length, "session")} running` : undefined;
+	const status = sessions.length ? `runbg: ${sessions.length} ${plural(sessions.length, "session")} running` : undefined;
 	ui.setStatus(SESSION_UI_KEY, status);
 
 	if (opts.notifyTree && sessions.length > 0) {
 		ui.notify(
-			`unified-exec: ${sessions.length} ${plural(sessions.length, "session")} still running after /tree.`,
+			`runbg: ${sessions.length} ${plural(sessions.length, "session")} still running after /tree.`,
 			"warning",
 		);
 	}
@@ -958,7 +958,7 @@ export default function (pi: ExtensionAPI) {
 			// queued as a follow-up — never steering/interrupting the current turn.
 			pi.sendMessage(
 				{
-					customType: "unified-exec-completed",
+					customType: "runbg-completed",
 					content: message.content,
 					display: true,
 					details: message.details,
@@ -968,7 +968,7 @@ export default function (pi: ExtensionAPI) {
 		},
 		onSendError: (err) => {
 			ctx.ui?.notify(
-				`unified-exec: failed to deliver completion notification: ${err instanceof Error ? err.message : String(err)}`,
+				`runbg: failed to deliver completion notification: ${err instanceof Error ? err.message : String(err)}`,
 				"warning",
 			);
 		},
@@ -987,9 +987,9 @@ export default function (pi: ExtensionAPI) {
 		shuttingDown: false,
 	};
 
-	// By default, unified-exec removes pi's built-in `bash` tool so the LLM
+	// By default, runbg removes pi's built-in `bash` tool so the LLM
 	// is steered toward exec_command/write_stdin. Pass --keep-builtin-bash to
-	// preserve the built-in alongside the unified-exec tools.
+	// preserve the built-in alongside the runbg tools.
 	pi.registerFlag("keep-builtin-bash", {
 		description: "Keep pi's built-in `bash` tool alongside exec_command/write_stdin. By default it is removed.",
 		type: "boolean",
@@ -1032,7 +1032,7 @@ export default function (pi: ExtensionAPI) {
 		if (!isPtyAvailable() && eventCtx.hasUI) {
 			// Non-fatal: pipes mode still works.
 			eventCtx.ui.notify(
-				"unified-exec: node-pty not available; tty: true will fail. Pipes (tty: false) still work.",
+				"runbg: node-pty not available; tty: true will fail. Pipes (tty: false) still work.",
 				"info",
 			);
 		}
@@ -1076,7 +1076,7 @@ export default function (pi: ExtensionAPI) {
 		if (drained.length && ctx.ui) {
 			const leftover = drained.filter((s) => !s.hasExited).length;
 			ctx.ui.notify(
-				`unified-exec: terminated ${drained.length - leftover} live session(s) on shutdown` +
+				`runbg: terminated ${drained.length - leftover} live session(s) on shutdown` +
 					(leftover ? `; ${leftover} did not confirm exit` : ""),
 				 leftover ? "warning" : "info",
 			);
@@ -1085,8 +1085,8 @@ export default function (pi: ExtensionAPI) {
 
 	// Human-facing escape hatch: inspect and kill live sessions without going
 	// through the model.
-	pi.registerCommand("unified-exec-sessions", {
-		description: "List live unified-exec sessions and optionally kill one (or all)",
+	pi.registerCommand("runbg-sessions", {
+		description: "List live runbg sessions and optionally kill one (or all)",
 		handler: async (_args, cmdCtx) => {
 			ctx.ui = cmdCtx.ui;
 			// Reap silently-exited sessions first so the picker only shows live ones.
@@ -1096,7 +1096,7 @@ export default function (pi: ExtensionAPI) {
 			updateRunningSessionsUi(ctx);
 			const sessions = runningSessions(ctx);
 			if (sessions.length === 0) {
-				cmdCtx.ui.notify("unified-exec: no live sessions", "info");
+				cmdCtx.ui.notify("runbg: no live sessions", "info");
 				return;
 			}
 			const now = Date.now();
@@ -1106,7 +1106,7 @@ export default function (pi: ExtensionAPI) {
 			});
 			const KILL_ALL = `Kill all ${sessions.length} ${plural(sessions.length, "session")}`;
 			const choice = await cmdCtx.ui.select(
-				`unified-exec: ${sessions.length} live ${plural(sessions.length, "session")} — select to kill (Esc to cancel)`,
+				`runbg: ${sessions.length} live ${plural(sessions.length, "session")} — select to kill (Esc to cancel)`,
 				[...labels, KILL_ALL],
 			);
 			if (!choice) return;
@@ -1120,7 +1120,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			updateRunningSessionsUi(ctx);
 			cmdCtx.ui.notify(
-				`unified-exec: killed ${killed} ${plural(killed, "session")}` +
+				`runbg: killed ${killed} ${plural(killed, "session")}` +
 					(failed ? `; ${failed} did not confirm exit (still listed)` : ""),
 				failed ? "warning" : "info",
 			);
@@ -1371,7 +1371,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "list_sessions",
 		label: "list_sessions",
-		description: "List all live unified-exec sessions in this pi run.",
+		description: "List all live runbg sessions in this pi run.",
 		promptSnippet: "List live sessions",
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, _signal, _onUpdate, eventCtx) {
@@ -1426,8 +1426,8 @@ export default function (pi: ExtensionAPI) {
 					})
 				: ["  (no live sessions)"];
 			const header = reaped.length
-				? `unified-exec sessions (${live.length} live, ${reaped.length} just exited):`
-				: `unified-exec sessions (${live.length}):`;
+				? `runbg sessions (${live.length} live, ${reaped.length} just exited):`
+				: `runbg sessions (${live.length}):`;
 			return {
 				// tool_time_utc lets the model compute a yield_until deadline from a
 				// trustworthy host clock without an extra probing call.
