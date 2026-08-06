@@ -10,12 +10,13 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { closeSync, createWriteStream, openSync, type WriteStream } from "node:fs";
+import { createWriteStream, type WriteStream } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { type CollectResult, collectOutputUntilDeadline } from "./collect.ts";
 import { HeadTailBuffer } from "./head-tail-buffer.ts";
+import { createExclusiveLog, type LogStatus, MAX_LOG_BYTES_ENV_VAR, resolveMaxLogBytes } from "./log-archive.ts";
 import { Gate, Notify } from "./notify.ts";
 import { type SpawnedChild, spawnChild } from "./pty.ts";
 
@@ -34,6 +35,8 @@ export interface SessionSpawnOptions {
 	rows?: number;
 	headTailMaxBytes?: number;
 	streamTailBytes?: number;
+	/** Mirror-size cap for the on-disk log; defaults to PI_RUNBG_MAX_LOG_BYTES / 256 MiB. */
+	maxLogBytes?: number;
 	displayCommand?: string; // human-readable command for list_sessions/UI
 	shell?: string; // raw `shell` arg recorded for introspection
 	windowsVerbatimArguments?: boolean; // Windows cmd.exe quoting (see shell.ts)
@@ -54,9 +57,16 @@ export class ExecSession {
 	readonly cwd: string;
 	readonly startedAt: number;
 	readonly pid: number | undefined;
-	/** Path to a log file that receives the full stdout+stderr stream. */
-	readonly logPath: string;
+	/**
+	 * Path to a log file that receives the full stdout+stderr stream.
+	 * Assigned by `spawn()` via exclusive create (collision-retried); treat
+	 * as readonly everywhere else.
+	 */
+	logPath: string;
 	private logStream: WriteStream | undefined;
+	private readonly maxLogBytes: number;
+	private logBytesWritten = 0;
+	private logStatusValue: LogStatus = "complete";
 
 	/** Head+tail buffer drained by each collectOutputUntilDeadline() call. */
 	readonly outputBuffer: HeadTailBuffer;
@@ -96,6 +106,7 @@ export class ExecSession {
 		this.lastUsedAt = this.startedAt;
 		this.outputBuffer = new HeadTailBuffer(opts.headTailMaxBytes ?? DEFAULT_HEAD_TAIL_MAX_BYTES);
 		this.streamTailCap = opts.streamTailBytes ?? DEFAULT_STREAM_TAIL_BYTES;
+		this.maxLogBytes = opts.maxLogBytes ?? resolveMaxLogBytes();
 		this.pid = undefined; // set in `start`
 		this.logPath = join(tmpdir(), `pi-runbg-${id}-${randomBytes(4).toString("hex")}.log`);
 	}
@@ -103,12 +114,14 @@ export class ExecSession {
 	static spawn(id: number, opts: SessionSpawnOptions): ExecSession {
 		const self = new ExecSession(id, opts);
 
-		// Touch-create the file synchronously so it exists on disk from t=0
-		// even before the child writes anything (and before the lazy stream
-		// opens the fd on its first buffered write). Then open a stream in
-		// append mode for the actual writes.
+		// Create the file exclusively (0600, O_EXCL, collision-retried —
+		// divergence #3, see log-archive.ts) so it exists on disk from t=0
+		// and a pre-planted path in the shared tmpdir is never followed or
+		// overwritten. Then open a stream in append mode for the writes.
 		try {
-			closeSync(openSync(self.logPath, "w"));
+			self.logPath = createExclusiveLog(
+				() => join(tmpdir(), `pi-runbg-${id}-${randomBytes(4).toString("hex")}.log`),
+			);
 			self.logStream = createWriteStream(self.logPath, { flags: "a" });
 			self.logStream.on("error", (err) => {
 				// Log-stream error (disk full, permissions, etc.). The child is
@@ -117,8 +130,10 @@ export class ExecSession {
 				// (kill() no-ops once hasExited) and orphan the process.
 				self.recordFailure(`log stream error: ${err?.message ?? err}`);
 				self.logStream = undefined;
+				self.logStatusValue = "partial";
 			});
 		} catch (err: any) {
+			self.logStatusValue = "unavailable";
 			self.markFailure(`failed to open log file ${self.logPath}: ${err?.message ?? err}`);
 			self.exitedAc.abort();
 			self.outputClosed.close();
@@ -151,9 +166,11 @@ export class ExecSession {
 			self.totalOutputBytes += chunk.length;
 			self.outputBuffer.pushChunk(chunk);
 			self.appendStreamTail(chunk);
-			// Mirror every byte to the log file. Errors are handled by the
-			// 'error' listener on the stream, which nulls `logStream` out.
-			self.logStream?.write(Buffer.from(chunk));
+			// Mirror to the log file up to the size cap (divergence #3); past
+			// it the log is explicitly marked partial instead of silently
+			// growing without bound. Stream errors are handled by the 'error'
+			// listener, which nulls `logStream` out.
+			self.mirrorToLog(chunk);
 			self.outputNotify.notifyAll();
 		});
 
@@ -219,6 +236,38 @@ export class ExecSession {
 				break;
 			}
 		}
+	}
+
+	/** Recoverability of the on-disk log (divergence #3, log-archive.ts). */
+	get logStatus(): LogStatus {
+		return this.logStatusValue;
+	}
+
+	/**
+	 * Mirror a chunk to the log, honoring the size cap. When the cap binds,
+	 * the boundary slice is written, an explicit truncation note is appended
+	 * to the log itself, the stream ends, and the log becomes "partial" —
+	 * results stop claiming full recoverability from then on.
+	 */
+	private mirrorToLog(chunk: Uint8Array): void {
+		if (!this.logStream) return;
+		const remaining = this.maxLogBytes - this.logBytesWritten;
+		if (remaining >= chunk.length) {
+			this.logStream.write(Buffer.from(chunk));
+			this.logBytesWritten += chunk.length;
+			return;
+		}
+		const stream = this.logStream;
+		this.logStream = undefined;
+		this.logStatusValue = "partial";
+		if (remaining > 0) {
+			stream.write(Buffer.from(chunk.subarray(0, remaining)));
+			this.logBytesWritten += remaining;
+		}
+		stream.write(
+			`\n[pi-runbg: log truncated here — ${this.maxLogBytes}-byte size cap reached (${MAX_LOG_BYTES_ENV_VAR}); subsequent output was not mirrored]\n`,
+		);
+		stream.end();
 	}
 
 	/**

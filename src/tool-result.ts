@@ -8,6 +8,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 
 import type { OnExitPolicy } from "./completion.ts";
+import type { LogStatus } from "./log-archive.ts";
 import { sanitizeOutputText } from "./output-safety.ts";
 
 const textDecoder = new TextDecoder("utf-8", { fatal: false });
@@ -32,6 +33,12 @@ export interface OutputResultDetails {
 	failure_message?: string;
 	tty?: boolean;
 	log_path?: string;
+	/**
+	 * Present only when log recovery degraded (divergence #3): "partial"
+	 * (mirroring stopped early — size cap or stream error) or "unavailable"
+	 * (log never created). Absent means the log is complete.
+	 */
+	log_status?: Exclude<LogStatus, "complete">;
 	cwd?: string;
 	command?: string;
 	truncation?: TruncationResult;
@@ -71,6 +78,8 @@ interface OutputEnvelopeInput {
 	wallTimeSec: number;
 	collected: Uint8Array;
 	logPath?: string;
+	/** Log recoverability; only degraded states surface in the result. */
+	logStatus?: LogStatus;
 	/** Middle bytes dropped by the retention cap during this call's drain. */
 	omittedBytes?: number;
 	/** Cumulative bytes the session has produced since spawn. */
@@ -138,6 +147,7 @@ type OutputEnvelope = Pick<
 	| "output"
 	| "original_token_count"
 	| "log_path"
+	| "log_status"
 	| "truncation"
 	| "omitted_bytes"
 	| "output_bytes_total"
@@ -153,6 +163,7 @@ function createOutputEnvelope(input: OutputEnvelopeInput): OutputEnvelope {
 		original_token_count: approxTokenCount(input.collected),
 	};
 	if (input.logPath) envelope.log_path = input.logPath;
+	if (input.logStatus && input.logStatus !== "complete") envelope.log_status = input.logStatus;
 	if (input.omittedBytes) envelope.omitted_bytes = input.omittedBytes;
 	if (input.totalBytes !== undefined) envelope.output_bytes_total = input.totalBytes;
 	if (truncation.truncated) envelope.truncation = truncation;
@@ -208,9 +219,20 @@ export function finalizeKillResult(input: FinalizeKillInput): KillResultDetails 
 }
 
 /** Pi-bash-style marker appended to model-visible text after a truncated body. */
-export function truncationMarker(t: TruncationResult | undefined, logPath: string | undefined): string | null {
+export function truncationMarker(
+	t: TruncationResult | undefined,
+	logPath: string | undefined,
+	logStatus?: LogStatus,
+): string | null {
 	if (!t?.truncated) return null;
-	const full = logPath ? `. Full output: ${safeMeta(logPath)}` : "";
+	// Only a complete log may be advertised as "Full output" (divergence #3):
+	// a partial log is named for what it is, an unavailable one not at all.
+	let full = "";
+	if (logPath && (logStatus === undefined || logStatus === "complete")) {
+		full = `. Full output: ${safeMeta(logPath)}`;
+	} else if (logPath && logStatus === "partial") {
+		full = `. Partial log (mirroring stopped early): ${safeMeta(logPath)}`;
+	}
 	if (t.lastLinePartial) {
 		return `[Showing last ${formatSize(t.outputBytes)} of final line (line ${t.totalLines} is larger than the ${formatSize(DEFAULT_MAX_BYTES)} limit)${full}]`;
 	}
@@ -225,7 +247,7 @@ export function truncationMarker(t: TruncationResult | undefined, logPath: strin
 function appendOutputSection(lines: string[], shape: OutputResultDetails): string {
 	const header = lines.join("\n");
 	const body = shape.output || "(no output)";
-	const marker = truncationMarker(shape.truncation, shape.log_path);
+	const marker = truncationMarker(shape.truncation, shape.log_path, shape.log_status);
 	const footer = marker ? `\n\n${marker}` : "";
 	return `${header}\n---\n${body}${footer}`;
 }
@@ -246,6 +268,7 @@ export function renderProcessResultText(shape: ProcessResultDetails): string {
 	if (shape.on_exit_wake) lines.push(`on_exit_wake: ${safeMeta(shape.on_exit_wake)}`);
 	if (shape.tool_time_utc) lines.push(`tool_time_utc: ${safeMeta(shape.tool_time_utc)}`);
 	if (shape.log_path) lines.push(`log_path: ${safeMeta(shape.log_path)}`);
+	if (shape.log_status) lines.push(`log_status: ${safeMeta(shape.log_status)}`);
 	if (shape.cwd) lines.push(`cwd: ${safeMeta(shape.cwd)}`);
 	lines.push(`wall_time_seconds: ${shape.wall_time_seconds.toFixed(3)}`);
 	lines.push(`chunk_id: ${shape.chunk_id}`);
@@ -268,6 +291,7 @@ export function renderKillResultText(shape: KillResultDetails): string {
 	if (shape.signal) lines.push(`signal: ${safeMeta(shape.signal)}`);
 	if (shape.failure_message) lines.push(`failure: ${safeMeta(shape.failure_message)}`);
 	if (shape.log_path) lines.push(`log_path: ${safeMeta(shape.log_path)}`);
+	if (shape.log_status) lines.push(`log_status: ${safeMeta(shape.log_status)}`);
 	if (shape.cwd) lines.push(`cwd: ${safeMeta(shape.cwd)}`);
 	lines.push(`wall_time_seconds: ${shape.wall_time_seconds.toFixed(3)}`);
 	lines.push(`chunk_id: ${shape.chunk_id}`);

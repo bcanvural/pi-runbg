@@ -675,8 +675,12 @@ built-in `bash` tool that codex itself treats as unsolved:
 Codex caps each session's in-memory buffer at 1 MiB and silently drops middle
 bytes once it fills. We mirror every byte the child writes to
 `/tmp/pi-runbg-<sid>-<random>.log` in parallel with the in-memory
-buffer. The file has the complete, unaltered stream across the entire
-session's lifetime; nothing is lost.
+buffer. The file is created exclusively with `0600` permissions and has the
+complete, unaltered stream across the entire session's lifetime — up to the
+mirror size cap (`PI_RUNBG_MAX_LOG_BYTES`, default 256 MiB; `0` = unlimited).
+If mirroring ever stops early (cap reached, disk error), results carry
+`log_status: partial` and the truncation marker stops claiming
+"Full output" (divergence #3 in [UPSTREAM.md](./UPSTREAM.md)).
 
 **2. LLM-visible output is tail-capped at pi's `bash` defaults (50 KiB or
 2000 lines, whichever hits first), with a pointer to the log file.**
@@ -705,9 +709,11 @@ The `log_path` field is exposed in every `exec_command` and `write_stdin`
 response (as a header line and in tool-call details), plus in `list_sessions`
 per-entry and in `kill_session` details.
 
-Log files live in `/tmp/` and are never auto-deleted (they're just regular
-files; `/tmp` cleanup is the OS's problem). If you run the same session to
-completion and never revisit the log, it'll linger until your next reboot.
+Log files live in `/tmp/` and outlive their sessions (they are the recovery
+surface). Stale ones are cleaned up by age at session start:
+`pi-runbg-*.log` files older than `PI_RUNBG_LOG_TTL_DAYS` (default 7; `0`
+disables) are deleted best-effort — age-based only, so a concurrent pi
+process's fresh logs are never touched, and symlinks are never followed.
 
 ## Other pi-flavor additions
 

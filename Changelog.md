@@ -30,6 +30,17 @@ its names.
 
 ### Added
 
+- **Log archive safety** (divergence #3, `UPSTREAM.md`, adopting upstream's
+  IV-0002 backlog; new `src/log-archive.ts`): session logs are created
+  exclusively (`O_EXCL`, collision-retried) with `0600` permissions, so a
+  pre-planted path or symlink in the shared tmpdir is never followed or
+  overwritten; the on-disk mirror is capped per session
+  (`PI_RUNBG_MAX_LOG_BYTES`, default 256 MiB, `0` = unlimited) with an
+  explicit truncation note written into the log; results carry
+  `log_status: partial|unavailable` when recovery degraded and the
+  truncation marker stops claiming "Full output"; stale `pi-runbg-*.log`
+  files are cleaned up by age at session start (`PI_RUNBG_LOG_TTL_DAYS`,
+  default 7 days, `0` disables; age-based only, symlinks skipped).
 - **Crash-path child reaping** (divergence #2, `UPSTREAM.md`): a synchronous
   process-"exit" handler SIGKILLs every live session's process group when the
   host exits without `session_shutdown` (pi's `uncaughtException` /

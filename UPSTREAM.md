@@ -43,7 +43,7 @@ that landed it. See `docs/design.md` §7.
 |---|---|---|---|
 | 1 | Keep pi's built-in `bash` by default; `--replace-builtin-bash` opts into upstream's removal (upstream default removes `bash`, flag `--keep-builtin-bash` to keep). Startup warning when the upstream package is installed alongside (same tool names). | Templates that don't know the session tools must keep a shell; user-side `bash` guards must not be silently bypassed (§7.1) | landed |
 | 2 | Best-effort crash cleanup: `process.on("exit")` synchronously group-kills live sessions (installed at `session_start`, removed at `session_shutdown`; SIGKILL'd hosts still orphan) | pi's crash paths (`uncaughtException`, dead terminal) skip `session_shutdown`; upstream orphans children (§7.2) | landed |
-| 3 | Log archive safety: `0600` + exclusive create, per-session size cap, `log_status`, startup cleanup of stale logs | Adopts upstream's own IV-0002 follow-up backlog (§7.3) | planned |
+| 3 | Log archive safety: `0600` + `O_EXCL` create (collision-retried, symlinks never followed), per-session mirror cap `PI_RUNBG_MAX_LOG_BYTES` (default 256 MiB, `0` unlimited), `log_status: partial\|unavailable` in results with "Full output" withheld when degraded, age-based startup cleanup `PI_RUNBG_LOG_TTL_DAYS` (default 7, `0` disables) | Adopts upstream's own IV-0002 follow-up backlog (§7.3) | landed |
 | 4 | Bounded relative-poll accumulation: `collectOutputUntilDeadline` retains drained bytes in a second head/tail buffer (session retention + 4 KiB marker headroom) instead of an unbounded chunk array; call-level drops get their own spliced marker and count into `omitted_bytes` | A chatty child during a 290 s empty poll can accumulate GBs in-process (§7.4) | landed |
 
 ## Syncing from upstream

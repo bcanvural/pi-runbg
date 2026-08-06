@@ -30,6 +30,7 @@ import { Type, type TUnsafe } from "typebox";
 import type { CollectResult } from "./collect.ts";
 import { CompletionCoordinator, type OnExitPolicy, sanitizeMeta } from "./completion.ts";
 import { formatElapsed } from "./format-time.ts";
+import { cleanupStaleLogs } from "./log-archive.ts";
 import { type LongWaitOutcome, startRateLimitedStream, waitForExitOrDeadline } from "./long-wait.ts";
 import { sleep } from "./notify.ts";
 import { sanitizeOutputText } from "./output-safety.ts";
@@ -421,6 +422,7 @@ async function runExecCommand(
 				failure: session.failureMessage,
 				tty,
 				logPath: session.logPath,
+				logStatus: session.logStatus,
 				cwd: effectiveCwd,
 				command: args.cmd,
 				yieldTimeMs,
@@ -480,6 +482,7 @@ async function runExecCommand(
 				failure: null,
 				tty,
 				logPath: session.logPath,
+				logStatus: session.logStatus,
 				cwd: effectiveCwd,
 				command: args.cmd,
 				yieldTimeMs,
@@ -504,6 +507,7 @@ async function runExecCommand(
 			failure: session.failureMessage,
 			tty,
 			logPath: session.logPath,
+			logStatus: session.logStatus,
 			cwd: effectiveCwd,
 			command: args.cmd,
 			yieldTimeMs,
@@ -590,6 +594,7 @@ async function runWriteStdin(
 					failure: session.failureMessage,
 					tty: session.tty,
 					logPath: session.logPath,
+					logStatus: session.logStatus,
 					cwd: session.cwd,
 					command: session.displayCommand,
 					yieldTimeMs,
@@ -626,6 +631,7 @@ async function runWriteStdin(
 				failure: session.failureMessage ?? writeFailure,
 				tty: session.tty,
 				logPath: session.logPath,
+				logStatus: session.logStatus,
 				cwd: session.cwd,
 				command: session.displayCommand,
 				yieldTimeMs,
@@ -647,6 +653,7 @@ async function runWriteStdin(
 			failure: writeFailure,
 			tty: session.tty,
 			logPath: session.logPath,
+			logStatus: session.logStatus,
 			cwd: session.cwd,
 			command: session.displayCommand,
 			yieldTimeMs,
@@ -758,6 +765,7 @@ async function runAbsoluteWait(
 			failure: session.failureMessage,
 			tty: session.tty,
 			logPath: session.logPath,
+			logStatus: session.logStatus,
 			cwd: session.cwd,
 			command: session.displayCommand,
 			extra: {
@@ -782,6 +790,7 @@ async function runAbsoluteWait(
 			failure: null,
 			tty: session.tty,
 			logPath: session.logPath,
+			logStatus: session.logStatus,
 			cwd: session.cwd,
 			command: session.displayCommand,
 			extra: {
@@ -810,6 +819,7 @@ async function runAbsoluteWait(
 		failure: null,
 		tty: session.tty,
 		logPath: session.logPath,
+		logStatus: session.logStatus,
 		cwd: session.cwd,
 		command: session.displayCommand,
 		extra: {
@@ -985,6 +995,7 @@ function buildStreamUpdate(
 			command: session.displayCommand,
 			cwd: session.cwd,
 			log_path: session.logPath,
+			...(session.logStatus !== "complete" ? { log_status: session.logStatus } : {}),
 			// Populate `output` so renderResult has a single source regardless
 			// of streaming vs final state.
 			output: tailText,
@@ -1107,6 +1118,10 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		warnIfUpstreamPackagePresent(ctx, pi);
+		// Stale-log cleanup (divergence #3): age-based and best-effort, so a
+		// concurrent pi process's fresh logs are never touched. Fire and
+		// forget — session start must not block on tmpdir scanning.
+		void cleanupStaleLogs();
 		// Crash-path reaper (divergence #2): removed again on session_shutdown,
 		// so graceful teardowns never stack listeners across /reload cycles and
 		// the handler can only ever fire while this instance owns sessions.
@@ -1447,6 +1462,7 @@ export default function (pi: ExtensionAPI) {
 				failure: killFailure || null,
 				tty: session.tty,
 				logPath: session.logPath,
+				logStatus: session.logStatus,
 				cwd: session.cwd,
 				command: session.displayCommand,
 				escalated,
