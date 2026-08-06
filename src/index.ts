@@ -551,7 +551,7 @@ async function runExecCommand(
 	// depended on it and (once out of the store) hides it from list_sessions,
 	// kill_session and the crash reaper. Reap exited corpses first — they are
 	// free room, protected-set or not.
-	ctx.store.reapExited().forEach((s) => unwatchSessionExit(ctx, s.id));
+	for (const reaped of ctx.store.reapExited()) afterSessionRemoved(ctx, reaped);
 	if (atSessionCap(ctx)) {
 		throw new Error(capError(ctx));
 	}
@@ -690,6 +690,18 @@ async function runExecCommand(
 				session.kill("SIGKILL");
 				await waitForExitOrDeadline({ exited: session.exited, durationMs: 500 });
 			}
+			if (!session.hasExited) {
+				// The kill did not land (SIGKILL denied, unkillable state, taskkill
+				// failure). An untracked live child is strictly worse than being one
+				// over the cap: register it so list_sessions, kill_session, the
+				// picker, and the crash reaper can all still reach it.
+				ctx.store.insert(session);
+				watchSessionExit(ctx, session);
+				updateRunningSessionsUi(ctx);
+				throw new Error(
+					`${reason} WARNING: the new process (session ${session.id}, pid ${session.pid ?? "unknown"}) did not respond to SIGTERM/SIGKILL and is still running; it is registered so you can retry kill_session on it.`,
+				);
+			}
 			throw new Error(reason);
 		}
 
@@ -698,7 +710,7 @@ async function runExecCommand(
 		const { pruned, count } = ctx.store.insert(session);
 		watchSessionExit(ctx, session);
 		if (pruned) {
-			unwatchSessionExit(ctx, pruned.id);
+			afterSessionRemoved(ctx, pruned);
 			// Suppresses the wake for live victims; keeps a tombstone for a
 			// naturally-exited wake session so its completion is not silently lost.
 			ctx.coordinator.handleEviction(pruned);
@@ -734,11 +746,17 @@ async function runExecCommand(
 				: initialHandle.preempt
 			: signal;
 		const pollStream = startStreaming(session, onUpdate, deadlineMs, initialAbort);
-		const collected = initialHandle
-			? await session.collect({ deadlineMs, externalAbort: initialAbort })
-			: { bytes: new Uint8Array(0), omittedBytes: 0 };
-		initialHandle?.release();
-		pollStream.stop();
+		// Release in `finally`: a throw here would otherwise hold this session's
+		// lock forever, hanging every later interaction with it.
+		let collected: CollectResult;
+		try {
+			collected = initialHandle
+				? await session.collect({ deadlineMs, externalAbort: initialAbort })
+				: { bytes: new Uint8Array(0), omittedBytes: 0 };
+		} finally {
+			initialHandle?.release();
+			pollStream.stop();
+		}
 
 		session.touch();
 		const stillAlive = !session.hasExited;
@@ -1438,11 +1456,24 @@ function unwatchSessionExit(ctx: ExtensionCtx, id: number): void {
 }
 
 function removeSession(ctx: ExtensionCtx, id: number): ExecSession | undefined {
-	unwatchSessionExit(ctx, id);
 	const removed = ctx.store.remove(id);
-	if (removed) rememberReaped(ctx, removed);
-	ctx.locks.forget(id);
+	if (removed) afterSessionRemoved(ctx, removed);
+	else unwatchSessionExit(ctx, id);
 	return removed;
+}
+
+/**
+ * Bookkeeping every removal path owes, whoever performed the store delete:
+ * drop the UI exit watcher, leave an exit tombstone so a call queued behind
+ * the observer can still echo the truth, and forget the interaction lock.
+ * (`unwatchSessionExit` only detaches OUR ui watcher — the completion
+ * coordinator's own exit registration is deliberately untouched, so an
+ * unobserved exit can still deliver its wake.)
+ */
+function afterSessionRemoved(ctx: ExtensionCtx, session: ExecSession): void {
+	unwatchSessionExit(ctx, session.id);
+	rememberReaped(ctx, session);
+	ctx.locks.forget(session.id);
 }
 
 /**
@@ -1876,7 +1907,7 @@ export default function (pi: ExtensionAPI) {
 		name: "write_stdin",
 		label: "write_stdin",
 		description:
-			"Write bytes to a running session. Omit both chars and chars_b64 to poll without writing. Use `chars` for text with C-style escapes (e.g. \\x1b ESC, \\n newline); use `chars_b64` for raw binary. Interrupt: send chars \\x03 alone — in a tty session the terminal turns it into Ctrl-C, and in a pipes session (tty: false) runbg delivers a real SIGINT to the process group. For empty polls, wait with yield_time_ms (relative, max 290 s) or yield_until (absolute UTC deadline — only when the human explicitly asks for a long attached wait).",
+			"Write bytes to a running session. Omit both chars and chars_b64 to poll without writing. Use `chars` for text with C-style escapes (e.g. \\x1b ESC, \\n newline); use `chars_b64` for raw binary. Interrupt: send chars \\x03 alone — in a tty session the terminal turns it into Ctrl-C, and in a pipes session (tty: false) runbg delivers a real SIGINT to the process group. chars_b64 is always literal bytes and never an interrupt, so use chars for Ctrl-C. For empty polls, wait with yield_time_ms (relative, max 290 s) or yield_until (absolute UTC deadline — only when the human explicitly asks for a long attached wait).",
 		promptSnippet: "Send input to or poll a running session",
 		promptGuidelines: [
 			`Use yield_time_ms for interaction or an empty progress poll of at most 290 seconds (${DEFAULT_MAX_BACKGROUND_POLL_MS} ms, cache-friendly). Larger values are rejected, not clamped. Repeat polls as needed instead of bypassing the cap.`,
