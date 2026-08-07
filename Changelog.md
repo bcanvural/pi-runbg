@@ -10,6 +10,33 @@ its names.
 
 ### Changed
 
+- **Attached waits now reach 290 s, not 30 s** (divergence #9). `exec_command`
+  — and `write_stdin` with input — were capped at 30 s, a constant inherited
+  under a "mirror codex" banner with no recorded rationale while the constant
+  beside it carried an argued one. The cost was structural: every job in the
+  30 s–5 min band (test suites, builds, installs, migrations) needed **two**
+  calls, a short yield to obtain a `session_id` and then an empty poll of the
+  same length. An empty poll blocks the same turn for the same time, so the
+  asymmetry bought nothing but a wasted round trip. Both paths now share the
+  cache-friendly ceiling, for the same reason it exists: stay inside the
+  5-minute prompt-cache window. Defaults are untouched (10 s / 250 ms), so
+  this widens the ceiling only — nothing waits longer unless a call asks it
+  to. `PI_RUNBG_MAX_EMPTY_POLL_MS` deliberately does *not* lower it: the var
+  names the empty-poll path, and silently shrinking attached waits for anyone
+  who had set it would be a surprising regression. `clampYield` is exported
+  so a test pins the contract instead of a 30-second sleep.
+  Prompted by comparing against oh-my-pi, which blocks 300 s by default and
+  up to 3600 s in a single call.
+- **`on_exit: "wake"` is now recommended, not rationed.** Guidance previously
+  said to arm it *only* when the human explicitly asked, which left the agent
+  ending its turn and hoping someone checked back. It is now the default move
+  for a long job that **terminates**: the result is delivered on completion,
+  so the turn ends instead of blocking. The prohibition that matters is
+  narrower and unchanged — never for processes that do not exit on their own
+  (dev servers, watchers, `tail -f`), where it would simply never fire.
+  oh-my-pi treats push-delivery as the normal way to background work
+  (`async: true` → *"result will be delivered automatically"*), with no poll
+  surface at all.
 - **Pi's built-in `bash` tool is kept by default** (divergence #1,
   `UPSTREAM.md`): upstream removes it unless `--keep-builtin-bash`; runbg
   keeps it unless asked, via `/runbg replace-bash on` (below) or

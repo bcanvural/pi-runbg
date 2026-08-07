@@ -68,7 +68,6 @@ import { unescapeChars } from "./unescape.ts";
 // ---------------- Constants (mirror codex) ----------------
 
 const MIN_YIELD_TIME_MS = 250;
-const MAX_YIELD_TIME_MS = 30_000;
 const MIN_EMPTY_YIELD_TIME_MS = 5_000;
 // Diverges from codex (30 min): kept below Anthropic's 5-minute prompt-cache
 // TTL so a long empty poll never outlives the cached prompt prefix. This is a
@@ -76,6 +75,26 @@ const MIN_EMPTY_YIELD_TIME_MS = 5_000;
 // raise the relative cap above 290 s — longer waits must use `yield_until`.
 const DEFAULT_MAX_BACKGROUND_POLL_MS = 290_000;
 export const MAX_EMPTY_POLL_ENV_VAR = "PI_RUNBG_MAX_EMPTY_POLL_MS";
+/**
+ * Ceiling for an ATTACHED wait: `exec_command`, and `write_stdin` WITH input.
+ *
+ * Diverges from codex/upstream's 30 s (divergence #9). That value arrived
+ * under a "mirror codex" banner with no recorded rationale, while the line
+ * above it carries an argued one. Its effect was that every job in the
+ * 30 s–5 min band — test suites, builds, installs, migrations — cost two
+ * calls: a short yield to obtain a session_id, then an empty poll. An empty
+ * poll of the same length blocks the same turn for the same time, so the
+ * asymmetry bought nothing but a wasted round trip. Now the same
+ * cache-friendly bound, for the same reason: stay under the 5-minute
+ * prompt-cache TTL.
+ *
+ * `PI_RUNBG_MAX_EMPTY_POLL_MS` deliberately does NOT lower this — it names
+ * the empty-poll path, and silently shrinking attached waits for anyone who
+ * had set it would be a surprising regression. Defaults are unchanged
+ * (`DEFAULT_EXEC_YIELD_MS` is still 10 s), so nothing waits longer unless a
+ * call explicitly asks it to.
+ */
+const MAX_YIELD_TIME_MS = DEFAULT_MAX_BACKGROUND_POLL_MS;
 const DEFAULT_EXEC_YIELD_MS = 10_000;
 const DEFAULT_WRITE_STDIN_YIELD_MS = 250;
 const EARLY_EXIT_GRACE_PERIOD_MS = 150;
@@ -124,7 +143,8 @@ function clamp(n: number, lo: number, hi: number): number {
 	return Math.min(hi, Math.max(lo, n));
 }
 
-function clampYield(ms: number | undefined, defaultMs: number): number {
+/** Exported for tests: pins the attached-wait ceiling (divergence #9). */
+export function clampYield(ms: number | undefined, defaultMs: number): number {
 	const v = typeof ms === "number" && ms > 0 ? ms : defaultMs;
 	return clamp(Math.floor(v), MIN_YIELD_TIME_MS, MAX_YIELD_TIME_MS);
 }
@@ -2190,16 +2210,16 @@ export default function (pi: ExtensionAPI) {
 		name: "exec_command",
 		label: "exec_command",
 		description:
-			'Run a command in a persistent session. Returns `session_id` if still running (drive with write_stdin) or `exit_code` if it finished within yield_time_ms. on_exit defaults to "none". Only pass on_exit: "wake" when the human explicitly wants auto-resume on unobserved exit — stale wakes interrupt later work. Use set_on_exit to disarm or re-arm a running session.',
+			'Run a command in a persistent session. Returns `session_id` if still running (drive with write_stdin) or `exit_code` if it finished within yield_time_ms. on_exit defaults to "none". Pass on_exit: "wake" for a long job that terminates, to have its result delivered on completion instead of blocking a turn; never for processes that do not exit on their own. Use set_on_exit to disarm or re-arm a running session.',
 		promptSnippet: "Run a shell command; long-running ones yield a session_id",
 		promptGuidelines: [
 			"Prefer dedicated file tools when available (read/grep/find/ls). Otherwise use exec_command with fast shell tools: rg for content search, fd if available (or find) for file names, and ls for directories.",
-			`Choose how you will wait BEFORE starting, from the job's expected duration. Under ~30s: one exec_command with yield_time_ms covering it (~500ms for quick one-shots, 10s default; the cap is ${MAX_YIELD_TIME_MS} ms, so a longer sleep silently hands back a session_id instead). 30s-5min: a short yield to obtain the session_id, then ONE long empty write_stdin poll — not several short ones, because a turn costs far more than a longer poll and ${DEFAULT_MAX_BACKGROUND_POLL_MS} ms returns inside the prompt-cache window. Over ~5min: do not hold the turn — report the session_id and what it is running, end the turn, and let the human resume (or arm on_exit: "wake" if they want auto-resume). Interactive processes (REPLs, ssh, sudo) always return a session_id you then drive with write_stdin. Never end a turn with a live session you have not named, and kill_session anything you have stopped caring about — abandoned sessions still count toward the session cap.`,
+			`Choose how you will wait BEFORE starting, from the job's expected duration. Expected to finish within ~5 minutes: ONE exec_command whose yield_time_ms covers it (~500ms for quick one-shots, ${DEFAULT_EXEC_YIELD_MS} ms default, up to ${MAX_YIELD_TIME_MS} ms) — do not split this into a short yield plus a poll, which costs an extra turn for the same wait. Longer than that, or unknown: start it, then set on_exit: "wake" and END THE TURN — the result is delivered to you automatically when it finishes, which beats holding the turn or hoping someone checks back. Interactive processes (REPLs, ssh, sudo) always return a session_id you then drive with write_stdin. Never end a turn with a live session you have not named to the human, and kill_session anything you have stopped caring about — abandoned sessions still count toward the session cap.`,
 			"Do not background inside cmd (`&`, `nohup`, `disown`) — the session IS the background: run the long process as cmd itself and poll it with write_stdin. A backgrounded child is not tracked by its session; if it inherits the session's output pipe, the session keeps reporting [still running] long after your cmd finished, and kill_session ends it anyway (SIGTERM goes to the whole process group, which nohup does not survive). Use setsid only when the human explicitly wants a process to outlive pi.",
 			"Compose multi-step waits in the shell, not across tool calls — the shell is your scripting layer, so anything needing no model judgment between steps belongs in one command. `until curl -sf URL; do sleep 2; done && npm test 2>&1 | tail -40` is a single call; polling, checking, then running is five or six. Prefer waiting on a CONDITION over sleeping a fixed duration: it returns the instant the condition holds instead of after a guess, and a bare sleep whose only purpose is to pass time gives you a session with nothing to observe.",
 			"Filter output at the source (tail, grep, wc, --quiet flags) rather than pulling everything into context. Results are bounded by a head/tail buffer, so an unfiltered 900-line run silently loses its MIDDLE — usually where the failure is. Truncation is a safety net, not a filtering strategy. log_path always holds the complete stream: grep or read that when the bounded result is not enough, instead of re-running the job.",
 			`An empty write_stdin poll (no chars) waits for progress and accepts yield_time_ms up to 290 seconds (${DEFAULT_MAX_BACKGROUND_POLL_MS} ms, cache-friendly). Each poll returns only output that is NEW since the last one, never bytes you have already seen, so a poll's cost is the TURN rather than the payload — which is why one long poll beats several short ones. Do NOT use yield_until just to bypass the 290s cap — only when the human explicitly asks for a long attached wait or a wall-clock deadline (finite non-interactive jobs only).`,
-			'on_exit defaults to "none". Prefer polling or human follow-up. Use on_exit: "wake" ONLY when the human explicitly wants auto-resume on unobserved completion — not for indefinite processes (dev servers, watchers). If you armed wake by mistake or the job is wrong/abandoned, call set_on_exit(session_id, on_exit: "none") promptly (does not kill the process). kill_session still kills and suppresses wake. Combining wake with an observing write_stdin is safe: direct completion consumes the wake.',
+			'on_exit defaults to "none". Arm on_exit: "wake" for any long job that TERMINATES and that you would otherwise wait on — it delivers the result to you on completion, so you can end the turn instead of blocking it. NEVER arm it for something that does not exit on its own (dev servers, watchers, tail -f): it would simply never fire, and a wake left armed on abandoned work interrupts later. If you armed it by mistake, call set_on_exit(session_id, on_exit: "none") promptly (does not kill the process). kill_session both kills and suppresses the wake. Combining wake with an observing write_stdin is safe: direct completion consumes the wake.',
 		],
 		parameters: Type.Object({
 			cmd: Type.String({ description: "Shell command to execute." }),

@@ -54,8 +54,9 @@ Verified facts (source review + local test run, 2026-08-06):
   two-way I/O, every byte mirrored to an on-disk log (`log_path`), bounded
   in-memory retention (1 MiB head+tail per session), model-visible output
   tail-capped per call at 50 KiB / 2000 lines (pi's `DEFAULT_MAX_BYTES/LINES`).
-- Bounded waits: `exec_command` / `write_stdin`-with-input attach ≤ 30 s
-  (defaults 10 s / 250 ms); empty polls clamp to [5 s, 290 s] — above-cap
+- Bounded waits: `exec_command` / `write_stdin`-with-input attach ≤ 290 s
+  (divergence #9; defaults unchanged at 10 s / 250 ms); empty polls clamp to
+  [5 s, 290 s] — above-cap
   values are *rejected*, not clamped; `yield_until` absolute-UTC waits
   (multi-day, timers chunked at 2^31−1 ms). 290 s cap exists for Anthropic
   prompt-cache friendliness.
@@ -112,8 +113,8 @@ Source of truth once forked: the fork's README. Summary:
 
 | Tool | Params | Returns (`details`) |
 |---|---|---|
-| `exec_command` | `cmd` (required), `workdir?`, `shell?`, `tty?` (PTY), `cols?`/`rows?` (PTY), `yield_time_ms?` (clamp **[250, 30 000]**, default 10 000), `on_exit?` (`"none"`\|`"wake"`) | `operation`, `status: "running"\|"exited"`, `running`, `session_id?` XOR `exit_code?`, `signal?`, bounded `output`, `output_bytes_total`, `truncation?`/`omitted_bytes?`, `wall_time_seconds`, `tty`, `cwd`, `command`, `log_path`, `tool_time_utc`, wake/wait metadata |
-| `write_stdin` | `session_id`, `chars?` (**optional — omit for a pure poll**; C-escapes decoded), `chars_b64?`, `yield_time_ms?` (with input [250, 30 000] def. 250; empty poll [5 000, 290 000], above cap **rejected**), `yield_until?` (RFC 3339 UTC, **empty polls only**, no max horizon) | session snapshot + bounded `output` |
+| `exec_command` | `cmd` (required), `workdir?`, `shell?`, `tty?` (PTY), `cols?`/`rows?` (PTY), `yield_time_ms?` (clamp **[250, 290 000]** — divergence #9, upstream 30 000; default 10 000), `on_exit?` (`"none"`\|`"wake"`) | `operation`, `status: "running"\|"exited"`, `running`, `session_id?` XOR `exit_code?`, `signal?`, bounded `output`, `output_bytes_total`, `truncation?`/`omitted_bytes?`, `wall_time_seconds`, `tty`, `cwd`, `command`, `log_path`, `tool_time_utc`, wake/wait metadata |
+| `write_stdin` | `session_id`, `chars?` (**optional — omit for a pure poll**; C-escapes decoded), `chars_b64?`, `yield_time_ms?` (with input [250, 290 000] def. 250; empty poll [5 000, 290 000], above cap **rejected**), `yield_until?` (RFC 3339 UTC, **empty polls only**, no max horizon) | session snapshot + bounded `output` |
 | `set_on_exit` | `session_id`, `on_exit` | `{ session_id, found, on_exit, status, running, wake_armed, … }` |
 | `kill_session` | `session_id`, `signal?` (default SIGTERM; SIGKILL escalation after 2 s) | bounded output envelope + `killed`, `escalated`, `status` |
 | `list_sessions` | — | per-session `{ session_id, command, pid, running, wake_armed, elapsed_ms, exit info, output_bytes_total, log_path }` + counts. **Side effect: reporting an exit consumes a pending wake** |
@@ -121,7 +122,8 @@ Source of truth once forked: the fork's README. Summary:
 v2 errors, recorded so they don't resurface in prompts or code: params are
 `cmd`/`tty`, not `command`/`interactive`; **there is no `vars` param**
 (children inherit pi's full `process.env`); `yield_until` is `write_stdin`-only;
-`exec_command`'s yield ceiling is 30 s, not 290 s; result fields are
+`exec_command`'s yield ceiling was 30 s upstream and is now 290 s here
+(divergence #9); result fields are
 `status`/`output`/`output_bytes_total`, not `state`/`tail`/`output_size`;
 commands finishing < 150 ms never enter the session store (return
 `exit_code`, no `session_id`).
@@ -169,7 +171,7 @@ would spawn duplicate processes, the exact failure class this section exists
 to fix):
 
 ```text
-exec_command                → start a session (attach ≤ 30 s)
+exec_command                → start a session (attach ≤ 290 s)
 write_stdin, chars omitted  → poll it (yield_time_ms ≤ 290 s; repeat OK, cache-friendly)
 write_stdin, chars set      → drive it (input / \x03 Ctrl-C / …)
 yield_until                 → ONLY if human explicitly asks for a long attach / UTC deadline

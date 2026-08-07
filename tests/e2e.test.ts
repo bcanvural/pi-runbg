@@ -11,7 +11,7 @@ import { strict as assert } from "node:assert";
 import { existsSync, readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 import { DEFAULT_MAX_BYTES } from "@earendil-works/pi-coding-agent";
-import extensionFactory, { MAX_EMPTY_POLL_ENV_VAR, resolveMaxEmptyPollMs } from "../src/index.ts";
+import extensionFactory, { clampYield, MAX_EMPTY_POLL_ENV_VAR, resolveMaxEmptyPollMs } from "../src/index.ts";
 import { IS_WINDOWS } from "../src/shell.ts";
 import { useIsolatedAgentEnv } from "./helpers/agent-env.ts";
 import { trackHarness, useHarnessCleanup } from "./helpers/harness-cleanup.ts";
@@ -122,6 +122,22 @@ describe("runbg e2e", () => {
 		assert.equal(resolveMaxEmptyPollMs({ [MAX_EMPTY_POLL_ENV_VAR]: "60000" }), 60_000);
 		assert.equal(resolveMaxEmptyPollMs({ [MAX_EMPTY_POLL_ENV_VAR]: "1000" }), 5_000);
 		assert.equal(resolveMaxEmptyPollMs({ [MAX_EMPTY_POLL_ENV_VAR]: "not-a-number" }), 290_000);
+	});
+
+	it("attached waits share the empty-poll ceiling, not codex's 30s (divergence #9)", () => {
+		// The 30 s cap we inherited made every 30 s-5 min job cost two calls:
+		// a short yield for a session_id, then an empty poll of the same
+		// length. Both block the same turn for the same time, so exec_command
+		// and write_stdin-with-input now reach the same cache-friendly bound.
+		assert.equal(clampYield(45_000, 10_000), 45_000, "45s must no longer clamp to 30s");
+		assert.equal(clampYield(290_000, 10_000), 290_000, "the cache-friendly max is reachable");
+		// Still bounded: nothing may outlive the prompt-cache window.
+		assert.equal(clampYield(400_000, 10_000), 290_000);
+		// Floor and default are unchanged — this widens the ceiling only, so
+		// no call waits longer unless it explicitly asks to.
+		assert.equal(clampYield(100, 10_000), 250);
+		assert.equal(clampYield(undefined, 10_000), 10_000);
+		assert.equal(clampYield(0, 250), 250);
 	});
 
 	it("registers explicit call/result renderers for every runbg tool", () => {

@@ -30,8 +30,9 @@ pi-flavor additions (`set_on_exit`, `kill_session`, `list_sessions`).
   with the in-memory buffer, so the full history is recoverable via
   `read(log_path)` even after the LLM-visible tail truncates.
 - **Bounded waits — the agent never stalls.** Every tool call returns
-  within a hard ceiling: 30 s for `exec_command` and interactive
-  `write_stdin`, 290 s for pure background polls (`yield_time_ms`). For a
+  within a hard ceiling: 290 s for every relative wait — `exec_command`,
+  interactive `write_stdin`, and pure background polls alike (`yield_time_ms`),
+  chosen to stay inside the 5-minute prompt-cache window. For a
   human-requested long attached wait, `yield_until` stays attached until an
   absolute UTC deadline (no default max horizon; multi-day waits re-arm
   timers safely). A long-running process keeps running; the agent just gets
@@ -124,8 +125,8 @@ Runs a command in a persistent session.
 | `tty` | boolean | `false` | Allocate a PTY (requires node-pty). |
 | `cols` | number | `120` | PTY width in columns (`tty: true` only; ignored for pipes). Clamped to [20, 500]. |
 | `rows` | number | `30` | PTY height in rows (`tty: true` only; ignored for pipes). Clamped to [5, 300]. |
-| `yield_time_ms` | number | `10_000` | How long this call stays attached waiting for output (an attachment window, not the command's lifetime), clamped to [250, 30_000]. |
-| `on_exit` | `"none"` \| `"wake"` | `"none"` | Persistent per-session policy for exits nobody is observing. Prefer `"none"`. `"wake"`: one synthetic follow-up prompt resumes the agent — only when the human explicitly wants auto-resume. Change later with `set_on_exit`. |
+| `yield_time_ms` | number | `10_000` | How long this call stays attached waiting for output (an attachment window, not the command's lifetime), clamped to [250, 290_000] (divergence #9 — upstream capped at 30_000). |
+| `on_exit` | `"none"` \| `"wake"` | `"none"` | Persistent per-session policy for exits nobody is observing. `"wake"`: one synthetic follow-up prompt resumes the agent when the process exits — the right choice for a long job that **terminates**, so the agent can end its turn instead of blocking it. Never for processes that do not exit on their own (dev servers, watchers): it would never fire. Change later with `set_on_exit`. |
 
 Response body (short output, no truncation):
 
