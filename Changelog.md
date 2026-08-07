@@ -43,15 +43,29 @@ its names.
 
 ### Fixed
 
+- **PTY mode works again on current Node.** The optional
+  `@homebridge/node-pty-prebuilt-multiarch` pin (`0.13.1`) declares
+  `engines: >=18.0.0 <25.0.0`, and npm skips an optional dependency whose
+  engine range excludes the running Node **silently** — no error, no warning.
+  On Node 26 the package was simply never installed, so `tty: true` failed
+  and every session start showed the `node-pty not available` notice, with
+  nothing to suggest the cause was a version range rather than a failed
+  native build. Bumped to `0.14.1` (`>=20.0.0 <27.0.0`), which restores PTY
+  mode; the four previously-skipped `tests/e2e-pty.test.ts` cases (PTY spawn,
+  Python REPL over PTY, line-echo round-trip, `\x03` interrupt) now run and
+  pass. The upper bound moves with each release, so a future Node upgrade can
+  silently disable PTY again — README now says how to check.
 - **The running-sessions widget no longer flags normal operation with `⚠`.**
   Reported as "a lot of yellow warning sign icons at the bottom". The widget
   sits `aboveEditor` — the strip users scan for problems — and live sessions
   are this extension's *normal* state, so a warning triangle parked there for
   the life of every background job reads as a fault. Now `●`; `⚠` is
-  reserved for states that want attention. Worth recording how this was
-  pinned down: U+26A0 appears in exactly one place across the whole installed
-  stack (pi's `dist/`, every extension, this package) — that widget line — so
-  the glyph was unambiguously ours.
+  reserved for states that want attention. Correct on its own merits, but
+  **not** the reported symptom: the flashing triangles turned out to be the
+  user's own benchmark output (see below). Searching the *source* of every
+  installed package found U+26A0 only here, which made the widget look
+  responsible — a reminder that a glyph on screen usually comes from
+  transcript content, not from code.
 - **The near-cap warning is edge-triggered instead of level-triggered.**
   `ui.notify(_, "warning")` is not a transient toast: pi's `showWarning`
   permanently appends a `Spacer` plus a `Warning: …` line to the transcript.
@@ -62,21 +76,23 @@ its names.
   the first one on. It now warns once on approach and re-arms only after the
   session count drains back below the threshold. Covered by
   `tests/session-cap.test.ts`.
-- **Investigated and NOT ours: the full-screen repaints reported alongside
-  the above.** pi's differential renderer falls back to `fullRender(true)`
-  whenever `firstChanged < viewportTop` — i.e. any line changing above the
-  visible window — and unconditionally on terminal width/height changes.
-  Neither is reachable from an extension that only renders at the bottom
-  (`setStatus`, `placement: "aboveEditor"`, and inline tool renderers at the
-  tool call's own index). Measured on a live session: of 33 recorded full
-  renders, 30 were `firstChanged < viewportTop` at line index 2 of a
-  25,080-line transcript — inside a user `setHeader` extension — and 3 were
-  terminal resizes. The severity is a function of transcript length, since a
-  full render rewrites every line it holds. The `terminal.clearOnShrink`
-  mechanism named in the report accounted for **zero** of them: it defaults
-  to false (`PI_CLEAR_ON_SHRINK === "1"` enables it, despite pi's own
-  adjacent comment claiming `=0` — the likely source of the misdiagnosis).
-
+- **Investigated and NOT a defect at all: the "yellow warning signs" and the
+  full-screen repaints.** Resolved by capturing the pane's raw byte stream
+  (`tmux pipe-pane`): 87 instances of `U+26A0 U+FE0F` in pi's output, all of
+  it transcript *content* — a benchmark grader printing
+  `c.pass ? "✅" : "⚠️ "` and its error lines. pi renders into the normal
+  scrollback rather than the alternate screen, so a full repaint rewrites
+  every line it holds; those emoji stream past and vanish when it settles.
+  Cost scales with transcript length (25k lines here), not with any
+  extension. `fullRender(true)` fires on terminal resize and whenever
+  `firstChanged < viewportTop` — any change above the visible window, which a
+  tall tool block finalizing above the fold reliably causes. Two dead ends
+  worth recording: `terminal.clearOnShrink`, named in the original report,
+  accounted for **zero** of 33 observed full renders (it defaults to false —
+  `PI_CLEAR_ON_SHRINK === "1"` enables it, despite pi's own adjacent comment
+  claiming `=0`); and a 25 Hz `capture-pane` poll found nothing, because a
+  repaint completes well inside a 40 ms sampling interval — sampling a
+  transient is not evidence of its absence.
 - **A finished job's output no longer disappears when polls arrive batched**
   (code review, N1 — regression in divergence #7's first cut): preemption was
   merged into `collect`'s `externalAbort`, and that signal is checked *before*

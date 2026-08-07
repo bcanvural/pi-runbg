@@ -88,6 +88,16 @@ The `npm install` fetches `@homebridge/node-pty-prebuilt-multiarch`
 your platform, pipe mode (`tty: false`) still works, but PTY mode
 (`tty: true`) will error with a clear message.
 
+> [!NOTE]
+> It is an **optional** dependency, and npm skips those **silently** when
+> their `engines` range excludes your Node — no error, no warning, just a
+> missing PTY and the `node-pty not available` notice at startup. That
+> package's range is a moving upper bound (`0.13.1` was `<25`, `0.14.1` is
+> `<27`), so a Node upgrade can switch PTY mode off without touching
+> anything here. If the notice appears, compare `node --version` against
+> `npm view @homebridge/node-pty-prebuilt-multiarch@<version> engines`
+> before assuming a build failure.
+
 To try without installing:
 
 ```bash
