@@ -24,6 +24,34 @@ its names.
   than the stored setting — is the reason `bash` is gone, and
   `/runbg replace-bash off` warns instead of silently failing when the flag
   overrules it.
+- **`exec_command` guidance now states the wait-mode decision rule.** The
+  guidelines explained polling mechanics but never said *how to choose*, so
+  the expensive mistakes were unaddressed. Added, informed by comparing
+  against codex's current `wait` tool:
+  - **A duration ladder, chosen before starting.** Under ~30 s: one
+    `exec_command` with a covering `yield_time_ms` (the clamp is 30 s, so a
+    longer sleep silently hands back a `session_id` instead). 30 s–5 min: a
+    short yield for the `session_id`, then *one* long empty poll. Over
+    ~5 min: do not hold the turn — report the `session_id` and end it.
+  - **Why one long poll beats several short ones**: a poll returns only
+    output new since the last one, so its cost is the *turn*, not the
+    payload — and 290 s returns inside the prompt-cache window (codex uses
+    300 s; ours sits deliberately under it).
+  - **Compose multi-step waits in the shell.** codex's answer to composition
+    is a V8 isolate where the model writes JavaScript calling tools; we have
+    no isolate, but the shell is the same scripting layer. Anything needing
+    no model judgment between steps is one command, not five turns. Prefer
+    waiting on a *condition* over sleeping a fixed duration.
+  - **Filter at the source.** Results are bounded by a head/tail buffer, so
+    an unfiltered 900-line run loses its *middle* — usually where the failure
+    is. Truncation is a safety net, not a filtering strategy; `log_path`
+    holds the full stream.
+  - **Session hygiene**: never end a turn with an unnamed live session, and
+    `kill_session` what you have abandoned — it still counts toward the cap.
+
+  Deduplicated against the existing polling guideline rather than appended,
+  since these strings are injected every turn: net ~910 tokens for the seven
+  `exec_command` guidelines.
 - **`exec_command` guidance now tells the model not to background inside
   `cmd`.** Reaching for `nohup cmd &` is the correct habit with a one-shot
   `bash` tool and the wrong one here — the session already *is* the
