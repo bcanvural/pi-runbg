@@ -166,3 +166,32 @@ describe("session cap", () => {
 		await h.shutdown();
 	});
 });
+
+describe("near-cap warning", () => {
+	// pi's ui.notify(_, "warning") is NOT a transient toast: showWarning appends
+	// a Spacer plus a `Warning: …` line to the transcript permanently. A
+	// level-triggered warning therefore accumulated two yellow lines per
+	// exec_command for the rest of the session — and since the threshold is
+	// `maxSessions - 4`, a small configured cap (like this file's 2) collapses
+	// it to 1, i.e. every call from the very first one.
+	it("warns once on approach, not on every call past the threshold", async () => {
+		const h = makeHarness();
+		await h.emit("session_start");
+		const nearCap = () => h.notifications.filter((n) => /sessions open/.test(n.message));
+
+		const a = await h.call("exec_command", { cmd: "sleep 30", yield_time_ms: 250 });
+		assert.equal(nearCap().length, 1, `first approach must warn: ${JSON.stringify(h.notifications)}`);
+		assert.equal(nearCap()[0].type, "warning");
+
+		const b = await h.call("exec_command", { cmd: "sleep 30", yield_time_ms: 250 });
+		assert.equal(nearCap().length, 1, "a second call past the threshold must not warn again");
+
+		// Draining back below the threshold re-arms it: a later approach is new
+		// information and should warn once more.
+		await h.call("kill_session", { session_id: a.details.session_id });
+		await h.call("kill_session", { session_id: b.details.session_id });
+		await h.call("exec_command", { cmd: "sleep 30", yield_time_ms: 250 });
+		assert.equal(nearCap().length, 2, `re-approach must warn again: ${JSON.stringify(h.notifications)}`);
+		await h.shutdown();
+	});
+});

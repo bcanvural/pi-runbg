@@ -217,6 +217,8 @@ interface ExtensionCtx {
 	logSweepInFlight: boolean;
 	/** True only while WE removed pi's built-in bash (divergence #1 latch). */
 	removedBuiltinBash: boolean;
+	/** Edge-trigger latch for the near-cap warning (pi warnings are permanent). */
+	warnedNearCap: boolean;
 	/** Per-session interaction serialization (divergence #7). */
 	locks: InteractionLocks;
 	/** Recently reaped sessions, for graceful echoes to queued callers. */
@@ -911,8 +913,19 @@ async function runExecCommand(
 			ctx.ui?.notify(`runbg: reaped exited session ${pruned.id} (LRU, at cap ${ctx.store.maxSessions})`, "info");
 		}
 		// Derived from the (configurable) cap so a lowered cap still warns.
-		if (count >= Math.max(1, ctx.store.maxSessions - WARNING_HEADROOM)) {
-			ctx.ui?.notify(`runbg: ${count}/${ctx.store.maxSessions} sessions open`, "warning");
+		// EDGE-triggered: `notify(_, "warning")` is not a transient toast — pi's
+		// showWarning permanently appends a Spacer plus a `Warning: …` line to
+		// the transcript. Warning on every call past the threshold therefore
+		// accumulated two yellow lines per exec_command for the rest of the
+		// session, and a lowered PI_RUNBG_MAX_SESSIONS collapses the threshold
+		// to 1, which made that every single call from the first one on.
+		if (count >= capWarningThreshold(ctx)) {
+			if (!ctx.warnedNearCap) {
+				ctx.warnedNearCap = true;
+				ctx.ui?.notify(`runbg: ${count}/${ctx.store.maxSessions} sessions open`, "warning");
+			}
+		} else {
+			ctx.warnedNearCap = false;
 		}
 		// Note: sessions stay in the store until a later tool call observes the
 		// exit: write_stdin returns the final exit_code/output, and list_sessions
@@ -1630,7 +1643,13 @@ function formatRunningSessionsWidget(ctx: ExtensionCtx, sessions: ExecSession[])
 	const now = Date.now();
 	const shown = sessions.slice(0, 5);
 	const lines = [
-		`⚠ runbg: ${sessions.length} ${plural(sessions.length, "session")} still running`,
+		// `●`, not `⚠`: live sessions are this extension's NORMAL state, and the
+		// widget sits `aboveEditor` — the strip users scan for problems. A
+		// warning triangle parked there for the whole life of every background
+		// job reads as "something is wrong" (it was reported as exactly that).
+		// `⚠` is reserved for states that want attention: at/near the session
+		// cap, a session that would not die, an undeliverable wake.
+		`● runbg: ${sessions.length} ${plural(sessions.length, "session")} still running`,
 		...shown.map((s) => {
 			const wake = ctx.coordinator.isArmed(s.id) ? " [wake]" : "";
 			return `  #${s.id} ${formatElapsed(now - s.startedAt)}${wake} ${oneLineCommand(s.displayCommand, 72)} (${s.cwd})`;
@@ -1712,6 +1731,14 @@ function afterSessionRemoved(ctx: ExtensionCtx, session: ExecSession): void {
 	unwatchSessionExit(ctx, session.id);
 	rememberReaped(ctx, session);
 	ctx.locks.forget(session.id);
+	// Re-arm the near-cap warning once the pressure is actually gone, so a
+	// second approach to the cap still warns once (see the notify site).
+	if (ctx.store.size < capWarningThreshold(ctx)) ctx.warnedNearCap = false;
+}
+
+/** Session count at which exec_command warns once that the cap is near. */
+function capWarningThreshold(ctx: ExtensionCtx): number {
+	return Math.max(1, ctx.store.maxSessions - WARNING_HEADROOM);
 }
 
 /**
@@ -1854,6 +1881,7 @@ export default function (pi: ExtensionAPI) {
 		logHeartbeat: undefined,
 		logSweepInFlight: false,
 		removedBuiltinBash: false,
+		warnedNearCap: false,
 		locks: new InteractionLocks(),
 		reaped: new Map(),
 	};

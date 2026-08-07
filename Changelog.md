@@ -43,6 +43,40 @@ its names.
 
 ### Fixed
 
+- **The running-sessions widget no longer flags normal operation with `⚠`.**
+  Reported as "a lot of yellow warning sign icons at the bottom". The widget
+  sits `aboveEditor` — the strip users scan for problems — and live sessions
+  are this extension's *normal* state, so a warning triangle parked there for
+  the life of every background job reads as a fault. Now `●`; `⚠` is
+  reserved for states that want attention. Worth recording how this was
+  pinned down: U+26A0 appears in exactly one place across the whole installed
+  stack (pi's `dist/`, every extension, this package) — that widget line — so
+  the glyph was unambiguously ours.
+- **The near-cap warning is edge-triggered instead of level-triggered.**
+  `ui.notify(_, "warning")` is not a transient toast: pi's `showWarning`
+  permanently appends a `Spacer` plus a `Warning: …` line to the transcript.
+  Warning on every `exec_command` past `maxSessions - 4` therefore added two
+  yellow lines per call for the rest of the session, and because the
+  threshold is `Math.max(1, maxSessions - 4)`, a small configured
+  `PI_RUNBG_MAX_SESSIONS` collapses it to 1 — making that *every* call from
+  the first one on. It now warns once on approach and re-arms only after the
+  session count drains back below the threshold. Covered by
+  `tests/session-cap.test.ts`.
+- **Investigated and NOT ours: the full-screen repaints reported alongside
+  the above.** pi's differential renderer falls back to `fullRender(true)`
+  whenever `firstChanged < viewportTop` — i.e. any line changing above the
+  visible window — and unconditionally on terminal width/height changes.
+  Neither is reachable from an extension that only renders at the bottom
+  (`setStatus`, `placement: "aboveEditor"`, and inline tool renderers at the
+  tool call's own index). Measured on a live session: of 33 recorded full
+  renders, 30 were `firstChanged < viewportTop` at line index 2 of a
+  25,080-line transcript — inside a user `setHeader` extension — and 3 were
+  terminal resizes. The severity is a function of transcript length, since a
+  full render rewrites every line it holds. The `terminal.clearOnShrink`
+  mechanism named in the report accounted for **zero** of them: it defaults
+  to false (`PI_CLEAR_ON_SHRINK === "1"` enables it, despite pi's own
+  adjacent comment claiming `=0` — the likely source of the misdiagnosis).
+
 - **A finished job's output no longer disappears when polls arrive batched**
   (code review, N1 — regression in divergence #7's first cut): preemption was
   merged into `collect`'s `externalAbort`, and that signal is checked *before*
