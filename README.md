@@ -483,20 +483,20 @@ Codex-parity unless noted:
 
 ```
 MIN_YIELD_TIME_MS            = 250
-MAX_YIELD_TIME_MS            = 30_000
 MIN_EMPTY_YIELD_TIME_MS      = 5_000
 DEFAULT_EXEC_YIELD_MS        = 10_000
 DEFAULT_WRITE_STDIN_YIELD_MS = 250
 EARLY_EXIT_GRACE_PERIOD_MS   = 150
 HEAD_TAIL_MAX_BYTES          = 1 MiB   (in-memory drain buffer)
-MAX_SESSIONS                 = 64
-WARNING_SESSIONS             = 60
+MAX_SESSIONS                 = 64    (env: PI_RUNBG_MAX_SESSIONS, overridable)
+WARNING_HEADROOM             = 4     (warn this many slots before the cap — warns at 60 of 64)
 LRU_PROTECTED_COUNT          = 8
 
 # Diverges from codex — codex allows 30 min; capped at 290 s to stay under
 # Anthropic's 5-minute prompt-cache TTL. The env override can only LOWER it;
 # longer waits use write_stdin's yield_until (absolute deadline):
 DEFAULT_MAX_BACKGROUND_POLL_MS = 290_000  (env: PI_RUNBG_MAX_EMPTY_POLL_MS, lower-only)
+MAX_YIELD_TIME_MS              = 290_000  (attached-wait ceiling — same bound; upstream was 30 s)
 LONG_WAIT_UPDATE_INTERVAL_MS   = 30_000  (rate limit for absolute-wait TUI updates)
 MAX_TIMER_ARM_MS               = 2^31-1   (setTimeout chunk size for multi-day yield_until)
 
