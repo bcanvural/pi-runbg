@@ -115,9 +115,28 @@ its names.
     The guideline now states that this is not a completed wait, not evidence
     the command finished, and not a failed verification — answer the human,
     then poll again.
-  - Probes `ExtensionContext.hasPendingMessages()` defensively (it postdates
-    our 0.80.5 peer floor); an older host simply never yields early. The
-    poller is unref'd and disposed at every lock-release site.
+  - **`hasPendingMessages()` counts follow-up messages too**, and pi does not
+    drain those until the whole turn ends — so an Alt+Enter follow-up would
+    otherwise make every later wait yield instantly, leaving the model unable
+    to wait for anything. Each episode therefore carries a small yield budget
+    (8). Two simpler rules were tried and rejected under test: a
+    once-per-episode latch left parallel batch siblings in full-length waits,
+    so the batch could never end and the message that caused the yield was
+    never delivered — worse than not yielding at all; a start-time rule
+    ("siblings already underway may also yield") assumed batch members begin
+    within milliseconds of each other, which held on an idle machine and was
+    then caught under full-suite load denying a late sibling, reproducing the
+    same stall. A counter has no timing assumption.
+  - Guidance covers the case where no message appears (the human used the
+    deliver-when-idle queue): wrap up and end the turn, which is what delivers
+    it — rather than the earlier advice to answer a message that isn't there.
+  - `yield_until` absolute waits are deliberately not steer-aware; they are
+    heartbeat-free by design and the human has opted into a long wait.
+  - `ExtensionContext.hasPendingMessages()` is probed defensively — not
+    because it is new (it predates our peer floor; it was renamed from
+    `hasQueuedMessages` in 0.32.0) but because that rename is exactly the
+    failure mode a hand-rolled structural type would hide. The poller is
+    unref'd and disposed at every lock-release site.
   - Guidance also now routes anything that *might* run long through
     `exec_command` even when pi's `bash` is present, since only a session can
     hand control back mid-wait. This makes steer-safety total rather than

@@ -239,6 +239,8 @@ interface ExtensionCtx {
 	removedBuiltinBash: boolean;
 	/** Edge-trigger latch for the near-cap warning (pi warnings are permanent). */
 	warnedNearCap: boolean;
+	/** Yields still allowed in the current pending-message episode (steerSignal). */
+	steerYieldsLeft: number;
 	/** Per-session interaction serialization (divergence #7). */
 	locks: InteractionLocks;
 	/** Recently reaped sessions, for graceful echoes to queued callers. */
@@ -406,10 +408,11 @@ function warnIfUpstreamPackagePresent(ctx: ExtensionCtx, pi: ExtensionAPI): void
  * namespace for future extension settings, so unknown keys are preserved
  * verbatim on every write.
  *
- * Every known key is normalized with a strict `=== true`, so a hand-edited
- * `"true"` or `1` reads as off rather than half-on: these settings remove
- * tools, and the safe default has to be the one that leaves pi's own shell
- * in place.
+ * Known keys are normalized so a hand-edited `"true"` or `1` cannot half-enable
+ * anything. Which direction is "safe" depends on the setting: the tool-removal
+ * keys use a strict `=== true` (never leave pi shell-less by accident), while
+ * `steerYield` uses `!== false` (never make a waiting human sit out a 290 s
+ * attach by accident). Each field documents its own choice.
  */
 interface RunbgSettings {
 	enabled: boolean;
@@ -723,52 +726,92 @@ type SteerHost = { hasPendingMessages?: () => boolean } | undefined;
 
 /** How often an attached wait checks whether the human has queued a message. */
 const STEER_POLL_INTERVAL_MS = 250;
+/**
+ * Yields allowed per pending-message episode. Generous on purpose: it must
+ * comfortably exceed any one tool batch (see steerSignal for why a tighter
+ * bound is actively harmful), while still capping the follow-up case at a
+ * handful of wasted early returns instead of an unbounded loop.
+ */
+export const STEER_YIELDS_PER_EPISODE = 8;
 
 /**
- * Abort signal that fires once the human has a message queued (divergence #10).
+ * Abort signal that fires once the human has input queued (divergence #10).
  *
  * Semantically a PREEMPTION, not a cancellation: the caller merges it into
  * `preemptAbort` so the wait drains what is already buffered and only then
  * stops. Cancelling instead would discard that output (see collect.ts).
  *
- * `hasPendingMessages` landed after our 0.80.5 peer floor and is absent in the
- * test harnesses, so it is probed defensively — an older host simply never
- * yields early. Returns undefined when there is nothing to watch, so the
- * common path allocates no timer.
+ * ONE YIELD PER EPISODE, PLUS WHATEVER WAS ALREADY WAITING. `hasPendingMessages()`
+ * counts steering AND follow-up messages together (agent-session.js:
+ * `_steeringMessages.length + _followUpMessages.length`) and an extension
+ * cannot tell them apart. pi drains them at different points: steering between
+ * tool batches, follow-ups only after the whole turn ends (agent-loop.js —
+ * `getSteeringMessages()` inside the `while (hasMoreToolCalls)` loop,
+ * `getFollowUpMessages()` after it). So an Alt+Enter follow-up leaves the flag
+ * true for the REST OF THE TURN, and yielding on every wait would leave the
+ * model unable to wait for anything until it stopped calling tools.
+ *
+ * But a plain once-per-episode latch is worse than none: pi runs a turn's tool
+ * batch in PARALLEL, so if the first call consumed the episode its siblings
+ * would sit out full-length waits — the batch could never end, so the very
+ * message that caused the yield would never be delivered.
+ *
+ * Hence a small BUDGET rather than a latch. A start-time rule ("siblings that
+ * were already underway may also yield") was tried and rejected: it assumes
+ * batch members start within milliseconds of each other, which held on an idle
+ * machine and failed under load — a sibling that started late was denied and
+ * sat out a full 20 s wait, reproducing the exact stall the rule existed to
+ * prevent. A counter has no timing assumption at all. Observing the flag clear
+ * refills the budget.
  */
 function steerSignal(
 	ctx: ExtensionCtx,
 	eventCtx: SteerHost,
 ): { signal: AbortSignal; dispose: () => void } | undefined {
-	if (!readRunbgSettings().steerYield) return undefined;
+	// Probed rather than assumed: `hasPendingMessages` has existed since pi
+	// 0.32.0 (renamed from `hasQueuedMessages`) so every supported host has it,
+	// but the rename is precisely why this stays defensive — and the test
+	// harnesses construct contexts by hand. Checked before the settings read,
+	// which touches disk.
 	const hasPending = eventCtx?.hasPendingMessages;
 	if (typeof hasPending !== "function") return undefined;
-	let already = false;
-	try {
-		already = hasPending.call(eventCtx) === true;
-	} catch {
-		return undefined; // host threw — treat as "no steering support"
-	}
+	const probe = (): boolean | undefined => {
+		try {
+			return hasPending.call(eventCtx) === true;
+		} catch {
+			return undefined; // host threw — treat as "no steering support"
+		}
+	};
+	const already = probe();
+	if (already === undefined) return undefined;
+	// Episode bookkeeping happens even when the setting is off, so toggling it
+	// on mid-turn cannot inherit a stale latch.
+	if (!already) ctx.steerYieldsLeft = STEER_YIELDS_PER_EPISODE;
+	if (!readRunbgSettings().steerYield) return undefined;
+	if (ctx.steerYieldsLeft <= 0) return undefined; // episode budget spent
 	const controller = new AbortController();
-	if (already) {
+	const fire = () => {
+		if (ctx.steerYieldsLeft > 0) ctx.steerYieldsLeft--;
 		controller.abort();
+	};
+	if (already) {
+		fire();
 		return { signal: controller.signal, dispose: () => {} };
 	}
+	// Not yet pending: watch for it. On a live host with the setting on this is
+	// the COMMON path, so the timer is unref'd and cleared on every exit.
 	const timer = setInterval(() => {
-		let pending = false;
-		try {
-			pending = hasPending.call(eventCtx) === true;
-		} catch {
-			clearInterval(timer);
+		const pending = probe();
+		if (pending === undefined) {
+			clearInterval(timer); // host started throwing; stop watching
 			return;
 		}
 		if (pending) {
 			clearInterval(timer);
-			controller.abort();
+			fire();
 		}
 	}, STEER_POLL_INTERVAL_MS);
 	timer.unref?.();
-	void ctx;
 	return { signal: controller.signal, dispose: () => clearInterval(timer) };
 }
 
@@ -1122,6 +1165,9 @@ async function runExecCommand(
 				extra: {
 					on_exit: args.on_exit,
 					...(wantsWake ? { completion_notification: "armed" as const } : {}),
+					// The attach can also be cut short by a waiting human. Without
+					// this the model cannot tell that from "the yield elapsed".
+					...(steer?.signal.aborted ? { wait_status: "yielded_for_user_message" as const } : {}),
 					tool_time_utc: nowUtcIso(),
 				},
 			});
@@ -1435,6 +1481,13 @@ async function runWriteStdin(
 			command: session.displayCommand,
 			yieldTimeMs,
 			extra: {
+				// Input writes take the lock non-preemptibly, so before steering
+				// existed this path could never end early and needed no status.
+				// It can now, and a silent early return on a write is exactly the
+				// "I waited, nothing happened" trap.
+				...(!isEmptyPoll && steer?.signal.aborted
+					? { wait_status: "yielded_for_user_message" as const }
+					: {}),
 				...(isEmptyPoll
 					? {
 							wait_mode: "relative" as const,
@@ -1557,8 +1610,15 @@ function terminalWaitExtra(
  * noisy process must not accumulate unbounded history in this call); the
  * session machinery keeps its bounded head/tail buffer, rolling UI tail, and
  * complete on-disk log.
- */
-async function runAbsoluteWait(
+  *
+ * NOT steer-aware (divergence #10 covers relative waits only). These are the
+ * longest waits in the system, so it is the mode where a human is most likely
+ * to be held hostage — but they are also explicitly heartbeat-free ("no 250 ms
+ * heartbeat for hours" below), and adding a poller for a multi-day wait would
+ * undo that. `yield_until` is already gated on the human having asked for a
+ * long attached wait, so they have opted into it; Esc still cancels the wait
+ * without killing the process. Revisit if that trade stops feeling right.
+ */async function runAbsoluteWait(
 	ctx: ExtensionCtx,
 	session: ExecSession,
 	yieldUntilRaw: string,
@@ -2022,6 +2082,7 @@ export default function (pi: ExtensionAPI) {
 		logSweepInFlight: false,
 		removedBuiltinBash: false,
 		warnedNearCap: false,
+		steerYieldsLeft: STEER_YIELDS_PER_EPISODE,
 		locks: new InteractionLocks(),
 		reaped: new Map(),
 	};
@@ -2185,7 +2246,7 @@ export default function (pi: ExtensionAPI) {
 		.join(" | ")} | status`;
 	pi.registerCommand("runbg", {
 		description:
-			"Configure runbg — on|off enables/disables the session tools (persisted; default off), replace-bash on|off removes/keeps pi's built-in bash, status shows the current state",
+			`Configure runbg — ${USAGE}. on|off enables/disables the session tools (persisted; default off); replace-bash removes/keeps pi's built-in bash; steer ends an attached wait as soon as you type; status shows the current state.`,
 		getArgumentCompletions: (prefix: string) => {
 			// pi replaces the ENTIRE argument text with the chosen `value`
 			// (CombinedAutocompleteProvider.applyCompletion substitutes the
@@ -2401,7 +2462,7 @@ export default function (pi: ExtensionAPI) {
 			"In tty sessions, submit lines with \\r (the Enter key) rather than \\n: POSIX terminals accept both, but Windows console programs only execute input on \\r.",
 			"To interrupt a running command, send chars \\x03 on its own (never via chars_b64, which is always literal bytes): in a pipes session that is delivered as a real SIGINT to the process group, and in a tty session the terminal turns it into Ctrl-C.",
 			'Poll one session at a time. Concurrent calls against the same session_id are serialized, so a progress poll may return early with wait_status "preempted" (and possibly no new output) when another call wants that session — that is not an error; poll again if you still need output.',
-			'wait_status "yielded_for_user_message" means the human typed while you were waiting, so the wait was cut short to hand control back. It is NOT a completed wait and NOT evidence the command finished or stalled — the process is still running untouched. Do not report the job as done, do not draw conclusions from the partial output, and do not treat it as a failed verification. Answer the human first, then poll the same session_id again if you still need the result.',
+			'wait_status "yielded_for_user_message" means the human has input queued, so the wait was cut short to hand control back. It is NOT a completed wait and NOT evidence the command finished or stalled — the process is still running untouched. Do not report the job as done, do not draw conclusions from the partial output, do not treat it as a failed verification. If their message is delivered to you, answer it first, then poll the same session_id again if you still need the result. If NO message appears, they queued it for delivery once you stop working — so wrap up and end the turn rather than starting another long wait; that is what delivers it.',
 			"For very noisy jobs, rely on the log_path and final/truncated output instead of repeatedly polling.",
 		],
 		parameters: Type.Object({
