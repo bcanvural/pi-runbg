@@ -379,3 +379,29 @@ describe("/runbg replace-bash setting (divergence #1 without the startup flag)",
 		await h.shutdown();
 	});
 });
+
+describe("steer coverage disclosure", () => {
+	it("says so when steer is enabled but pi's bash can still block", async () => {
+		writeFileSync(SETTINGS, JSON.stringify({ enabled: true, steerYield: false }));
+		const h = makeHarness(["bash", "read", ...RUNBG_TOOLS]);
+		await h.emit("session_start");
+		await h.invokeCommand("runbg", "steer on");
+		const msg = h.notifications.at(-1)!.message;
+		assert.ok(msg.includes("steer on"), msg);
+		assert.ok(msg.includes("bash"), `must disclose the gap while bash is active: ${msg}`);
+		assert.ok(msg.includes("replace-bash on"), `must point at the fix: ${msg}`);
+		await h.shutdown();
+	});
+
+	it("stays quiet about bash when there is no bash to route around", async () => {
+		writeFileSync(SETTINGS, JSON.stringify({ enabled: true, replaceBuiltinBash: true, steerYield: false }));
+		const h = makeHarness(["bash", "read", ...RUNBG_TOOLS]);
+		await h.emit("session_start");
+		assert.ok(!h.activeTools().includes("bash"), "precondition: replace-bash removed it");
+		await h.invokeCommand("runbg", "steer on");
+		const msg = h.notifications.at(-1)!.message;
+		assert.ok(msg.includes("steer on"), msg);
+		assert.ok(!msg.includes("replace-bash on"), `no gap to disclose, so no nag: ${msg}`);
+		await h.shutdown();
+	});
+});

@@ -112,6 +112,21 @@ its names.
   meanings. Guidelines still elaborate for the default-prompt case; the
   contract no longer depends on them. Raised by an agent that had been driving
   the tools and reviewed the surface as a consumer.
+- **Steering's coverage limit is now stated on both sides.** Steering only
+  covers waits runbg owns; a `bash` call blocks until its command finishes and
+  we cannot intervene. So `exec_command`'s description tells the model to
+  prefer it over `bash` for anything that might run long (phrased "if a
+  separate `bash` tool is also available", so it stays true either way — we
+  cannot re-register a description, `refreshTools` is not exposed to
+  extensions, and a build-time conditional would go stale on the next toggle),
+  and `/runbg steer on` says plainly when it cannot deliver in full: *"pi's
+  built-in `bash` is still active, and commands the model routes through it
+  still block — /runbg replace-bash on for full coverage"*. Merging the two
+  settings was considered and rejected: `steer` defaults on, and coupling it
+  would silently remove `bash` — which would disable any user-side `bash`
+  guard (e.g. a dangerous-command filter matching `isToolCallEventType("bash",
+  …)`) without saying a word. That is the failure divergence #1 exists to
+  prevent.
 - **`wait_status: "cancelled"` is documented to the model.** It means the human
   interrupted the *wait*, not the process — and since `yield_until` is
   deliberately not steer-aware, it is the normal way to break out of an

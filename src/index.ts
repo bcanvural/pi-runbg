@@ -466,6 +466,8 @@ interface SettingNoticeInfo {
 	 * and the latch could not deliver it (see BASH_NOT_RESTORED_NOTE).
 	 */
 	bashRestorePending: boolean;
+	/** pi's built-in `bash` is active after this write — steering cannot cover it. */
+	bashActive: boolean;
 }
 
 /**
@@ -602,12 +604,20 @@ const STEER_SETTING: BooleanSetting = {
 	offHint: "Keep waiting for the full yield_time_ms even while a message is queued",
 	notice: (value, info) => {
 		if (value) {
-			return {
-				message: info.already
-					? "runbg: steer already on — tool state re-applied for this session"
-					: "runbg: steer on (persists) — attached waits end as soon as you type; the process keeps running",
-				type: "info",
-			};
+			const base = info.already
+				? "runbg: steer already on — tool state re-applied for this session"
+				: "runbg: steer on (persists) — attached waits end as soon as you type; the process keeps running";
+			// Honest about the half it cannot deliver: steering only covers waits
+			// runbg owns, and pi's `bash` blocks until its command finishes with no
+			// way for us to intervene. Better said out loud than discovered while
+			// waiting out a two-minute build.
+			if (info.bashActive) {
+				return {
+					message: `${base}. Note: pi's built-in \`bash\` is still active, and commands the model routes through it still block — /runbg replace-bash on for full coverage`,
+					type: "info",
+				};
+			}
+			return { message: base, type: "info" };
 		}
 		return {
 			message: info.already
@@ -2312,6 +2322,7 @@ export default function (pi: ExtensionAPI) {
 						wasReplacing &&
 						!(after.enabled && replaceAfter.effective) &&
 						!pi.getActiveTools().includes("bash"),
+					bashActive: pi.getActiveTools().includes("bash"),
 				});
 				notify(message, type);
 			};
@@ -2414,7 +2425,7 @@ export default function (pi: ExtensionAPI) {
 - Finishes within ~5 min → ONE exec_command with yield_time_ms covering it (max ${MAX_YIELD_TIME_MS} ms). Do not split into a short yield plus a poll.
 - Longer or unknown → exec_command, then on_exit: "wake", then END THE TURN. The result is delivered on completion.
 - Interactive (REPL, ssh, sudo) → exec_command with a short yield, then drive it with write_stdin.
-Returns \`session_id\` if still running or \`exit_code\` if it finished within yield_time_ms. NEVER background inside cmd (\`&\`, \`nohup\`): the session already is the background. NEVER arm on_exit: "wake" for a process that does not exit on its own (dev servers, watchers) — it can only fail to fire. Use set_on_exit to disarm or re-arm a running session.`,
+Returns \`session_id\` if still running or \`exit_code\` if it finished within yield_time_ms. If a separate \`bash\` tool is also available, prefer exec_command for anything that MIGHT run long: only a session yields a handle, so only it can hand control back while the command keeps running — a bash call of the same length blocks until it finishes. Use bash only for commands that are certainly fast. NEVER background inside cmd (\`&\`, \`nohup\`): the session already is the background. NEVER arm on_exit: "wake" for a process that does not exit on its own (dev servers, watchers) — it can only fail to fire. Use set_on_exit to disarm or re-arm a running session.`,
 		promptSnippet: "Run a shell command; long-running ones yield a session_id",
 		promptGuidelines: [
 			"Prefer dedicated file tools when available (read/grep/find/ls). Otherwise use exec_command with fast shell tools: rg for content search, fd if available (or find) for file names, and ls for directories.",
