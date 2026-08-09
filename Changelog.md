@@ -98,6 +98,13 @@ its names.
 
 ### Added
 
+- **`write_stdin` guidance teaches the resumable log read** (IV-0003's v0):
+  `output_bytes_total` equals the log file's byte length while the log is
+  untruncated, so output that has left the buffer can be fetched by range
+  (`tail -c +<N+1> "$log_path"`) instead of re-reading the whole file — with
+  the caveat that `tty: true` logs carry raw terminal control bytes and should
+  be filtered, not dumped. Interim measure; the sanitized ranged-read tool
+  remains scoped in `docs/IV-0003-log-cursor-reads.md`.
 - **Scoped (not built): cursor reads of the session log** —
   `docs/IV-0003-log-cursor-reads.md`. Live polling is already delta-based (the
   buffer is the cursor), but historical output — beyond the 1 MiB retention,
