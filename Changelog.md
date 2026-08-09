@@ -98,6 +98,20 @@ its names.
 
 ### Added
 
+- **Scoped (not built): cursor reads of the session log** —
+  `docs/IV-0003-log-cursor-reads.md`. Live polling is already delta-based (the
+  buffer is the cursor), but historical output — beyond the 1 MiB retention,
+  across turns, after a wake or reap — has no ranged reader: the omission
+  marker points at `log_path`, where the only options are whole-file or a raw
+  shell read that bypasses IV-0002's sanitization. The scope pins the decisive
+  choices: key by validated `log_path` (session ids reset across pi runs while
+  logs persist 7 days, so id-addressing can silently hit the wrong process's
+  log), never a blocking `follow` (waiting stays in `write_stdin`, where the
+  steering integration lives), raw-byte cursor arithmetic with UTF-8 boundary
+  adjustment, and the `PI_RUNBG_MAX_LOG_BYTES` offset-drift caveat. Costed at
+  ~150–220 schema tokens per request forever, which is the honest argument
+  against; recommendation is guidance-line now, tool when the retention wall
+  is actually hit.
 - **The core wait contract moved into the tool `description`s, where it
   actually survives.** pi's system-prompt builder returns early on the
   custom-prompt branch (`system-prompt.js`: `if (customPrompt) { … return
