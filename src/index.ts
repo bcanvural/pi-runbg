@@ -2403,7 +2403,18 @@ export default function (pi: ExtensionAPI) {
 		name: "exec_command",
 		label: "exec_command",
 		description:
-			'Run a command in a persistent session. Returns `session_id` if still running (drive with write_stdin) or `exit_code` if it finished within yield_time_ms. on_exit defaults to "none". Pass on_exit: "wake" for a long job that terminates, to have its result delivered on completion instead of blocking a turn; never for processes that do not exit on their own. Use set_on_exit to disarm or re-arm a running session.',
+			// The decision table leads the DESCRIPTION, not the guidelines, on
+			// purpose. pi's system-prompt builder returns early on the
+			// custom-prompt branch (`if (customPrompt) { … return prompt; }`),
+			// so `promptGuidelines` are silently dropped by every replace-mode
+			// sysprompt template — a very common setup. Descriptions ship with
+			// the tool schema and always arrive, so the core contract lives here
+			// and the guidelines elaborate.
+			`Run a command in a persistent session. Choose the wait mode FIRST:
+- Finishes within ~5 min → ONE exec_command with yield_time_ms covering it (max ${MAX_YIELD_TIME_MS} ms). Do not split into a short yield plus a poll.
+- Longer or unknown → exec_command, then on_exit: "wake", then END THE TURN. The result is delivered on completion.
+- Interactive (REPL, ssh, sudo) → exec_command with a short yield, then drive it with write_stdin.
+Returns \`session_id\` if still running or \`exit_code\` if it finished within yield_time_ms. NEVER background inside cmd (\`&\`, \`nohup\`): the session already is the background. NEVER arm on_exit: "wake" for a process that does not exit on its own (dev servers, watchers) — it can only fail to fire. Use set_on_exit to disarm or re-arm a running session.`,
 		promptSnippet: "Run a shell command; long-running ones yield a session_id",
 		promptGuidelines: [
 			"Prefer dedicated file tools when available (read/grep/find/ls). Otherwise use exec_command with fast shell tools: rg for content search, fd if available (or find) for file names, and ls for directories.",
@@ -2464,7 +2475,7 @@ export default function (pi: ExtensionAPI) {
 		name: "write_stdin",
 		label: "write_stdin",
 		description:
-			"Write bytes to a running session. Omit both chars and chars_b64 to poll without writing. Use `chars` for text with C-style escapes (e.g. \\x1b ESC, \\n newline); use `chars_b64` for raw binary. Interrupt: send chars \\x03 alone — in a tty session the terminal turns it into Ctrl-C, and in a pipes session (tty: false) runbg delivers a real SIGINT to the process group. chars_b64 is always literal bytes and never an interrupt, so use chars for Ctrl-C. For empty polls, wait with yield_time_ms (relative, max 290 s) or yield_until (absolute UTC deadline — only when the human explicitly asks for a long attached wait).",
+			"Write bytes to a running session. Omit both chars and chars_b64 to poll without writing. Use `chars` for text with C-style escapes (e.g. \\x1b ESC, \\n newline); use `chars_b64` for raw binary. Interrupt: send chars \\x03 alone — in a tty session the terminal turns it into Ctrl-C, and in a pipes session (tty: false) runbg delivers a real SIGINT to the process group. chars_b64 is always literal bytes and never an interrupt, so use chars for Ctrl-C. For empty polls, wait with yield_time_ms (relative, max 290 s) or yield_until (absolute UTC deadline — only when the human explicitly asks for a long attached wait). A wait that ends early NEVER means the process died: wait_status \"cancelled\" (the human interrupted the wait — the usual way to break out of a yield_until), \"yielded_for_user_message\" (they have input queued) and \"preempted\" (another call wants this session) all leave the process running untouched. Do not kill, restart, or report failure on any of them — poll again.",
 		promptSnippet: "Send input to or poll a running session",
 		promptGuidelines: [
 			`Use yield_time_ms for interaction or an empty progress poll of at most 290 seconds (${DEFAULT_MAX_BACKGROUND_POLL_MS} ms, cache-friendly). Larger values are rejected, not clamped. Repeat polls as needed instead of bypassing the cap.`,
@@ -2474,6 +2485,7 @@ export default function (pi: ExtensionAPI) {
 			"In tty sessions, submit lines with \\r (the Enter key) rather than \\n: POSIX terminals accept both, but Windows console programs only execute input on \\r.",
 			"To interrupt a running command, send chars \\x03 on its own (never via chars_b64, which is always literal bytes): in a pipes session that is delivered as a real SIGINT to the process group, and in a tty session the terminal turns it into Ctrl-C.",
 			'Poll one session at a time. Concurrent calls against the same session_id are serialized, so a progress poll may return early with wait_status "preempted" (and possibly no new output) when another call wants that session — that is not an error; poll again if you still need output.',
+			'wait_status "cancelled" means the human interrupted the WAIT, not the process — it is how they break out of a yield_until, which is deliberately not steer-aware. The session is untouched and still running: do not kill or restart anything, just poll again when appropriate.',
 			'wait_status "yielded_for_user_message" means the human has input queued, so the wait was cut short to hand control back. It is NOT a completed wait and NOT evidence the command finished or stalled — the process is still running untouched. Do not report the job as done, do not draw conclusions from the partial output, do not treat it as a failed verification. If their message is delivered to you, answer it first, then poll the same session_id again if you still need the result. If NO message appears, they queued it for delivery once you stop working — so wrap up and end the turn rather than starting another long wait; that is what delivers it.',
 			"For very noisy jobs, rely on the log_path and final/truncated output instead of repeatedly polling.",
 		],

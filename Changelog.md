@@ -98,6 +98,27 @@ its names.
 
 ### Added
 
+- **The core wait contract moved into the tool `description`s, where it
+  actually survives.** pi's system-prompt builder returns early on the
+  custom-prompt branch (`system-prompt.js`: `if (customPrompt) { … return
+  prompt; }`) — it never reaches `toolSnippets` or `promptGuidelines`. So
+  **every replace-mode sysprompt template silently drops all of them**, which
+  is a very common setup and exactly the one this extension is meant to pair
+  with. Roughly 1,040 tokens of carefully-written `exec_command` guidance was
+  invisible in that configuration. `exec_command`'s description now leads with
+  a three-line decision table (≤5 min → one call; longer/unknown → `wake` and
+  end the turn; interactive → short yield then `write_stdin`) plus the two
+  hard NEVERs, and `write_stdin`'s description now carries the wait_status
+  meanings. Guidelines still elaborate for the default-prompt case; the
+  contract no longer depends on them. Raised by an agent that had been driving
+  the tools and reviewed the surface as a consumer.
+- **`wait_status: "cancelled"` is documented to the model.** It means the human
+  interrupted the *wait*, not the process — and since `yield_until` is
+  deliberately not steer-aware, it is the normal way to break out of an
+  absolute wait. Undocumented, a model could read "cancelled" as "the process
+  was killed" and go restart something that never stopped. All three early-exit
+  statuses (`cancelled`, `yielded_for_user_message`, `preempted`) now say
+  plainly that the process is untouched and the correct move is to poll again.
 - **`/runbg steer on|off` (default on): an attached wait now ends as soon as
   you type** (divergence #10). pi delivers a steering message only after every
   tool call in the batch finishes, so a long attached wait held the human's
