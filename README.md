@@ -1,11 +1,16 @@
 # pi-runbg
 
-A pi extension for long-lived background sessions, porting codex's
-`unified_exec` session model: every command becomes a session the LLM drives
-with writes and polls, instead of a single blocking call the agent waits on.
+A pi extension for long-lived background sessions: every command becomes a
+session the LLM drives with writes and polls, instead of a single blocking
+call the agent waits on.
 
-Mirrors codex's `exec_command` + `write_stdin` tool surface, with small
-pi-flavor additions (`set_on_exit`, `kill_session`, `list_sessions`).
+It started as a port of codex's `unified_exec` model and still shares its
+tool names and schemas (`exec_command`, `write_stdin`, plus `set_on_exit`,
+`kill_session`, `list_sessions`), so prompts written for that surface work
+here. It is no longer a straight port: where codex's choices did not survive
+contact with pi — or with a human sitting in front of it — this diverges on
+purpose, and says so. Every deviation is recorded with its reasoning in
+[UPSTREAM.md](./UPSTREAM.md).
 
 > [!IMPORTANT]
 > **Fork notice:** this is a fork of
@@ -13,10 +18,10 @@ pi-flavor additions (`set_on_exit`, `kill_session`, `list_sessions`).
 > (MIT, by Ren Wang — closed to external contributions, forks invited).
 > Tool names, schemas, and constants are preserved verbatim; the package,
 > env vars, log prefix, and slash command are renamed to `runbg`.
-> Deliberate behavior divergences are documented in
+> Divergences are deliberate and documented in
 > [UPSTREAM.md](./UPSTREAM.md) — the headline one: **pi's built-in `bash`
 > tool is kept by default** (upstream removes it); `/runbg replace-bash on`
-> opts into upstream's codex-parity behavior.
+> opts into the codex-parity behavior.
 > Design rationale lives in [docs/design.md](./docs/design.md).
 > Do not install this alongside `pi-unified-exec` — both register the same
 > tool names.
@@ -37,6 +42,17 @@ pi-flavor additions (`set_on_exit`, `kill_session`, `list_sessions`).
   absolute UTC deadline (no default max horizon; multi-day waits re-arm
   timers safely). A long-running process keeps running; the agent just gets
   control back with a `session_id` and can poll again when it chooses.
+- **Waits get out of your way (divergence #10).** pi hands a steering message
+  to the model only after every tool call in the batch finishes, so a long
+  attached wait would make you wait it out to be heard — and with plain
+  `bash` the only escape is Esc, which kills the command. Here, typing ends
+  the wait within ~250 ms: the result comes back tagged
+  `wait_status: yielded_for_user_message`, your message is handled next, and
+  **the process keeps running untouched**. That is safe only because the
+  session owns the process — the wait stops, the work does not. `/runbg steer
+  off` to disable. Note this covers commands that run through runbg; a `bash`
+  call still blocks, which is a further argument for `/runbg replace-bash on`
+  if you care about staying in control.
 - **Completion can resume the agent (opt-in).** `exec_command(on_exit: "wake")`
   (default is `"none"`) delivers exactly one follow-up model prompt (bounded
   exit metadata, no raw output) when a backgrounded process exits while
@@ -70,8 +86,9 @@ Codex's alternative: every call opens a session, yields after a bounded
 drives the session on later turns via `write_stdin(session_id, chars, …)`. A
 PTY is available for interactive programs (Python REPL, ssh, sudo, TUIs).
 
-This extension is a faithful port of that design, with codex's constants
-preserved.
+That model is the starting point here. The constants and tool surface are
+kept where they still earn their place, and changed where they do not — see
+[UPSTREAM.md](./UPSTREAM.md) for what moved and why.
 
 ## Install
 

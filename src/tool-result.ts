@@ -64,7 +64,8 @@ export interface ProcessResultDetails extends OutputResultDetails {
 		| "relative_deadline_reached"
 		| "absolute_deadline_reached"
 		| "cancelled"
-		| "preempted";
+		| "preempted"
+		| "yielded_for_user_message";
 	yield_until?: string;
 	effective_wait_ms?: number;
 	on_exit?: OnExitPolicy;

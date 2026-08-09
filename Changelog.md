@@ -96,6 +96,38 @@ its names.
   fire-and-forget child outlives pi depends on whether its session was
   already reaped at shutdown — i.e. on the same shell-syntax accident.
 
+### Added
+
+- **`/runbg steer on|off` (default on): an attached wait now ends as soon as
+  you type** (divergence #10). pi delivers a steering message only after every
+  tool call in the batch finishes, so a long attached wait held the human's
+  message hostage — and with plain `bash` the only escape is Esc, which kills
+  the command outright. A queued message now ends the wait within ~250 ms; the
+  result comes back as `wait_status: "yielded_for_user_message"` and **the
+  process keeps running untouched**.
+  - **It is a preemption, not a cancellation.** The signal is merged into
+    `preemptAbort`, so the wait drains buffered output and only then stops.
+    Wiring it as a cancellation instead would silently discard a finished
+    job's final output — the exact N1 bug fixed earlier in this release, in a
+    new disguise. Pinned by a test.
+  - **The result wording is load-bearing.** The failure mode is a model
+    reading an early return as "I waited, nothing happened, so it is done".
+    The guideline now states that this is not a completed wait, not evidence
+    the command finished, and not a failed verification — answer the human,
+    then poll again.
+  - Probes `ExtensionContext.hasPendingMessages()` defensively (it postdates
+    our 0.80.5 peer floor); an older host simply never yields early. The
+    poller is unref'd and disposed at every lock-release site.
+  - Guidance also now routes anything that *might* run long through
+    `exec_command` even when pi's `bash` is present, since only a session can
+    hand control back mid-wait. This makes steer-safety total rather than
+    dependent on which tool the model happened to pick — the most practical
+    argument yet for `/runbg replace-bash on`.
+  - This is a **workaround for a host-level gap**, recorded as such: the
+    complete fix belongs in pi, deferring pending tool calls batch-wide for
+    every tool rather than these five. Modelled on oh-my-pi, which skips the
+    pending call outright.
+
 ### Fixed
 
 - **PTY mode works again on current Node.** The optional

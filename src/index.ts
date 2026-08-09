@@ -415,6 +415,8 @@ interface RunbgSettings {
 	enabled: boolean;
 	/** Divergence #1: remove pi's built-in `bash` while runbg is enabled. */
 	replaceBuiltinBash: boolean;
+	/** Divergence #10: end an attached wait early when the human has typed. */
+	steerYield: boolean;
 	[key: string]: unknown;
 }
 
@@ -429,12 +431,22 @@ export function readRunbgSettings(): RunbgSettings {
 		const raw: unknown = JSON.parse(readFileSync(runbgSettingsPath(), "utf8"));
 		if (raw && typeof raw === "object" && !Array.isArray(raw)) {
 			const obj = raw as Record<string, unknown>;
-			return { ...obj, enabled: obj.enabled === true, replaceBuiltinBash: obj.replaceBuiltinBash === true };
+			return {
+				...obj,
+				enabled: obj.enabled === true,
+				replaceBuiltinBash: obj.replaceBuiltinBash === true,
+				// Default TRUE, so normalized with `!== false` rather than the
+				// `=== true` used above. The safe default differs by setting:
+				// for tool removal it is "off" (never leave pi shell-less); for
+				// yielding to a waiting human it is "on" (never make someone
+				// wait out a 290 s attach to be heard).
+				steerYield: obj.steerYield !== false,
+			};
 		}
 	} catch {
 		// missing or corrupt file → defaults
 	}
-	return { enabled: false, replaceBuiltinBash: false };
+	return { enabled: false, replaceBuiltinBash: false, steerYield: true };
 }
 
 /** State a setting's toast may report on, beyond the value being written. */
@@ -471,7 +483,7 @@ interface BooleanSetting {
 	/** Extra accepted spellings; never offered in completions. */
 	aliases: readonly string[];
 	/** Key in runbg.json. */
-	key: "enabled" | "replaceBuiltinBash";
+	key: "enabled" | "replaceBuiltinBash" | "steerYield";
 	/** Offer `<name> on|off` in argument completions. */
 	offerCompletions: boolean;
 	onHint: string;
@@ -570,7 +582,42 @@ const REPLACE_BASH_SETTING: BooleanSetting = {
 	},
 };
 
-const BOOLEAN_SETTINGS: readonly BooleanSetting[] = [ENABLED_SETTING, REPLACE_BASH_SETTING];
+/**
+ * Divergence #10: end an attached wait as soon as the human has typed.
+ *
+ * pi delivers a steering message only after every tool call in the batch has
+ * finished, so a long attached wait makes the human wait it out to be heard —
+ * with `bash` the only alternative is Esc, which kills the command. Ending the
+ * wait is safe here precisely because the session owns the process: the wait
+ * stops, the work does not. Modelled on oh-my-pi, which skips a pending tool
+ * call outright when a user message is queued.
+ */
+const STEER_SETTING: BooleanSetting = {
+	name: "steer",
+	aliases: ["steer-yield"],
+	key: "steerYield",
+	offerCompletions: true,
+	onHint: "End an attached wait early when you type, so long waits never delay your message (default)",
+	offHint: "Keep waiting for the full yield_time_ms even while a message is queued",
+	notice: (value, info) => {
+		if (value) {
+			return {
+				message: info.already
+					? "runbg: steer already on — tool state re-applied for this session"
+					: "runbg: steer on (persists) — attached waits end as soon as you type; the process keeps running",
+				type: "info",
+			};
+		}
+		return {
+			message: info.already
+				? "runbg: steer already off — tool state re-applied for this session"
+				: "runbg: steer off (persists) — a long attached wait will now hold your message until it finishes",
+			type: "info",
+		};
+	},
+};
+
+const BOOLEAN_SETTINGS: readonly BooleanSetting[] = [ENABLED_SETTING, REPLACE_BASH_SETTING, STEER_SETTING];
 
 function findBooleanSetting(word: string): BooleanSetting | undefined {
 	return BOOLEAN_SETTINGS.find((setting) => setting.name === word || setting.aliases.includes(word));
@@ -671,6 +718,60 @@ function applySessionToolPolicy(ctx: ExtensionCtx, pi: ExtensionAPI): void {
 	}
 }
 
+/** Host capability probe for steering (divergence #10); undefined on older pi. */
+type SteerHost = { hasPendingMessages?: () => boolean } | undefined;
+
+/** How often an attached wait checks whether the human has queued a message. */
+const STEER_POLL_INTERVAL_MS = 250;
+
+/**
+ * Abort signal that fires once the human has a message queued (divergence #10).
+ *
+ * Semantically a PREEMPTION, not a cancellation: the caller merges it into
+ * `preemptAbort` so the wait drains what is already buffered and only then
+ * stops. Cancelling instead would discard that output (see collect.ts).
+ *
+ * `hasPendingMessages` landed after our 0.80.5 peer floor and is absent in the
+ * test harnesses, so it is probed defensively — an older host simply never
+ * yields early. Returns undefined when there is nothing to watch, so the
+ * common path allocates no timer.
+ */
+function steerSignal(
+	ctx: ExtensionCtx,
+	eventCtx: SteerHost,
+): { signal: AbortSignal; dispose: () => void } | undefined {
+	if (!readRunbgSettings().steerYield) return undefined;
+	const hasPending = eventCtx?.hasPendingMessages;
+	if (typeof hasPending !== "function") return undefined;
+	let already = false;
+	try {
+		already = hasPending.call(eventCtx) === true;
+	} catch {
+		return undefined; // host threw — treat as "no steering support"
+	}
+	const controller = new AbortController();
+	if (already) {
+		controller.abort();
+		return { signal: controller.signal, dispose: () => {} };
+	}
+	const timer = setInterval(() => {
+		let pending = false;
+		try {
+			pending = hasPending.call(eventCtx) === true;
+		} catch {
+			clearInterval(timer);
+			return;
+		}
+		if (pending) {
+			clearInterval(timer);
+			controller.abort();
+		}
+	}, STEER_POLL_INTERVAL_MS);
+	timer.unref?.();
+	void ctx;
+	return { signal: controller.signal, dispose: () => clearInterval(timer) };
+}
+
 type ExecCommandArgs = {
 	cmd: string;
 	workdir?: string;
@@ -747,6 +848,7 @@ async function runExecCommand(
 	signal: AbortSignal | undefined,
 	onUpdate: ((partial: { content: [{ type: "text"; text: string }]; details: unknown }) => void) | undefined,
 	cwd: string,
+	eventCtx: SteerHost,
 ): Promise<ResponseShape> {
 	const finalizeResponse = (input: FinalizeInput): ResponseShape =>
 		finalizeProcessResult({ ...input, operation: "exec_command" });
@@ -969,7 +1071,13 @@ async function runExecCommand(
 		// cancelled call must not drain (its result may be discarded), while a
 		// preempted call's result IS delivered and must drain first. Streaming
 		// stops on either, so the UI signal is still the merged one.
-		const initialPreempt = initialHandle?.preempt;
+		// A queued user message ends the attach the same way a competing
+		// interaction does: drain, then stop. The process is untouched.
+		const steer = steerSignal(ctx, eventCtx);
+		const initialPreempt =
+			initialHandle?.preempt && steer
+				? AbortSignal.any([initialHandle.preempt, steer.signal])
+				: (initialHandle?.preempt ?? steer?.signal);
 		const streamAbort =
 			signal && initialPreempt ? AbortSignal.any([signal, initialPreempt]) : (initialPreempt ?? signal);
 		const pollStream = startStreaming(session, onUpdate, deadlineMs, streamAbort);
@@ -983,6 +1091,7 @@ async function runExecCommand(
 		} finally {
 			initialHandle?.release();
 			pollStream.stop();
+			steer?.dispose();
 		}
 
 		session.touch();
@@ -1068,6 +1177,7 @@ async function runWriteStdin(
 	signal: AbortSignal | undefined,
 	onUpdate: ((partial: { content: [{ type: "text"; text: string }]; details: unknown }) => void) | undefined,
 	toolCallId: string,
+	eventCtx: SteerHost,
 ): Promise<ResponseShape> {
 	const finalizeResponse = (input: FinalizeInput): ResponseShape =>
 		finalizeProcessResult({ ...input, operation: "write_stdin" });
@@ -1145,7 +1255,11 @@ async function runWriteStdin(
 	// The drain must end on the caller's cancellation OR on preemption.
 	// Streaming stops on cancellation OR preemption; the DRAIN keeps them
 	// separate (see collect.ts) so a preempted poll still returns its bytes.
-	const streamAbort = signal ? AbortSignal.any([signal, handle.preempt]) : handle.preempt;
+	// A queued user message joins the preempt side for the same reason: drain
+	// first, then stop (divergence #10).
+	const steer = steerSignal(ctx, eventCtx);
+	const waitPreempt = steer ? AbortSignal.any([handle.preempt, steer.signal]) : handle.preempt;
+	const streamAbort = signal ? AbortSignal.any([signal, waitPreempt]) : waitPreempt;
 	try {
 		let writeFailure: string | null = null;
 		// Divergence #8 / codex parity: in a PTY the terminal line discipline
@@ -1171,7 +1285,7 @@ async function runWriteStdin(
 			const collected = await session.collect({
 				deadlineMs: start + yieldTimeMs,
 				externalAbort: signal,
-				preemptAbort: handle.preempt,
+				preemptAbort: waitPreempt,
 			});
 			const wallSec = (Date.now() - start) / 1000;
 			if (session.hasExited) {
@@ -1230,7 +1344,7 @@ async function runWriteStdin(
 				const collected = await session.collect({
 					deadlineMs: Date.now() + 50,
 					externalAbort: signal,
-					preemptAbort: handle.preempt,
+					preemptAbort: waitPreempt,
 				});
 				const armed = ctx.coordinator.isArmed(session.id);
 				removeSession(ctx, session.id);
@@ -1267,7 +1381,7 @@ async function runWriteStdin(
 		// already-failed tool call until the deadline (up to 290 s of them).
 		let collected: CollectResult;
 		try {
-			collected = await session.collect({ deadlineMs, externalAbort: signal, preemptAbort: handle.preempt });
+			collected = await session.collect({ deadlineMs, externalAbort: signal, preemptAbort: waitPreempt });
 		} finally {
 			pollStream.stop();
 		}
@@ -1328,11 +1442,16 @@ async function runWriteStdin(
 							// this call — another interaction wanted the session, so this
 							// poll returned early WITH its drained output. The model may
 							// simply poll again.
+							// Steering is reported distinctly from "preempted": the
+							// model must not read it as "the wait completed and
+							// nothing happened" and conclude the job is done.
 							wait_status: signal?.aborted
 								? ("cancelled" as const)
-								: handle.preempted
-									? ("preempted" as const)
-									: ("relative_deadline_reached" as const),
+								: steer?.signal.aborted
+									? ("yielded_for_user_message" as const)
+									: handle.preempted
+										? ("preempted" as const)
+										: ("relative_deadline_reached" as const),
 						}
 					: {}),
 				tool_time_utc: nowUtcIso(),
@@ -1345,6 +1464,7 @@ async function runWriteStdin(
 		throw err;
 	} finally {
 		handle.release();
+		steer?.dispose();
 	}
 }
 
@@ -2214,6 +2334,7 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet: "Run a shell command; long-running ones yield a session_id",
 		promptGuidelines: [
 			"Prefer dedicated file tools when available (read/grep/find/ls). Otherwise use exec_command with fast shell tools: rg for content search, fd if available (or find) for file names, and ls for directories.",
+			"When pi\'s built-in `bash` is also available, still route anything that MIGHT run long through exec_command — builds, test suites, installs, migrations, deploys, anything network-bound. Only exec_command yields a session, so only it can hand control back mid-wait when the human types; a bash call of the same length makes them wait it out or press Esc, which kills the command outright. Reach for bash only for commands that are certainly fast.",
 			`Choose how you will wait BEFORE starting, from the job's expected duration. Expected to finish within ~5 minutes: ONE exec_command whose yield_time_ms covers it (~500ms for quick one-shots, ${DEFAULT_EXEC_YIELD_MS} ms default, up to ${MAX_YIELD_TIME_MS} ms) — do not split this into a short yield plus a poll, which costs an extra turn for the same wait. Longer than that, or unknown: start it, then set on_exit: "wake" and END THE TURN — the result is delivered to you automatically when it finishes, which beats holding the turn or hoping someone checks back. Interactive processes (REPLs, ssh, sudo) always return a session_id you then drive with write_stdin. Never end a turn with a live session you have not named to the human, and kill_session anything you have stopped caring about — abandoned sessions still count toward the session cap.`,
 			"Do not background inside cmd (`&`, `nohup`, `disown`) — the session IS the background: run the long process as cmd itself and poll it with write_stdin. A backgrounded child is not tracked by its session; if it inherits the session's output pipe, the session keeps reporting [still running] long after your cmd finished, and kill_session ends it anyway (SIGTERM goes to the whole process group, which nohup does not survive). Use setsid only when the human explicitly wants a process to outlive pi.",
 			"Compose multi-step waits in the shell, not across tool calls — the shell is your scripting layer, so anything needing no model judgment between steps belongs in one command. `until curl -sf URL; do sleep 2; done && npm test 2>&1 | tail -40` is a single call; polling, checking, then running is five or six. Prefer waiting on a CONDITION over sleeping a fixed duration: it returns the instant the condition holds instead of after a guess, and a bare sleep whose only purpose is to pass time gives you a session with nothing to observe.",
@@ -2255,7 +2376,7 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(_toolCallId, params, signal, onUpdate, eventCtx) {
 			ctx.ui ??= eventCtx.ui;
-			const shape = await runExecCommand(ctx, params as ExecCommandArgs, signal, onUpdate as any, eventCtx.cwd);
+			const shape = await runExecCommand(ctx, params as ExecCommandArgs, signal, onUpdate as any, eventCtx.cwd, eventCtx);
 			updateRunningSessionsUi(ctx);
 			return {
 				content: [{ type: "text", text: renderProcessResultText(shape) }],
@@ -2280,6 +2401,7 @@ export default function (pi: ExtensionAPI) {
 			"In tty sessions, submit lines with \\r (the Enter key) rather than \\n: POSIX terminals accept both, but Windows console programs only execute input on \\r.",
 			"To interrupt a running command, send chars \\x03 on its own (never via chars_b64, which is always literal bytes): in a pipes session that is delivered as a real SIGINT to the process group, and in a tty session the terminal turns it into Ctrl-C.",
 			'Poll one session at a time. Concurrent calls against the same session_id are serialized, so a progress poll may return early with wait_status "preempted" (and possibly no new output) when another call wants that session — that is not an error; poll again if you still need output.',
+			'wait_status "yielded_for_user_message" means the human typed while you were waiting, so the wait was cut short to hand control back. It is NOT a completed wait and NOT evidence the command finished or stalled — the process is still running untouched. Do not report the job as done, do not draw conclusions from the partial output, and do not treat it as a failed verification. Answer the human first, then poll the same session_id again if you still need the result.',
 			"For very noisy jobs, rely on the log_path and final/truncated output instead of repeatedly polling.",
 		],
 		parameters: Type.Object({
@@ -2309,7 +2431,7 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(toolCallId, params, signal, onUpdate, eventCtx) {
 			ctx.ui ??= eventCtx.ui;
-			const shape = await runWriteStdin(ctx, params as WriteStdinArgs, signal, onUpdate as any, toolCallId);
+			const shape = await runWriteStdin(ctx, params as WriteStdinArgs, signal, onUpdate as any, toolCallId, eventCtx);
 			updateRunningSessionsUi(ctx);
 			return {
 				content: [{ type: "text", text: renderProcessResultText(shape) }],

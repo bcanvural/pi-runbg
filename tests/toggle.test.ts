@@ -214,7 +214,7 @@ describe("/runbg settings command", () => {
 		const complete = h.commands.runbg.getArgumentCompletions!;
 		assert.deepEqual(
 			complete("").map((i: any) => i.value),
-			["on", "off", "status", "replace-bash on", "replace-bash off"],
+			["on", "off", "status", "replace-bash on", "replace-bash off", "steer on", "steer off"],
 		);
 		assert.deepEqual(
 			complete("o").map((i: any) => i.value),
