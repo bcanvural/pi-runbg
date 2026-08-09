@@ -239,8 +239,6 @@ interface ExtensionCtx {
 	removedBuiltinBash: boolean;
 	/** Edge-trigger latch for the near-cap warning (pi warnings are permanent). */
 	warnedNearCap: boolean;
-	/** Yields still allowed in the current pending-message episode (steerSignal). */
-	steerYieldsLeft: number;
 	/** Per-session interaction serialization (divergence #7). */
 	locks: InteractionLocks;
 	/** Recently reaped sessions, for graceful echoes to queued callers. */
@@ -727,12 +725,13 @@ type SteerHost = { hasPendingMessages?: () => boolean } | undefined;
 /** How often an attached wait checks whether the human has queued a message. */
 const STEER_POLL_INTERVAL_MS = 250;
 /**
- * Yields allowed per pending-message episode. Generous on purpose: it must
- * comfortably exceed any one tool batch (see steerSignal for why a tighter
- * bound is actively harmful), while still capping the follow-up case at a
- * handful of wasted early returns instead of an unbounded loop.
+ * Waits shorter than this are not made steer-aware. A sub-second attach ends
+ * on its own before a human could act on it, so cutting it short buys nothing
+ * and costs a false alarm: the result would be tagged
+ * `yielded_for_user_message` — which tells the model to wrap up — for a
+ * keystroke during a routine 300 ms attach.
  */
-export const STEER_YIELDS_PER_EPISODE = 8;
+const STEER_MIN_WAIT_MS = 2_000;
 
 /**
  * Abort signal that fires once the human has input queued (divergence #10).
@@ -741,33 +740,45 @@ export const STEER_YIELDS_PER_EPISODE = 8;
  * `preemptAbort` so the wait drains what is already buffered and only then
  * stops. Cancelling instead would discard that output (see collect.ts).
  *
- * ONE YIELD PER EPISODE, PLUS WHATEVER WAS ALREADY WAITING. `hasPendingMessages()`
- * counts steering AND follow-up messages together (agent-session.js:
- * `_steeringMessages.length + _followUpMessages.length`) and an extension
- * cannot tell them apart. pi drains them at different points: steering between
- * tool batches, follow-ups only after the whole turn ends (agent-loop.js —
- * `getSteeringMessages()` inside the `while (hasMoreToolCalls)` loop,
- * `getFollowUpMessages()` after it). So an Alt+Enter follow-up leaves the flag
- * true for the REST OF THE TURN, and yielding on every wait would leave the
- * model unable to wait for anything until it stopped calling tools.
+ * DELIBERATELY UNBOUNDED, after three attempts to bound it were each measured
+ * worse than not bounding it. `hasPendingMessages()` counts steering AND
+ * follow-up messages together (agent-session.js: `_steeringMessages.length +
+ * _followUpMessages.length`) with no way to tell them apart, and pi drains them
+ * at different points: steering between tool batches, follow-ups only after the
+ * whole turn ends (agent-loop.js — `getSteeringMessages()` inside the
+ * `while (hasMoreToolCalls)` loop, `getFollowUpMessages()` after it). So an
+ * Alt+Enter follow-up leaves the flag true for the rest of the turn and every
+ * wait yields instantly.
  *
- * But a plain once-per-episode latch is worse than none: pi runs a turn's tool
- * batch in PARALLEL, so if the first call consumed the episode its siblings
- * would sit out full-length waits — the batch could never end, so the very
- * message that caused the yield would never be delivered.
+ * That is survivable, and arguably right: a follow-up means "deliver this when
+ * you stop", so hurrying the agent toward the end of its turn is what the human
+ * asked for. The guideline tells the model exactly that. What is NOT survivable
+ * is any rule that can deny a wait its yield, because pi runs a tool batch in
+ * PARALLEL: one denied sibling sits out a full-length wait, the batch cannot
+ * end, and the message that caused the yield is never delivered — the feature
+ * failing at its only job.
  *
- * Hence a small BUDGET rather than a latch. A start-time rule ("siblings that
- * were already underway may also yield") was tried and rejected: it assumes
- * batch members start within milliseconds of each other, which held on an idle
- * machine and failed under load — a sibling that started late was denied and
- * sat out a full 20 s wait, reproducing the exact stall the rule existed to
- * prevent. A counter has no timing assumption at all. Observing the flag clear
- * refills the budget.
+ * Rejected, in order, each caught by measurement rather than reasoning:
+ *   1. once-per-episode latch — denied every sibling after the first;
+ *   2. start-time rule ("siblings already underway may also yield") — assumed
+ *      batch members begin within milliseconds; under load a late sibling was
+ *      denied and stalled a 20 s wait;
+ *   3. per-episode budget — in the intended case every sibling starts with the
+ *      flag clear, refills, and is admitted, so the number did nothing; when
+ *      the flag was already raised (the human typed during model generation) a
+ *      10-call batch exhausted it and stalled, and an exhausted budget could
+ *      silently persist into the next episode.
+ * The short-wait floor below is the one guard that survived: it cannot deny a
+ * wait long enough for a human to be waiting on it.
  */
 function steerSignal(
-	ctx: ExtensionCtx,
 	eventCtx: SteerHost,
+	waitMs: number,
 ): { signal: AbortSignal; dispose: () => void } | undefined {
+	// A wait too short for a human to be waiting on cannot be worth cutting
+	// short, and tagging it would tell the model to wrap up over a keystroke
+	// that happened to land during a routine sub-second attach.
+	if (waitMs < STEER_MIN_WAIT_MS) return undefined;
 	// Probed rather than assumed: `hasPendingMessages` has existed since pi
 	// 0.32.0 (renamed from `hasQueuedMessages`) so every supported host has it,
 	// but the rename is precisely why this stays defensive — and the test
@@ -786,14 +797,9 @@ function steerSignal(
 	if (already === undefined) return undefined;
 	// Episode bookkeeping happens even when the setting is off, so toggling it
 	// on mid-turn cannot inherit a stale latch.
-	if (!already) ctx.steerYieldsLeft = STEER_YIELDS_PER_EPISODE;
 	if (!readRunbgSettings().steerYield) return undefined;
-	if (ctx.steerYieldsLeft <= 0) return undefined; // episode budget spent
 	const controller = new AbortController();
-	const fire = () => {
-		if (ctx.steerYieldsLeft > 0) ctx.steerYieldsLeft--;
-		controller.abort();
-	};
+	const fire = () => controller.abort();
 	if (already) {
 		fire();
 		return { signal: controller.signal, dispose: () => {} };
@@ -1116,7 +1122,7 @@ async function runExecCommand(
 		// stops on either, so the UI signal is still the merged one.
 		// A queued user message ends the attach the same way a competing
 		// interaction does: drain, then stop. The process is untouched.
-		const steer = steerSignal(ctx, eventCtx);
+		const steer = steerSignal(eventCtx, yieldTimeMs);
 		const initialPreempt =
 			initialHandle?.preempt && steer
 				? AbortSignal.any([initialHandle.preempt, steer.signal])
@@ -1303,7 +1309,7 @@ async function runWriteStdin(
 	// separate (see collect.ts) so a preempted poll still returns its bytes.
 	// A queued user message joins the preempt side for the same reason: drain
 	// first, then stop (divergence #10).
-	const steer = steerSignal(ctx, eventCtx);
+	const steer = steerSignal(eventCtx, yieldTimeMs);
 	const waitPreempt = steer ? AbortSignal.any([handle.preempt, steer.signal]) : handle.preempt;
 	const streamAbort = signal ? AbortSignal.any([signal, waitPreempt]) : waitPreempt;
 	try {
@@ -1375,6 +1381,12 @@ async function runWriteStdin(
 				yieldTimeMs,
 				extra: {
 					tool_time_utc: nowUtcIso(),
+					// The interrupt-confirmation drain can be cut short too. Silence
+					// here is the worst case of all: the model asked for confirmation
+					// that \x03 worked, got "still running, no new output" in 100 ms,
+					// and the natural next move is to escalate to kill_session on a
+					// process the human may want alive.
+					...(steer?.signal.aborted ? { wait_status: "yielded_for_user_message" as const } : {}),
 					...(armed ? { on_exit: "wake" as const, completion_notification: "armed" as const } : {}),
 				},
 			});
@@ -1610,7 +1622,7 @@ function terminalWaitExtra(
  * noisy process must not accumulate unbounded history in this call); the
  * session machinery keeps its bounded head/tail buffer, rolling UI tail, and
  * complete on-disk log.
-  *
+ *
  * NOT steer-aware (divergence #10 covers relative waits only). These are the
  * longest waits in the system, so it is the mode where a human is most likely
  * to be held hostage — but they are also explicitly heartbeat-free ("no 250 ms
@@ -1618,7 +1630,8 @@ function terminalWaitExtra(
  * undo that. `yield_until` is already gated on the human having asked for a
  * long attached wait, so they have opted into it; Esc still cancels the wait
  * without killing the process. Revisit if that trade stops feeling right.
- */async function runAbsoluteWait(
+ */
+async function runAbsoluteWait(
 	ctx: ExtensionCtx,
 	session: ExecSession,
 	yieldUntilRaw: string,
@@ -2082,7 +2095,6 @@ export default function (pi: ExtensionAPI) {
 		logSweepInFlight: false,
 		removedBuiltinBash: false,
 		warnedNearCap: false,
-		steerYieldsLeft: STEER_YIELDS_PER_EPISODE,
 		locks: new InteractionLocks(),
 		reaped: new Map(),
 	};

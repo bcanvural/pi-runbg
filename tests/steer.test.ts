@@ -11,7 +11,7 @@
 import { strict as assert } from "node:assert";
 import { rmSync, writeFileSync } from "node:fs";
 import { beforeEach, describe, it } from "node:test";
-import extensionFactory, { STEER_YIELDS_PER_EPISODE } from "../src/index.ts";
+import extensionFactory from "../src/index.ts";
 import { useIsolatedAgentEnv } from "./helpers/agent-env.ts";
 import { trackHarness, useHarnessCleanup } from "./helpers/harness-cleanup.ts";
 
@@ -99,32 +99,52 @@ describe("steer-aware waits (divergence #10)", () => {
 		await h.shutdown();
 	});
 
-	it("bounds the follow-up case: yields are budgeted per episode, then waits run full length", async () => {
-		// hasPendingMessages() counts follow-ups too, and pi does not drain those
-		// until the whole turn ends — so the flag can stay true all turn. Without
-		// a bound, every later wait would yield instantly and the model could
-		// never wait for anything. The bound is a budget rather than a latch or a
-		// start-time rule, because both of those deny legitimate batch siblings.
+	it("the ATTACH also drains before it yields, not just the poll", async () => {
+		// Mutation testing showed the N1 invariant was pinned for write_stdin
+		// only: wiring the attach's drain as a cancellation left the suite green.
+		// To catch break-before-drain the abort must ALREADY be set when collect
+		// starts, so the very first iteration is the one that breaks — hence the
+		// flag is pre-raised and the marker is printed immediately, landing in the
+		// buffer during the pre-collect grace. (An earlier version raised the flag
+		// mid-wait, by which time the marker had been drained normally and both
+		// wirings passed.)
+		const h = makeHarness({ pending: () => true });
+		await h.emit("session_start");
+		const started = await h.call("exec_command", {
+			cmd: "echo ATTACH-MARKER; sleep 30",
+			yield_time_ms: 2_500,
+		});
+		const text = started.content.map((c: any) => c.text).join("");
+		assert.equal(started.details.wait_status, "yielded_for_user_message");
+		assert.ok(text.includes("ATTACH-MARKER"), `attach must drain before yielding: ${JSON.stringify(text)}`);
+		await h.call("kill_session", { session_id: started.details.session_id });
+		await h.shutdown();
+	});
+
+	it("never claims a yield when nothing was queued", async () => {
+		// Guards the false-positive direction: reporting unconditionally also
+		// left the suite green, and a spurious tag tells the model to wrap up.
+		const h = makeHarness({ pending: () => false });
+		await h.emit("session_start");
+		const started = await h.call("exec_command", { cmd: "sleep 30", yield_time_ms: 2_500 });
+		const sid = started.details.session_id;
+		assert.equal(started.details.wait_status, undefined, "attach must not claim a yield");
+		const poll = await h.call("write_stdin", { session_id: sid, yield_time_ms: 5_000 });
+		assert.equal(poll.details.wait_status, "relative_deadline_reached");
+		const wrote = await h.call("write_stdin", { session_id: sid, chars: "x\n", yield_time_ms: 2_500 });
+		assert.notEqual(wrote.details.wait_status, "yielded_for_user_message", "input write must not claim a yield");
+		await h.call("kill_session", { session_id: sid });
+		await h.shutdown();
+	});
+
+	it("leaves short waits alone (no false alarm on a sub-second attach)", async () => {
+		// A keystroke landing during a routine 300ms attach must not come back
+		// tagged as a yield — the guidance reads that as "wrap up and end turn".
 		const h = makeHarness({ pending: () => true });
 		await h.emit("session_start");
 		const started = await h.call("exec_command", { cmd: "sleep 30", yield_time_ms: 300 });
-		const sid = started.details.session_id;
-		assert.equal(started.details.wait_status, "yielded_for_user_message", "the attach spends the first yield");
-		// Spend exactly the rest of the budget; each of these returns immediately.
-		// (Overshooting would make every extra call wait its full deadline.)
-		for (let i = 0; i < STEER_YIELDS_PER_EPISODE - 1; i++) {
-			await h.call("write_stdin", { session_id: sid, yield_time_ms: 6_000 });
-		}
-		const t0 = Date.now();
-		const exhausted = await h.call("write_stdin", { session_id: sid, yield_time_ms: 6_000 });
-		const elapsed = Date.now() - t0;
-		assert.notEqual(
-			exhausted.details.wait_status,
-			"yielded_for_user_message",
-			"once the budget is spent, waits must run their full length again",
-		);
-		assert.ok(elapsed > 3_000, `an exhausted-budget wait must actually wait, took ${elapsed}ms`);
-		await h.call("kill_session", { session_id: sid });
+		assert.equal(started.details.wait_status, undefined, "a 300ms attach is too short to be worth cutting");
+		await h.call("kill_session", { session_id: started.details.session_id });
 		await h.shutdown();
 	});
 

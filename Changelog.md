@@ -116,17 +116,24 @@ its names.
     the command finished, and not a failed verification — answer the human,
     then poll again.
   - **`hasPendingMessages()` counts follow-up messages too**, and pi does not
-    drain those until the whole turn ends — so an Alt+Enter follow-up would
-    otherwise make every later wait yield instantly, leaving the model unable
-    to wait for anything. Each episode therefore carries a small yield budget
-    (8). Two simpler rules were tried and rejected under test: a
-    once-per-episode latch left parallel batch siblings in full-length waits,
-    so the batch could never end and the message that caused the yield was
-    never delivered — worse than not yielding at all; a start-time rule
-    ("siblings already underway may also yield") assumed batch members begin
-    within milliseconds of each other, which held on an idle machine and was
-    then caught under full-suite load denying a late sibling, reproducing the
-    same stall. A counter has no timing assumption.
+    drain those until the whole turn ends, so an Alt+Enter follow-up leaves
+    every wait yielding instantly. That is survivable and arguably correct —
+    it hurries the agent toward the turn end, which is what that queue asks
+    for — so yielding is deliberately **unbounded**. Three bounds were tried
+    and each measured worse than none, because pi runs a tool batch in
+    *parallel* and any rule that can deny a wait its yield strands a sibling
+    in a full-length wait, so the batch never ends and the message that caused
+    the yield is never delivered: a once-per-episode latch denied every
+    sibling; a start-time rule assumed batch members begin within milliseconds
+    and was caught under load denying a late one; a per-episode budget did
+    nothing at all in the intended case (siblings all start with the flag
+    clear, refill, and pass) while stalling a batch when the human typed
+    during model generation, and could silently persist exhausted into the
+    next episode.
+  - The one guard kept is a **2 s floor** — waits too short for a human to be
+    acting on are left alone. This also removes a false alarm where a
+    keystroke during a routine 300 ms attach came back tagged as a yield,
+    which the guidance reads as "wrap up and end the turn".
   - Guidance covers the case where no message appears (the human used the
     deliver-when-idle queue): wrap up and end the turn, which is what delivers
     it — rather than the earlier advice to answer a message that isn't there.
