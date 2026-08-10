@@ -4,7 +4,8 @@
  * Child output has three independent layers:
  *   1. the complete session log on disk;
  *   2. the bounded result payload in details.output;
- *   3. a five-visual-line collapsed TUI preview of that bounded payload.
+ *   3. a collapsed TUI preview of that bounded payload (PREVIEW_LINES visual
+ *      lines, ten by default).
  *
  * Renderers are display-only. The model-visible content is already bounded in
  * tool-result.ts, so a renderer failure cannot expose the retained 1 MiB buffer
