@@ -67,8 +67,22 @@ type ToolRenderContext<TState = any, TArgs = any> = Parameters<ExportedRenderCal
 	state: TState;
 };
 
-// Preview lines for collapsed output (matches Pi's built-in bash tool).
-const PREVIEW_LINES = 5;
+// Preview lines for collapsed output. The default matches Pi's built-in bash
+// tool; the env var exists for setups whose transcript style wants a deeper
+// window (an omp-styled pi shows ten) without runbg diverging from stock pi
+// for everyone else. Same contract as PI_RUNBG_MAX_SESSIONS: floored at 1,
+// garbage falls back to the default.
+const DEFAULT_PREVIEW_LINES = 5;
+export const PREVIEW_LINES_ENV_VAR = "PI_RUNBG_PREVIEW_LINES";
+
+export function resolvePreviewLines(env: Record<string, string | undefined> = process.env): number {
+	const raw = env[PREVIEW_LINES_ENV_VAR];
+	if (raw === undefined || raw.trim() === "") return DEFAULT_PREVIEW_LINES;
+	const parsed = Number(raw);
+	if (!Number.isFinite(parsed)) return DEFAULT_PREVIEW_LINES;
+	return Math.max(1, Math.floor(parsed));
+}
+
 const LIST_PREVIEW_SESSIONS = 5;
 
 /** State attached to one tool execution across call/result re-renders. */
@@ -377,7 +391,7 @@ function rebuildOutputResult(
 			container.addChild({
 				render: (width: number): string[] => {
 					if (state.cachedLines === undefined || state.cachedWidth !== width) {
-						const preview = truncateToVisualLines(styled, PREVIEW_LINES, width);
+						const preview = truncateToVisualLines(styled, resolvePreviewLines(), width);
 						state.cachedLines = preview.visualLines;
 						state.cachedSkipped = preview.skippedCount;
 						state.cachedWidth = width;
