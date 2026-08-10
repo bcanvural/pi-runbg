@@ -227,7 +227,7 @@ stretch or shrink an in-progress wait.
 | Env var | Default | Notes |
 |---|---|---|
 | `PI_RUNBG_MAX_EMPTY_POLL_MS` | `290_000` | Cap for empty `write_stdin` polls. May be **lowered** but never raises the effective cache-friendly maximum above 290 s. Positive values below `5_000` are raised to `5_000`; invalid values use the default. |
-| `PI_RUNBG_PREVIEW_LINES` | `5` | Visual lines of output shown in a collapsed tool block. The default matches Pi's built-in bash tool; a transcript styled after omp wants `10` (pi-omp-feel's README says so too). Floored at 1; invalid values use the default. |
+| `PI_RUNBG_PREVIEW_LINES` | `5` | Visual lines of output shown in a collapsed tool block. The default matches Pi's built-in bash tool. Read lazily at render time, so a themer may seed it for alignment when unset — pi-omp-feel sets `10` to match its deeper bash tail; an explicit shell value wins. Floored at 1; invalid values use the default. |
 
 #### Control bytes and escapes in `chars`
 
