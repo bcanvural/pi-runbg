@@ -67,12 +67,13 @@ type ToolRenderContext<TState = any, TArgs = any> = Parameters<ExportedRenderCal
 	state: TState;
 };
 
-// Preview lines for collapsed output. The default matches Pi's built-in bash
-// tool; the env var exists for setups whose transcript style wants a deeper
-// window (an omp-styled pi shows ten) without runbg diverging from stock pi
-// for everyone else. Same contract as PI_RUNBG_MAX_SESSIONS: floored at 1,
-// garbage falls back to the default.
-const DEFAULT_PREVIEW_LINES = 5;
+// Preview lines for collapsed output. Ten is a deliberate divergence from
+// Pi's built-in bash tool (five): the deeper window is worth more than the
+// mirror, and omp-styled transcripts run at this depth anyway. The env var
+// takes it back to five for anyone who wants stock-pi consistency. Same
+// contract as PI_RUNBG_MAX_SESSIONS: floored at 1, garbage falls back to
+// the default.
+const DEFAULT_PREVIEW_LINES = 10;
 export const PREVIEW_LINES_ENV_VAR = "PI_RUNBG_PREVIEW_LINES";
 
 export function resolvePreviewLines(env: Record<string, string | undefined> = process.env): number {

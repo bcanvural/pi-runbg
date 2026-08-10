@@ -227,7 +227,7 @@ stretch or shrink an in-progress wait.
 | Env var | Default | Notes |
 |---|---|---|
 | `PI_RUNBG_MAX_EMPTY_POLL_MS` | `290_000` | Cap for empty `write_stdin` polls. May be **lowered** but never raises the effective cache-friendly maximum above 290 s. Positive values below `5_000` are raised to `5_000`; invalid values use the default. |
-| `PI_RUNBG_PREVIEW_LINES` | `5` | Visual lines of output shown in a collapsed tool block. The default matches Pi's built-in bash tool. Read lazily at render time, so a themer may seed it for alignment when unset — pi-omp-feel sets `10` to match its deeper bash tail; an explicit shell value wins. Floored at 1; invalid values use the default. |
+| `PI_RUNBG_PREVIEW_LINES` | `10` | Visual lines of output shown in a collapsed tool block. Deliberately deeper than Pi's built-in bash tool (five); set `5` for stock-pi consistency. Read lazily at render time. Floored at 1; invalid values use the default. |
 
 #### Control bytes and escapes in `chars`
 
@@ -507,7 +507,7 @@ DEFAULT_WRITE_STDIN_YIELD_MS = 250
 EARLY_EXIT_GRACE_PERIOD_MS   = 150
 HEAD_TAIL_MAX_BYTES          = 1 MiB   (in-memory drain buffer)
 MAX_SESSIONS                 = 64    (env: PI_RUNBG_MAX_SESSIONS, overridable)
-PREVIEW_LINES                = 5     (env: PI_RUNBG_PREVIEW_LINES, overridable — collapsed output window)
+PREVIEW_LINES                = 10    (env: PI_RUNBG_PREVIEW_LINES, overridable — collapsed output window; pi's bash shows 5)
 WARNING_HEADROOM             = 4     (warn this many slots before the cap — warns at 60 of 64)
 LRU_PROTECTED_COUNT          = 8
 
