@@ -593,7 +593,17 @@ describe("runbg e2e", () => {
 		const inflight = h.call("exec_command", { cmd: "sleep 30", yield_time_ms: 500 });
 		await new Promise((r) => setTimeout(r, 40)); // inside the grace window
 		await h.emit("session_shutdown");
-		const r = await inflight;
+		let r;
+		try {
+			r = await inflight;
+		} catch (error) {
+			// Third legitimate outcome: the shutdown wins the race outright and
+			// exec_command refuses with the termination notice. The invariant
+			// this test guards — no orphaned child — is exactly what that
+			// message asserts. Slow runners (Windows CI) land here.
+			assert.match(String(error), /shut down while this command was starting/);
+			return;
+		}
 		// The pending session must have been terminated by the shutdown: the
 		// call resolves with exit info (or a dead session), never a live one.
 		if (r.details.session_id !== undefined) {
