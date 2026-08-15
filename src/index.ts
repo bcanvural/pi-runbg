@@ -903,6 +903,35 @@ function capError(ctx: ExtensionCtx): string {
 	);
 }
 
+const HELD_OPEN_NOTE =
+	"shell has exited, but the output pipe is still open — typically a backgrounded process that inherited " +
+	"stdout/stderr — so this session stays open until the last holder exits (an armed on_exit wake stays " +
+	"pending until then). To detach: `(cd dir && cmd >log 2>&1 </dev/null) &` or `setsid cmd >log 2>&1 " +
+	"</dev/null &`; to end it: kill_session (a setsid'd holder escapes the group kill — find it with " +
+	"ps/pgrep and kill it by pid, or wait for it to exit).";
+
+const HELD_OPEN_NOTE_WINDOWS =
+	"shell has exited, but the output pipe is still open — typically a backgrounded process that inherited " +
+	"stdout/stderr — so this session stays open until the last holder exits (an armed on_exit wake stays " +
+	"pending until then). To detach: `(cd dir && cmd >log 2>&1 </dev/null) &` or `setsid cmd >log 2>&1 " +
+	"</dev/null &`. Windows: kill_session cannot reach it once the shell has exited — find the holder " +
+	"with `tasklist` and kill it with `taskkill /pid <pid> /F`, or wait for it to exit.";
+
+/**
+ * Held-open diagnosis (IV-0006): explanation for sessions whose shell has
+ * exited but whose output pipe is still held open by background processes —
+ * they report "running" even though the foreground command is long done.
+ * State-driven (never command-text matching), so it covers any construct
+ * that leaves a pipe holder behind. Defensive: `session` may be undefined
+ * (store miss / reaped-only sites) and the note is gated on `hasExited`
+ * first. Platform-aware remedy (Windows taskkill live-root limitation;
+ * POSIX setsid escape).
+ */
+function heldOpenNote(session: ExecSession | undefined): string | undefined {
+	if (!session || session.hasExited || !session.shellExited) return undefined;
+	return IS_WINDOWS ? HELD_OPEN_NOTE_WINDOWS : HELD_OPEN_NOTE;
+}
+
 async function runExecCommand(
 	ctx: ExtensionCtx,
 	args: ExecCommandArgs,
@@ -913,7 +942,20 @@ async function runExecCommand(
 	eventCtx: SteerHost,
 ): Promise<ResponseShape> {
 	const finalizeResponse = (input: FinalizeInput, stageFor?: number): ResponseShape => {
-		const shape = finalizeProcessResult({ ...input, operation: "exec_command" });
+		// IV-0006: derive the held-open note centrally, gated on the same
+		// condition finalizeProcessResult uses for `[still running]` — a
+		// future still-running site in this function gets the note
+		// automatically, and terminal sites need zero edits (see the
+		// maintainer note: divergence in copied fields is a bug, not a
+		// variation).
+		const shape = finalizeProcessResult({
+			...input,
+			operation: "exec_command",
+			extra: {
+				...input.extra,
+				note: input.sessionId !== undefined ? heldOpenNote(session) : undefined,
+			},
+		});
 		// Terminal results carry no session_id (the session left the store),
 		// but their bounded body can still contain the excerpt — stage with
 		// the ORIGINAL observed id so containment consumes the wake.
@@ -1254,6 +1296,10 @@ async function runExecCommand(
  * the wake exactly-once protocol lives. When editing one, check its siblings:
  * a divergence in the copied fields is a bug, not a variation. (One such
  * divergence silently dropped `failure_message` from the still-running path.)
+ * IV-0006 convention: any still-running-capable result path OUTSIDE these
+ * wrappers (a new standalone function, a new tool) must derive the held-open
+ * note via `heldOpenNote` gated on sessionId presence — `cancelledWhileQueued`
+ * is the precedent.
  * A `sessionResultFields(session, terminal)` spread for the mechanical fields
  * only — leaving `failure`/`extra`/`collected`/`wallTimeSec`/`yieldTimeMs`
  * explicit at each site — is the agreed consolidation whenever this protocol
@@ -1269,7 +1315,15 @@ async function runWriteStdin(
 	eventCtx: SteerHost,
 ): Promise<ResponseShape> {
 	const finalizeResponse = (input: FinalizeInput, stageFor?: number): ResponseShape => {
-		const shape = finalizeProcessResult({ ...input, operation: "write_stdin" });
+		// IV-0006: held-open note derived centrally (see runExecCommand).
+		const shape = finalizeProcessResult({
+			...input,
+			operation: "write_stdin",
+			extra: {
+				...input.extra,
+				note: input.sessionId !== undefined ? heldOpenNote(session) : undefined,
+			},
+		});
 		const observedId = stageFor ?? input.sessionId;
 		if (observedId !== undefined) {
 			ctx.coordinator.stageMatchConsumption(toolCallId, observedId, shape.output ?? "");
@@ -1600,6 +1654,9 @@ function cancelledWhileQueued(ctx: ExtensionCtx, sessionId: number, isEmptyPoll:
 		extra: {
 			...(isEmptyPoll ? { wait_mode: "relative" as const, wait_status: "cancelled" as const } : {}),
 			tool_time_utc: nowUtcIso(),
+			// IV-0006: standalone still-running site outside the wrappers —
+			// session can be a reaped-only miss here; the helper is defensive.
+			note: heldOpenNote(session),
 		},
 	});
 }
@@ -1683,7 +1740,15 @@ async function runAbsoluteWait(
 	toolCallId: string,
 ): Promise<ResponseShape> {
 	const finalizeResponse = (input: FinalizeInput, stageFor?: number): ResponseShape => {
-		const shape = finalizeProcessResult({ ...input, operation: "write_stdin" });
+		// IV-0006: held-open note derived centrally (see runExecCommand).
+		const shape = finalizeProcessResult({
+			...input,
+			operation: "write_stdin",
+			extra: {
+				...input.extra,
+				note: input.sessionId !== undefined ? heldOpenNote(session) : undefined,
+			},
+		});
 		const observedId = stageFor ?? input.sessionId;
 		if (observedId !== undefined) {
 			ctx.coordinator.stageMatchConsumption(toolCallId, observedId, shape.output ?? "");
@@ -1921,7 +1986,8 @@ function formatRunningSessionsWidget(ctx: ExtensionCtx, sessions: ExecSession[])
 		...shown.map((s) => {
 			const wake = ctx.coordinator.isArmed(s.id) ? " [wake]" : "";
 			const match = ctx.coordinator.isMatchArmed(s.id) ? " [match]" : "";
-			return `  #${s.id} ${formatElapsed(now - s.startedAt)}${wake}${match} ${oneLineCommand(s.displayCommand, 72)} (${s.cwd})`;
+			const held = s.shellExited ? " (shell exited, pipe held)" : "";
+			return `  #${s.id} ${formatElapsed(now - s.startedAt)}${wake}${match}${held} ${oneLineCommand(s.displayCommand, 72)} (${s.cwd})`;
 		}),
 	];
 	if (sessions.length > shown.length) lines.push(`  … ${sessions.length - shown.length} more; use list_sessions`);
@@ -2446,7 +2512,8 @@ export default function (pi: ExtensionAPI) {
 			const labels = sessions.map((s) => {
 				const wake = ctx.coordinator.isArmed(s.id) ? " [wake]" : "";
 				const match = ctx.coordinator.isMatchArmed(s.id) ? " [match]" : "";
-				return `#${s.id} ${formatElapsed(now - s.startedAt)}${wake}${match} ${oneLineCommand(s.displayCommand, 60)}`;
+				const held = s.shellExited ? " (shell exited, pipe held)" : "";
+				return `#${s.id} ${formatElapsed(now - s.startedAt)}${wake}${match}${held} ${oneLineCommand(s.displayCommand, 60)}`;
 			});
 			const KILL_ALL = `Kill all ${sessions.length} ${plural(sessions.length, "session")}`;
 			const choice = await cmdCtx.ui.select(
@@ -2489,13 +2556,13 @@ export default function (pi: ExtensionAPI) {
 - Longer or unknown → exec_command. If the human explicitly wants auto-resume when a terminating process completes, include on_exit: "wake" and END THE TURN; otherwise leave the default "none" and poll later or end the turn according to the workflow.
 - Non-terminating with a readiness signal (dev servers, watchers, migrations that stay up) → exec_command with on_output: {pattern} armed, then END THE TURN — woken on the first match.
 - Interactive (REPL, ssh, sudo) → exec_command with a short yield, then drive it with write_stdin.
-Returns \`session_id\` if still running or \`exit_code\` if it finished within yield_time_ms. If a separate \`bash\` tool is also available, prefer exec_command for anything that MIGHT run long: only a session yields a handle, so only it can hand control back while the command keeps running — a bash call of the same length blocks until it finishes. Use bash only for commands that are certainly fast. NEVER background inside cmd (\`&\`, \`nohup\`): the session already is the background. NEVER arm on_exit: "wake" for a process that does not exit on its own (dev servers, watchers) — it can only fail to fire; for readiness of those, arm on_output instead, and arm BOTH arms if crash-before-ready matters. Use set_on_exit to disarm or re-arm a running session.`,
+Returns \`session_id\` if still running or \`exit_code\` if it finished within yield_time_ms. If a separate \`bash\` tool is also available, prefer exec_command for anything that MIGHT run long: only a session yields a handle, so only it can hand control back while the command keeps running — a bash call of the same length blocks until it finishes. Use bash only for commands that are certainly fast. NEVER background inside cmd (\`&\`, \`nohup\`): the session already is the background — if a backgrounded child inherits this session's output pipe, the session keeps reporting [still running] long after your cmd finished (the result will carry a held-open note explaining the state; kill_session reaches ordinary same-group children, but a setsid'd holder escapes the group kill and a Windows descendant whose parent shell is already gone is unreachable — the note gives the remedy). NEVER arm on_exit: "wake" for a process that does not exit on its own (dev servers, watchers) — it can only fail to fire; for readiness of those, arm on_output instead, and arm BOTH arms if crash-before-ready matters. Use set_on_exit to disarm or re-arm a running session.`,
 		promptSnippet: "Run a shell command; long-running ones yield a session_id",
 		promptGuidelines: [
 			"Prefer dedicated file tools when available (read/grep/find/ls). Otherwise use exec_command with fast shell tools: rg for content search, fd if available (or find) for file names, and ls for directories.",
 			"When pi\'s built-in `bash` is also available, still route anything that MIGHT run long through exec_command — builds, test suites, installs, migrations, deploys, anything network-bound. Only exec_command yields a session, so only it can hand control back mid-wait when the human types; a bash call of the same length makes them wait it out or press Esc, which kills the command outright. Reach for bash only for commands that are certainly fast.",
 			`Choose how you will wait BEFORE starting, from the job's expected duration. Expected to finish within ~5 minutes: ONE exec_command whose yield_time_ms covers it (~500ms for quick one-shots, ${DEFAULT_EXEC_YIELD_MS} ms default, up to ${MAX_YIELD_TIME_MS} ms) — do not split this into a short yield plus a poll, which costs an extra turn for the same wait. Longer than that, or unknown: start it; keep on_exit at its default "none" unless the human explicitly wants auto-resume on termination. If they do, set on_exit: "wake" and END THE TURN; otherwise poll later or end the turn according to the workflow. Non-terminating with a readiness signal (dev servers, watchers, migrations that stay up): exec_command with on_output: {pattern} armed, then END THE TURN — you are woken on the first match; use a distinctive banner substring, never a common word like "ready". Interactive processes (REPLs, ssh, sudo) always return a session_id you then drive with write_stdin. Never end a turn with a live session you have not named to the human, and kill_session anything you have stopped caring about — abandoned sessions still count toward the session cap.`,
-			"Do not background inside cmd (`&`, `nohup`, `disown`) — the session IS the background: run the long process as cmd itself and poll it with write_stdin. A backgrounded child is not tracked by its session; if it inherits the session's output pipe, the session keeps reporting [still running] long after your cmd finished, and kill_session ends it anyway (SIGTERM goes to the whole process group, which nohup does not survive). Use setsid only when the human explicitly wants a process to outlive pi.",
+			"Do not background inside cmd (`&`, `nohup`, `disown`) — the session IS the background: run the long process as cmd itself and poll it with write_stdin. A backgrounded child is not tracked by its session; if it inherits the session's output pipe, the session keeps reporting [still running] long after your cmd finished — the result will carry a held-open note explaining the state and giving the remedy. kill_session ends ordinary same-group children (SIGTERM goes to the whole process group, which nohup does not survive), but a setsid'd holder is in its own group and escapes the group kill, and on Windows a descendant whose parent shell is already gone is unreachable — the note is the diagnosis surface for both. Use setsid only when the human explicitly wants a process to outlive pi (with the note's redirects).",
 			"Compose multi-step waits in the shell, not across tool calls — the shell is your scripting layer, so anything needing no model judgment between steps belongs in one command. `until curl -sf URL; do sleep 2; done && npm test 2>&1 | tail -40` is a single call; polling, checking, then running is five or six. Prefer waiting on a CONDITION over sleeping a fixed duration: it returns the instant the condition holds instead of after a guess, and a bare sleep whose only purpose is to pass time gives you a session with nothing to observe.",
 			"Filter output at the source (tail, grep, wc, --quiet flags) rather than pulling everything into context. Results are bounded by a head/tail buffer, so an unfiltered 900-line run silently loses its MIDDLE — usually where the failure is. Truncation is a safety net, not a filtering strategy. log_path always holds the complete stream: grep or read that when the bounded result is not enough, instead of re-running the job.",
 			`An empty write_stdin poll (no chars) waits for progress and accepts yield_time_ms up to 290 seconds (${DEFAULT_MAX_BACKGROUND_POLL_MS} ms, cache-friendly). Each poll returns only output that is NEW since the last one, never bytes you have already seen, so a poll's cost is the TURN rather than the payload — which is why one long poll beats several short ones. Do NOT use yield_until just to bypass the 290s cap — only when the human explicitly asks for a long attached wait or a wall-clock deadline (finite non-interactive jobs only).`,
@@ -2792,6 +2859,11 @@ Returns \`session_id\` if still running or \`exit_code\` if it finished within y
 						`process still running after ${initial}${escalated ? " and SIGKILL escalation" : ""}; ` +
 							"the session remains registered — retry kill_session or check permissions",
 						session.failureMessage,
+						// IV-0006: on a held-open session the retry advice is a
+						// guaranteed loop (Windows taskkill live-root; POSIX setsid
+						// escape) — append the platform note so the model gets the
+						// remedy instead. Condition mirrors heldOpenNote's gate.
+						!killed && !session.hasExited && session.shellExited ? heldOpenNote(session) : undefined,
 					]
 					.filter((value): value is string => Boolean(value))
 					.join("; ");
@@ -2861,6 +2933,10 @@ Returns \`session_id\` if still running or \`exit_code\` if it finished within y
 					started_at_ms: s.startedAt,
 					elapsed_ms: now - s.startedAt,
 					running: !s.hasExited,
+					// IV-0006: shell exited while the session still reports running
+					// (background job holds the pipe). Present only for live
+					// entries, mirroring the exit_code/signal convention.
+					shell_exited: s.hasExited ? undefined : s.shellExited,
 					wake_armed: ctx.coordinator.isArmed(s.id),
 					match_armed: ctx.coordinator.isMatchArmed(s.id),
 					exit_code: s.hasExited ? s.exitCode : undefined,
@@ -2877,9 +2953,10 @@ Returns \`session_id\` if still running or \`exit_code\` if it finished within y
 							: `  [exited${s.exit_code !== undefined && s.exit_code !== null ? ` exit_code=${s.exit_code}` : ""}${s.signal ? ` signal=${s.signal}` : ""}; removed from store]`;
 						const wake = s.wake_armed ? " [wake]" : "";
 						const match = s.match_armed ? " [match]" : "";
+						const held = s.running && s.shell_exited ? " [shell exited]" : "";
 						return `  ${String(s.session_id).padStart(3)}  pid=${String(s.pid ?? "?").padStart(6)}  ${
 							s.tty ? "tty" : "pipe"
-						}  ${((s.elapsed_ms / 1000).toFixed(1) + "s").padStart(8)}${wake}${match}  ${oneLineCommand(s.command, 60)}${exitedSuffix}\n        log: ${s.log_path}`;
+						}  ${((s.elapsed_ms / 1000).toFixed(1) + "s").padStart(8)}${wake}${match}${held}  ${oneLineCommand(s.command, 60)}${exitedSuffix}\n        log: ${s.log_path}`;
 					})
 				: ["  (no live sessions)"];
 			const header = reaped.length

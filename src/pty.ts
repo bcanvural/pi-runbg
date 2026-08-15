@@ -39,6 +39,15 @@ export type ExitCallback = (
 export interface SpawnedChild {
 	readonly pid: number | undefined;
 	readonly tty: boolean;
+	/**
+	 * The direct child process (the shell) has exited. Distinct from the
+	 * session's close-based exit: descendants that inherited the stdout/stderr
+	 * pipe keep it open, so pipe EOF (and thus `close`) can lag the process
+	 * exit indefinitely. Exposed so callers can explain a session that stays
+	 * "running" after its shell is gone. Diagnostic only — wake arms and
+	 * session exit stay tied to `close`.
+	 */
+	readonly processExited: boolean;
 	/** Write raw bytes to the child's stdin (or PTY input side). */
 	write(data: Uint8Array): boolean;
 	/** Subscribe to data chunks (combined stdout+stderr). Returns unsubscribe. */
@@ -238,6 +247,7 @@ function spawnPty(mod: PtyModule, opts: SpawnOptions): SpawnedChild {
 	const dataHandlers = new Set<(chunk: Uint8Array) => void>();
 	const exitHandlers = new Set<ExitCallback>();
 	let exited = false;
+	let processExited = false;
 
 	const dataSub = child.onData((data) => {
 		const chunk = typeof data === "string" ? new TextEncoder().encode(data) : new Uint8Array(data);
@@ -252,6 +262,7 @@ function spawnPty(mod: PtyModule, opts: SpawnOptions): SpawnedChild {
 	const exitSub = child.onExit(({ exitCode, signal }) => {
 		if (exited) return;
 		exited = true;
+		processExited = true;
 		dataSub?.dispose?.();
 		exitSub?.dispose?.();
 		const sigName = signal != null ? signalNameFromNumber(signal) : null;
@@ -270,6 +281,9 @@ function spawnPty(mod: PtyModule, opts: SpawnOptions): SpawnedChild {
 	return {
 		pid: child.pid,
 		tty: true,
+		get processExited() {
+			return processExited;
+		},
 		write(data) {
 			if (exited) return false;
 			try {
@@ -325,6 +339,17 @@ function spawnPipes(opts: SpawnOptions): SpawnedChild {
 	const dataHandlers = new Set<(chunk: Uint8Array) => void>();
 	const exitHandlers = new Set<ExitCallback>();
 	let exited = false;
+	let processExited = false;
+	// The process `exit` event fires when the shell itself ends, before its
+	// stdio streams are closed. Background jobs that inherited the output
+	// pipe delay the `close` event indefinitely; this flag keeps the two
+	// distinct so a held-open session is diagnosable instead of looking like
+	// a still-working command. On async spawn failure (`error`) the `exit`
+	// event may never fire — the flag stays false, which is truthful (no
+	// shell ever ran).
+	child.once("exit", () => {
+		processExited = true;
+	});
 
 	const onChunk = (chunk: Buffer) => {
 		const view = new Uint8Array(chunk);
@@ -373,6 +398,9 @@ function spawnPipes(opts: SpawnOptions): SpawnedChild {
 	return {
 		pid: child.pid,
 		tty: false,
+		get processExited() {
+			return processExited;
+		},
 		write(data) {
 			const stdin = child.stdin;
 			if (exited || !stdin || stdin.destroyed || stdin.writableEnded) return false;

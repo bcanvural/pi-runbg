@@ -564,6 +564,19 @@ export class ExecSession {
 		return this.state.hasExited;
 	}
 
+	/**
+	 * The shell process itself has exited. In pipes mode this can be true
+	 * while `hasExited` is still false: background jobs that inherited the
+	 * output pipe keep it open, so the close-based session exit lags (or
+	 * never arrives). Diagnostic only — wake arms and session exit stay tied
+	 * to `hasExited`. Defensive: the spawn-failure paths never assign
+	 * `child`, and the getter is public — `false` for "no shell" is
+	 * truthful (the session failed to spawn, and `hasExited` is true there).
+	 */
+	get shellExited(): boolean {
+		return this.child?.processExited ?? false;
+	}
+
 	get exitCode(): number | null {
 		return this.state.exitCode;
 	}

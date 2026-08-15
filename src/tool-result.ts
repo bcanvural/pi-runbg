@@ -31,6 +31,13 @@ export interface OutputResultDetails {
 	exit_code?: number;
 	signal?: string;
 	failure_message?: string;
+	/**
+	 * Held-open diagnosis (IV-0006): the shell has exited but background
+	 * process(es) still hold the output pipe, so the session reports running
+	 * although the foreground command is long done. Present only on
+	 * `[still running]` results (and folded into kill-failure messages).
+	 */
+	note?: string;
 	tty?: boolean;
 	log_path?: string;
 	/**
@@ -274,6 +281,7 @@ export function renderProcessResultText(shape: ProcessResultDetails): string {
 	if (shape.exit_code !== undefined) lines.push(`exit_code: ${shape.exit_code}`);
 	if (shape.signal) lines.push(`signal: ${safeMeta(shape.signal)}`);
 	if (shape.failure_message) lines.push(`failure: ${safeMeta(shape.failure_message)}`);
+	if (shape.note) lines.push(`note: ${safeMeta(shape.note)}`);
 	if (shape.wait_mode) lines.push(`wait_mode: ${safeMeta(shape.wait_mode)}`);
 	if (shape.wait_status) lines.push(`wait_status: ${safeMeta(shape.wait_status)}`);
 	if (shape.yield_until) lines.push(`yield_until: ${safeMeta(shape.yield_until)}`);

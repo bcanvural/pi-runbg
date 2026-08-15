@@ -125,6 +125,8 @@ interface SessionListItem {
 	wake_armed: boolean;
 	/** Match arm (on_output) armed. A match-only arm never lights the exit-arm [wake] label. */
 	match_armed?: boolean;
+	/** IV-0006: shell exited while the session still reports running (background job holds the pipe). */
+	shell_exited?: boolean;
 	exit_code?: number | null;
 	signal?: string;
 	failure_message?: string;
@@ -494,6 +496,10 @@ function buildStatusLine(
 	}
 
 	if (details.failure_message) bits.push(theme.fg("error", `failure: ${safeOneLine(details.failure_message)}`));
+	// IV-0006: the held-open diagnosis is long; the widget marker and the
+	// note's own header line carry the full text — the status line shows a
+	// bounded hint.
+	if (details.note) bits.push(theme.fg("warning", `note: ${safeOneLine(details.note, 90)}`));
 	if (details.yield_until && (options.isPartial || details.running)) {
 		bits.push(formatUntilLabel(details.yield_until));
 	}
@@ -578,8 +584,10 @@ export function renderListSessionsResult(
 							);
 					const wake = session.wake_armed ? theme.fg("warning", " [wake]") : "";
 					const match = session.match_armed ? theme.fg("warning", " [match]") : "";
+					const held =
+						session.running && session.shell_exited ? theme.fg("warning", " [shell exited]") : "";
 					const command = safeOneLine(session.command, 100);
-					const line = `#${session.session_id} pid=${session.pid ?? "?"} ${session.tty ? "tty" : "pipe"} ${(session.elapsed_ms / 1000).toFixed(1)}s ${state}${wake}${match} ${command}`;
+					const line = `#${session.session_id} pid=${session.pid ?? "?"} ${session.tty ? "tty" : "pipe"} ${(session.elapsed_ms / 1000).toFixed(1)}s ${state}${wake}${match}${held} ${command}`;
 					lines.push(truncateToWidth(line, width, "..."));
 					if (options.expanded) {
 						lines.push(
