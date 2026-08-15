@@ -3,3 +3,7 @@ local_data/
 .pi-workflow-runs/
 *.log
 .DS_Store
+
+# Project-local skills (agent instructions, not shared)
+.pi/skills/
+.pi-subagents/

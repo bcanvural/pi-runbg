@@ -16,8 +16,12 @@ purpose, and says so. Every deviation is recorded with its reasoning in
 > **Fork notice:** this is a fork of
 > [iamwrm/pi-unified-exec](https://github.com/iamwrm/pi-unified-exec) v0.9.0
 > (MIT, by Ren Wang — closed to external contributions, forks invited).
-> Tool names, schemas, and constants are preserved verbatim; the package,
-> env vars, log prefix, and slash command are renamed to `runbg`.
+> Tool names are preserved verbatim. Schemas and constants hold upstream's
+> shape except where this README or UPSTREAM.md marks a divergence:
+> `on_output` is added to `exec_command` and `set_on_exit` (IV-0004),
+> `set_on_exit.on_exit` is relaxed from required to optional,
+> `MAX_YIELD_TIME_MS` rises 30 s → 290 s, and `PREVIEW_LINES` goes 5 → 10.
+> The package, env vars, log prefix, and slash command are renamed to `runbg`.
 > Divergences are deliberate and documented in
 > [UPSTREAM.md](./UPSTREAM.md) — the headline one: **pi's built-in `bash`
 > tool is kept by default** (upstream removes it); `/runbg replace-bash on`
@@ -67,8 +71,9 @@ purpose, and says so. Every deviation is recorded with its reasoning in
 - **Compact, bounded output with complete recovery.** Every output-bearing
   result—including `kill_session`—is tail-capped at 50 KiB / 2000 lines before
   it reaches model context or persisted details. All five tools have explicit
-  TUI renderers; child output defaults to a five-visual-line tail and expands
-  with Pi's configured `app.tools.expand` binding. Model/result/TUI text strips
+  TUI renderers; child output defaults to a ten-visual-line tail
+  (`PI_RUNBG_PREVIEW_LINES`; pi's bash shows five) and expands with Pi's
+  configured `app.tools.expand` binding. Model/result/TUI text strips
   terminal-control sequences; the complete raw stream remains available at
   `log_path`.
 - **Ctrl-C and other control bytes, not just stdin text.**
@@ -454,8 +459,10 @@ without an extra probing call.
   session tools, disable it when you switch away.
   - Settings: `/runbg on|off` is the primary switch (shorthand for
     `/runbg enabled on|off`); `/runbg replace-bash on|off` removes or keeps
-    pi's built-in `bash` (see below; off by default). Every setting also
-    answers `/runbg <setting>` on its own to report just that value.
+    pi's built-in `bash` (see below; off by default); `/runbg steer on|off`
+    toggles the human-input cut-short for attached waits (on by default —
+    divergence #10; see Highlights). Every setting also answers
+    `/runbg <setting>` on its own to report just that value.
 - `/runbg-sessions` — human-facing escape hatch: lists live sessions in
   a selector (armed wakes show `[wake]`) and kills the chosen one (or all of
   them) without going through the model. Uses the same SIGTERM → 2s → SIGKILL
@@ -558,8 +565,12 @@ bounded entries plus log paths when expanded.
 footer shows `runbg: N sessions running`. After `/tree` navigation, a
 widget above the editor lists the live `session_id`s and commands (with
 `[wake]` when auto-resume is armed) so the human sees that processes survived
-branch navigation. The footer/widget refreshes as soon as a background session
-exits; the exited session remains drainable via `write_stdin` until observed,
+branch navigation. Held-open sessions — shell exited, background job still
+holding the output pipe (IV-0006) — show `(shell exited, pipe held)` in the
+widget, the `/runbg-sessions` picker, and the `list_sessions` TUI rows
+(`[shell exited]`), and carry a `note` header line on still-running results.
+The footer/widget refreshes as soon as a background session exits; the
+exited session remains drainable via `write_stdin` until observed,
 preserving the usual lazy cleanup semantics.
 
 By design this display omits some metadata the LLM sees (`chunk_id`,
@@ -598,13 +609,24 @@ MAX_TIMER_ARM_MS               = 2^31-1   (setTimeout chunk size for multi-day y
 DEFAULT_MAX_BYTES            = 50 KiB  (LLM-visible per-call truncation cap)
 DEFAULT_MAX_LINES            = 2000
 OUTPUT_POLL_INTERVAL_MS      = 250     (pi-specific: onUpdate cadence)
-PREVIEW_LINES                = 5       (visual TUI lines before app.tools.expand)
 ```
 
 ## Semantic notes
 
 - **Early exit**: commands that finish in <150 ms never touch the session
   store. The response has `exit_code`, no `session_id`.
+- **Held-open diagnosis (IV-0006)**: a session whose shell has exited but
+  whose output pipe is still held by background processes (inherited
+  stdout/stderr, `cd … && cmd &` chains) reports `[still running]` with a
+  `note` header line explaining the state and giving the detach/kill
+  remedies — platform-aware (Windows taskkill live-root and POSIX `setsid`
+  escapes are named instead of overpromising `kill_session`).
+  `list_sessions` marks such entries `shell_exited: true` (`[shell exited]`
+  in the text listing, live entries only); the widget and `/runbg-sessions`
+  picker show `(shell exited, pipe held)`. An armed `on_exit: "wake"`
+  stays pending until the last pipe holder exits — poll, kill, or disarm
+  instead of waiting for it. Kill-failed results append the note when the
+  killed-but-alive session is held open (wake eligibility restored).
 - **Session persistence between calls**: if a process exits after a tool call
   returns but before the next one, the session stays in the store. The next
   `write_stdin(session_id, …)` call will observe the exit and return
@@ -641,6 +663,8 @@ PREVIEW_LINES                = 5       (visual TUI lines before app.tools.expand
 src/
 ├── index.ts              # tool registration, event handlers, flag
 ├── session.ts            # ExecSession: spawn, read, write, kill, log-stream, state
+├── log-archive.ts        # log policy: 0600 O_EXCL create, mirror cap, TTL cleanup (divergence #3)
+├── interaction-lock.ts   # per-session read/write serialization, preemptible polls (divergence #7)
 ├── session-store.ts      # SessionStore + LRU eviction (matches codex)
 ├── head-tail-buffer.ts   # direct port of codex's HeadTailBuffer
 ├── collect.ts            # collectOutputUntilDeadline
@@ -648,6 +672,7 @@ src/
 ├── time.ts               # strict RFC 3339 UTC parsing for yield_until
 ├── format-time.ts        # shared elapsed / remaining human labels
 ├── completion.ts         # CompletionCoordinator: on_exit "wake" scheduling (exactly-once)
+├── wake-match.ts         # IV-0004 matching core: IncrementalMatcher + MatchLineRing
 ├── notify.ts             # Notify / Gate / sleep primitives
 ├── pty.ts                # node-pty loader + pipes fallback + Windows tree-kill
 ├── shell.ts              # shell selection & argv construction (Windows-aware)
@@ -664,6 +689,11 @@ docs/
 ├── DC-0001-agentic-workspace.md                  # IV/DC doctrine
 ├── IV-0001-long-wait-and-wake-control.md         # long-wait / wake initiative
 ├── IV-0002-output-lifecycle-and-rendering.md     # bounded output / compact TUI
+├── IV-0003-log-cursor-reads.md                   # scoped, not built: resumable cursor reads
+├── IV-0004-wake-on-output-pattern.md             # readiness wake (on_output)
+├── IV-0005-settled-gated-wake-delivery.md        # settled-gated wake flush
+├── IV-0006-held-open-session-diagnosis.md        # held-open diagnosis (shell exited, pipe held)
+├── design.md                                     # design rationale
 └── DEV.md                                        # contributor onboarding
 ```
 
@@ -780,9 +810,15 @@ cancellation, timer/listener cleanup, rate-limited streaming with no idle
 heartbeat), the CompletionCoordinator (exactly-once invariant, observation
 leases, `setOnExit` disarm/re-arm including tombstones, kill/eviction/shutdown
 suppression, batching, bounded sanitized wake content), wake + yield_until +
-`set_on_exit` + `wake_armed` listing integration through the real tools, plus
-the pre-existing
-coverage: HeadTailBuffer (direct port of codex's unit
+`set_on_exit` + `wake_armed` listing integration through the real tools, the
+IV-0004 matching core (incremental literal scan, ASCII-only fold, byte-bound
+carry, excerpt ring), per-session interaction serialization (divergence #7:
+preemptible polls, queued-cancel drops, tombstone echo), log-archive safety
+(divergence #3: 0600 O_EXCL create, mirror cap, TTL cleanup), crash-path
+reaping (divergence #2), session-cap refusal (divergence #6), the steering
+cut-short (divergence #10), the dormant-tools toggle (divergence #5),
+builtin-bash preservation (divergence #1), headless `pi -p` acceptance, plus
+the pre-existing coverage: HeadTailBuffer (direct port of codex's unit
 tests), Notify/Gate/sleep, collectOutputUntilDeadline (10 scenarios incl.
 abort-listener/timer cleanup), SessionStore LRU (10 scenarios), truncateTail
 (ported from pi, 13 scenarios), unescapeChars (14 scenarios for
@@ -870,8 +906,9 @@ configured TTL can never undercut that heartbeat.
   navigation. The UI refreshes immediately on background session exit without
   pruning the exited session before the next `write_stdin`/`list_sessions`.
 - Explicit `renderCall` / `renderResult` coverage for all five tools, mirroring
-  Pi bash's styling: command banners, five-visual-line output tails, configured
-  `app.tools.expand` hints, compact session inventories, live elapsed counters,
+  Pi bash's styling: command banners, ten-visual-line output tails
+  (`PI_RUNBG_PREVIEW_LINES`), configured `app.tools.expand` hints, compact
+  session inventories, live elapsed counters,
   process/kill status footers, and `⟳ poll` / `» input` banners.
 - `cwd`, `command`, and `yield_time_ms` are surfaced in tool-call details
   (and `cwd` in the LLM-visible response header) for easy debugging.
@@ -925,6 +962,14 @@ Supported — both pipes and PTY mode:
   (access denied, protected process), `kill_session` says so and the session
   stays registered for retry — it is never silently dropped while the
   process lives.
+- **Held-open sessions are not always killable.** On Windows, `kill_session`
+  on a session whose shell has already exited cannot reach the background
+  holder — `taskkill /T` enumerates children of a live root only (the same
+  applies on POSIX to a `setsid`'d holder, which escapes the group kill).
+  The kill-failed result appends the held-open note (IV-0006) with the
+  `tasklist`/`taskkill /pid` remedy or the wait-for-exit option; the note is
+  the diagnosis surface, `list_sessions` shows the state (`shell_exited` /
+  `[shell exited]`), and a poll surfaces the note.
 - **Supply-chain note (PTY prebuilds).** npm's lockfile integrity covers the
   `@homebridge/node-pty-prebuilt-multiarch` JS payload, but the native
   ConPTY binary is fetched at install time by `prebuild-install` from the

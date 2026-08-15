@@ -10,6 +10,32 @@ its names.
 
 
 ### Added
+- **Held-open session diagnosis (IV-0006) — port of upstream 0.9.1
+  (`8493da5`) through the sync contract, with documented extensions.** A
+  session whose shell has exited but whose output pipe is held open by
+  background processes (inherited stdout/stderr; `cd … && cmd &` chains)
+  previously reported `[still running]` forever with no explanation.
+  `SpawnedChild.processExited` (pipes: the `exit` event; PTY: node-pty
+  onExit) and `ExecSession.shellExited` (defensive
+  `child?.processExited ?? false`) separate shell exit from the
+  close-based session exit. The note is derived centrally in each tool's
+  `finalizeResponse` wrapper (gated on `sessionId` presence — the
+  `[still running]` condition) plus the standalone `cancelledWhileQueued`
+  site, and renders as a header line on still-running results.
+  Platform-aware remedy text (Windows taskkill live-root; POSIX `setsid`
+  escape). `list_sessions` gains `shell_exited` (live entries only) +
+  `[shell exited]` marker; widget and `/runbg-sessions` picker show
+  `(shell exited, pipe held)`; the TUI result row shows a bounded note
+  hint. Wake contract documented and tested: an armed `on_exit` wake
+  stays pending while the pipe is held. Kill-failed results append the
+  note when the killed-but-alive session is held open (wake eligibility
+  restored per IV-0005). exec_command guidance scoped: `kill_session`
+  reaches ordinary same-group children only. Tests: tests/held-open.test.ts
+  (16 cases — raw-spawn state, sync/async spawn failures, note wiring across
+  all six still-running sites, list_sessions, widget/picker, wake contract,
+  setsid'd-holder failed kill). Sync record: upstream commits since the fork:
+  `8493da5` (held-open diagnosis — ported with extensions, UPSTREAM.md #13)
+  and `e1dc5f7` (pi 0.84.1 dev-baseline chore — not ported).
 - **Settled-gated wake delivery (IV-0005, implemented).** Lifecycle-aware
   runtimes now keep fired exit/readiness wakes pending during an active agent
   run and flush them at `agent_settled`, with one shared settled-chain barrier
@@ -256,6 +282,24 @@ its names.
 
 
 ### Docs
+
+- **Gitignore the project-local review skill.** `.pi/skills/` is excluded
+  (agent instructions for the IV review gauntlet — df/dp/sol-reviewer
+  rounds with live supervisor discussion — kept local, not shared via
+  git).
+
+- **README/UPSTREAM docs sync.** The README's fork notice no longer claims
+  schemas and constants are preserved verbatim (they are not: additive
+  `on_output`, relaxed `set_on_exit.on_exit`, `MAX_YIELD_TIME_MS` 30 s →
+  290 s, `PREVIEW_LINES` 5 → 10 — all already recorded as divergences). The
+  architecture and workspace-docs trees now list every file
+  (`interaction-lock.ts`, `log-archive.ts`, `wake-match.ts`, `design.md`,
+  IV-0003/0004/0005 docs), the tests paragraph covers the post-0.9.0 suites
+  (divergences #1/#2/#3/#5/#6/#7/#10, headless, wake-match), the stale
+  duplicate `PREVIEW_LINES = 5` constant entry and the two remaining
+  "five-visual-line" claims are removed (code default is 10), and the
+  Commands section documents `/runbg steer on|off`.
+  UPSTREAM.md's contract line now matches the fork notice.
 
 - **IV-0004 — wake on output pattern (readiness wake), implemented design.**
  New design doc and shipped implementation add an `on_output: { pattern,
