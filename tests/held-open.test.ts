@@ -345,7 +345,32 @@ describe("held-open note wiring through the tools", () => {
 		assert.equal(entry.running, true);
 		assert.equal(entry.shell_exited, true);
 		assert.ok(ls.content[0].text.includes("[shell exited]"), "text listing marks the state");
-		await h.call("kill_session", { session_id: sid });
+		// Cleanup: on POSIX the group kill (kill -pgid) lands instantly and the
+		// session is removed. On Windows, taskkill /T /F can only enumerate the
+		// children of a LIVE root — the shell has already exited here, so the
+		// background holder is unreachable (the documented IV-0006 live-root
+		// limitation; the kill-failure result carries the platform note) and the
+		// session stays registered until the holder exits on its own. Assert that
+		// documented behavior, then wait for the natural cleanup so the phase
+		// below starts from a clean store.
+		const killRes = await h.call("kill_session", { session_id: sid });
+		if (IS_WINDOWS) {
+			assert.equal(
+				killRes.details.status,
+				"kill_failed",
+				"Windows live-root kill cannot reach the holder of an exited shell",
+			);
+			assert.ok(
+				killRes.details.failure_message?.includes("shell has exited"),
+				"kill-failure result carries the held-open note",
+			);
+			const cleanupDeadline = Date.now() + 6000;
+			while (Date.now() < cleanupDeadline) {
+				const lsClean = await h.call("list_sessions", {});
+				if (!lsClean.details.sessions.some((s: any) => s.session_id === sid)) break;
+				await sleep(150);
+			}
+		}
 
 		// Second session: let the holder exit NATURALLY so the exit is silent
 		// — the next list_sessions reaps it and reports it one final time with

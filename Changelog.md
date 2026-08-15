@@ -330,6 +330,18 @@ its names.
 
 ### Fixed
 
+- **Held-open test fixed on Windows (IV-0006 suite).**
+  `list_sessions … reaped entries stay clean` assumed `kill_session`
+  removes a held-open session on every platform: the POSIX group kill
+  (`kill -pgid`) does, but Windows `taskkill /T /F` can only enumerate
+  the children of a **live** root — the shell had already exited in the
+  fixture, so the background holder was unreachable and the session
+  legitimately stayed registered (the documented IV-0006 live-root
+  behavior, which the kill-failure note explains). The test now asserts
+  the Windows `kill_failed` result with its platform note and waits for
+  the holder's natural exit, instead of assuming removal. This is a test
+  fix only — the product behavior is the intended diagnosis.
+
 - **PTY mode works again on current Node.** The optional
   `@homebridge/node-pty-prebuilt-multiarch` pin (`0.13.1`) declares
   `engines: >=18.0.0 <25.0.0`, and npm skips an optional dependency whose
