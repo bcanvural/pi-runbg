@@ -340,7 +340,13 @@ its names.
   behavior, which the kill-failure note explains). The test now asserts
   the Windows `kill_failed` result with its platform note and waits for
   the holder's natural exit, instead of assuming removal. This is a test
-  fix only — the product behavior is the intended diagnosis.
+  fix only — the product behavior is the intended diagnosis. Two
+  load-sensitive fixtures hardened after a second CI run flaked on
+  Node 24 (macOS + Windows): the platform-note case's yield window
+  widened (500ms→1.5s, holder 5s→15s) so the result cannot finalize
+  before the shell-exit event lands when spawn is load-delayed; the
+  setsid'd-holder fixture extended 6s→15s so the holder outlives any
+  stall between spawn and the kill attempt.
 
 - **PTY mode works again on current Node.** The optional
   `@homebridge/node-pty-prebuilt-multiarch` pin (`0.13.1`) declares

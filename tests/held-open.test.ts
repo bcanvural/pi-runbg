@@ -270,9 +270,13 @@ describe("held-open note wiring through the tools", () => {
 	it("exec_command on a held-open session carries the platform note", async () => {
 		const h = makeHarness();
 		await h.emit("session_start");
-		// The shell exits within ms (echo done); sleep holds the pipe for 5s,
-		// so the 500ms-attached result is still running WITH the note.
-		const r = await h.call("exec_command", { cmd: "sleep 5 & echo done", yield_time_ms: 500, shell: "bash" });
+		// The shell exits within ms (echo done); sleep holds the pipe, so the
+		// attached result is still running WITH the note. The yield window
+		// must cover spawn plus the exit-event delivery: on a loaded CI runner
+		// the spawn itself can eat most of a 500ms window and the result
+		// finalizes before bash's exit event lands (seen on Node 24 Windows).
+		// 1.5s window, 15s holder — the session is safely held throughout.
+		const r = await h.call("exec_command", { cmd: "sleep 15 & echo done", yield_time_ms: 1500, shell: "bash" });
 		assert.equal(r.details.status, "running");
 		assert.ok(r.details.note, "held-open note present on the still-running result");
 		assert.ok(r.details.note.includes(NOTE_HEAD), `note names the state: ${r.details.note}`);
@@ -500,11 +504,13 @@ describe("kill failure on a held-open session (POSIX)", { skip: IS_WINDOWS }, ()
 		await h.emit("session_start");
 		// python3 os.setsid() creates a new session — the holder escapes the
 		// shell's group, so kill(-pgid) lands on nothing once the shell exits.
-		// The holder must outlive the kill grace (2s SIGTERM + 500ms SIGKILL),
-		// hence time.sleep(6). python3 is an assumed POSIX test dependency
+		// The holder must outlive the kill grace (2s SIGTERM + 500ms SIGKILL)
+		// plus any load stall between spawn and the kill call (a loaded CI
+		// runner delayed the kill past a 6s holder on Node 24 macOS), hence
+		// time.sleep(15). python3 is an assumed POSIX test dependency
 		// (e2e-pty drives a REPL).
 		const r = await h.call("exec_command", {
-			cmd: 'python3 -c "import os,time; os.setsid(); time.sleep(6)" & echo done',
+			cmd: 'python3 -c "import os,time; os.setsid(); time.sleep(15)" & echo done',
 			yield_time_ms: 400,
 			on_exit: "wake",
 			shell: "bash",
