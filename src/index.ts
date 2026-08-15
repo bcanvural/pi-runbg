@@ -2114,8 +2114,9 @@ function startStreaming(
 export default function (pi: ExtensionAPI) {
 	const coordinator = new CompletionCoordinator({
 		send: (message) => {
-			// If pi is idle this starts a model turn; if a run is active it is
-			// queued as a follow-up — never steering/interrupting the current turn.
+			// Lifecycle-aware coordinators invoke this only after agent_settled; on
+			// older hosts the fallback may queue a follow-up while a run is active,
+			// but it never steers or interrupts the current turn.
 			// Match wakes get their own customType ("runbg-matched") so the TUI
 			// and persisted transcript can tell a readiness wake from an exit
 			// wake; the payload shape is identical for both kinds (IV-0004).
@@ -2134,6 +2135,9 @@ export default function (pi: ExtensionAPI) {
 				`runbg: failed to deliver completion notification: ${err instanceof Error ? err.message : String(err)}`,
 				"warning",
 			);
+		},
+		onLifecycleUnavailable: () => {
+			console.warn("runbg: settled-gated wake delivery unavailable; using immediate flush fallback");
 		},
 	});
 	const ctx: ExtensionCtx = {
@@ -2180,17 +2184,26 @@ export default function (pi: ExtensionAPI) {
 	pi.on("tool_execution_end", async (event) => {
 		ctx.coordinator.handleToolExecutionEnd(event.toolCallId, event.isError === true);
 	});
-	// agent_settled (pi >= 0.80.5, our peer minimum) is a safe point to flush
-	// pending completions (e.g. retry a failed send). Wrapped so an older
-	// runtime that rejects unknown events degrades gracefully — wakes still
-	// deliver via the debounce timer and tool boundaries.
+	// Lifecycle-aware delivery is enabled only when BOTH subscriptions succeed.
+	// A partial registration leaves the agent_start handler inert through the
+	// coordinator capability flag, preserving the old immediate-flush fallback.
+	let agentStartRegistered = false;
+	let agentSettledRegistered = false;
 	try {
-		pi.on("agent_settled", async () => {
-			ctx.coordinator.flushPending();
+		pi.on("agent_start", () => {
+			ctx.coordinator.setAgentStarted();
 		});
+		agentStartRegistered = true;
 	} catch {
-		// pi < 0.80.5: no agent_settled event — non-fatal.
+		// Older/alternate hosts may reject this event name.
 	}
+	try {
+		pi.on("agent_settled", () => ctx.coordinator.setAgentSettled());
+		agentSettledRegistered = true;
+	} catch {
+		// Older/alternate hosts may reject this event name.
+	}
+	coordinator.setLifecycleHandlersRegistered(agentStartRegistered, agentSettledRegistered);
 
 	pi.on("session_start", async (_event, eventCtx) => {
 		ctx.ui = eventCtx.ui;
@@ -2473,7 +2486,7 @@ export default function (pi: ExtensionAPI) {
 			// and the guidelines elaborate.
 			`Run a command in a persistent session. Choose the wait mode FIRST:
 - Finishes within ~5 min → ONE exec_command with yield_time_ms covering it (max ${MAX_YIELD_TIME_MS} ms). Do not split into a short yield plus a poll.
-- Longer or unknown → exec_command, then on_exit: "wake", then END THE TURN. The result is delivered on completion.
+- Longer or unknown → exec_command. If the human explicitly wants auto-resume when a terminating process completes, include on_exit: "wake" and END THE TURN; otherwise leave the default "none" and poll later or end the turn according to the workflow.
 - Non-terminating with a readiness signal (dev servers, watchers, migrations that stay up) → exec_command with on_output: {pattern} armed, then END THE TURN — woken on the first match.
 - Interactive (REPL, ssh, sudo) → exec_command with a short yield, then drive it with write_stdin.
 Returns \`session_id\` if still running or \`exit_code\` if it finished within yield_time_ms. If a separate \`bash\` tool is also available, prefer exec_command for anything that MIGHT run long: only a session yields a handle, so only it can hand control back while the command keeps running — a bash call of the same length blocks until it finishes. Use bash only for commands that are certainly fast. NEVER background inside cmd (\`&\`, \`nohup\`): the session already is the background. NEVER arm on_exit: "wake" for a process that does not exit on its own (dev servers, watchers) — it can only fail to fire; for readiness of those, arm on_output instead, and arm BOTH arms if crash-before-ready matters. Use set_on_exit to disarm or re-arm a running session.`,
@@ -2481,12 +2494,12 @@ Returns \`session_id\` if still running or \`exit_code\` if it finished within y
 		promptGuidelines: [
 			"Prefer dedicated file tools when available (read/grep/find/ls). Otherwise use exec_command with fast shell tools: rg for content search, fd if available (or find) for file names, and ls for directories.",
 			"When pi\'s built-in `bash` is also available, still route anything that MIGHT run long through exec_command — builds, test suites, installs, migrations, deploys, anything network-bound. Only exec_command yields a session, so only it can hand control back mid-wait when the human types; a bash call of the same length makes them wait it out or press Esc, which kills the command outright. Reach for bash only for commands that are certainly fast.",
-			`Choose how you will wait BEFORE starting, from the job's expected duration. Expected to finish within ~5 minutes: ONE exec_command whose yield_time_ms covers it (~500ms for quick one-shots, ${DEFAULT_EXEC_YIELD_MS} ms default, up to ${MAX_YIELD_TIME_MS} ms) — do not split this into a short yield plus a poll, which costs an extra turn for the same wait. Longer than that, or unknown: start it, then set on_exit: "wake" and END THE TURN — the result is delivered to you automatically when it finishes, which beats holding the turn or hoping someone checks back. Non-terminating with a readiness signal (dev servers, watchers, migrations that stay up): exec_command with on_output: {pattern} armed, then END THE TURN — you are woken on the first match; use a distinctive banner substring, never a common word like "ready". Interactive processes (REPLs, ssh, sudo) always return a session_id you then drive with write_stdin. Never end a turn with a live session you have not named to the human, and kill_session anything you have stopped caring about — abandoned sessions still count toward the session cap.`,
+			`Choose how you will wait BEFORE starting, from the job's expected duration. Expected to finish within ~5 minutes: ONE exec_command whose yield_time_ms covers it (~500ms for quick one-shots, ${DEFAULT_EXEC_YIELD_MS} ms default, up to ${MAX_YIELD_TIME_MS} ms) — do not split this into a short yield plus a poll, which costs an extra turn for the same wait. Longer than that, or unknown: start it; keep on_exit at its default "none" unless the human explicitly wants auto-resume on termination. If they do, set on_exit: "wake" and END THE TURN; otherwise poll later or end the turn according to the workflow. Non-terminating with a readiness signal (dev servers, watchers, migrations that stay up): exec_command with on_output: {pattern} armed, then END THE TURN — you are woken on the first match; use a distinctive banner substring, never a common word like "ready". Interactive processes (REPLs, ssh, sudo) always return a session_id you then drive with write_stdin. Never end a turn with a live session you have not named to the human, and kill_session anything you have stopped caring about — abandoned sessions still count toward the session cap.`,
 			"Do not background inside cmd (`&`, `nohup`, `disown`) — the session IS the background: run the long process as cmd itself and poll it with write_stdin. A backgrounded child is not tracked by its session; if it inherits the session's output pipe, the session keeps reporting [still running] long after your cmd finished, and kill_session ends it anyway (SIGTERM goes to the whole process group, which nohup does not survive). Use setsid only when the human explicitly wants a process to outlive pi.",
 			"Compose multi-step waits in the shell, not across tool calls — the shell is your scripting layer, so anything needing no model judgment between steps belongs in one command. `until curl -sf URL; do sleep 2; done && npm test 2>&1 | tail -40` is a single call; polling, checking, then running is five or six. Prefer waiting on a CONDITION over sleeping a fixed duration: it returns the instant the condition holds instead of after a guess, and a bare sleep whose only purpose is to pass time gives you a session with nothing to observe.",
 			"Filter output at the source (tail, grep, wc, --quiet flags) rather than pulling everything into context. Results are bounded by a head/tail buffer, so an unfiltered 900-line run silently loses its MIDDLE — usually where the failure is. Truncation is a safety net, not a filtering strategy. log_path always holds the complete stream: grep or read that when the bounded result is not enough, instead of re-running the job.",
 			`An empty write_stdin poll (no chars) waits for progress and accepts yield_time_ms up to 290 seconds (${DEFAULT_MAX_BACKGROUND_POLL_MS} ms, cache-friendly). Each poll returns only output that is NEW since the last one, never bytes you have already seen, so a poll's cost is the TURN rather than the payload — which is why one long poll beats several short ones. Do NOT use yield_until just to bypass the 290s cap — only when the human explicitly asks for a long attached wait or a wall-clock deadline (finite non-interactive jobs only).`,
-			'on_exit defaults to "none". Arm on_exit: "wake" for any long job that TERMINATES and that you would otherwise wait on — it delivers the result to you on completion, so you can end the turn instead of blocking it. NEVER arm it for something that does not exit on its own (dev servers, watchers, tail -f): it would simply never fire — for readiness of those, arm on_output: {pattern} instead, and arm BOTH arms (on_exit: "wake" + on_output) if crash-before-ready matters (first event wins; a match-only arm yields NO wake if the process dies before matching). If you armed it by mistake, call set_on_exit(session_id, on_exit: "none") promptly (does not kill the process). kill_session both kills and suppresses the wake. Combining wake with an observing write_stdin is safe: direct completion consumes the wake.',
+			'on_exit defaults to "none". Arm on_exit: "wake" ONLY when the human explicitly wants auto-resume for a terminating job; then end the turn and let the completion wake resume the workflow. NEVER arm it for something that does not exit on its own (dev servers, watchers, tail -f): it would simply never fire — for readiness of those, arm on_output: {pattern} instead, and arm BOTH arms (on_exit: "wake" + on_output) if crash-before-ready matters (first event wins; a match-only arm yields NO wake if the process dies before matching). A lifecycle-aware host may hold an unobserved wake until the current agent run reaches agent_settled; a direct finalized write_stdin result consumes it first. If you armed it by mistake, call set_on_exit(session_id, on_exit: "none") promptly (does not kill the process). kill_session both kills and suppresses the wake. Combining wake with an observing write_stdin is safe: direct completion consumes the wake.',
 			'Wakes are disarmed per arm, and both arms are one-shot. on_exit: "none" disarms ONLY the exit arm; on_output: null disarms ONLY the match arm; the combined call (on_exit: "none", on_output: null) is full cleanup — a both-omitted set_on_exit call is a valid no-op audit that returns the current armed state. After a match wake, output beyond the match_excerpt has NOT been consumed: poll write_stdin (no chars) or read log_path before acting. A match wake with a large elapsed hint ("matched after 4h12m") may be stale — verify the signal is still relevant before acting, and re-arm via set_on_exit(on_output: {...}) for any later signal.',
 		],
 		parameters: Type.Object({

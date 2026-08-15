@@ -574,6 +574,22 @@ describe("exec_command on_exit", () => {
 		await h.emit("session_shutdown");
 	});
 
+it("defers an unobserved wake until the lifecycle settled boundary", async () => {
+    const h = makeHarness();
+    await h.emit("session_start");
+    await h.emit("agent_start", { type: "agent_start" });
+    const result = await h.call("exec_command", { cmd: "sleep 0.3", yield_time_ms: 250, on_exit: "wake" });
+    assert.ok(typeof result.details.session_id === "number");
+    await sleep(500);
+    assert.equal(h.sentMessages.length, 0, "active lifecycle phase must gate the debounce flush");
+    const settled = h.emit("agent_settled", { type: "agent_settled" });
+    assert.ok(await waitFor(() => h.sentMessages.length === 1), "wake expected at settlement");
+    await h.emit("agent_start", { type: "agent_start" });
+    await h.emit("agent_settled", { type: "agent_settled" });
+    await settled;
+    await h.emit("session_shutdown");
+});
+
 	it("agent_settled flushes a wake whose send previously failed", async () => {
 		const h = makeHarness();
 		await h.emit("session_start");
@@ -602,10 +618,13 @@ describe("exec_command on_exit", () => {
 		// poll until either a (failed) exit path settled or timeout.
 		await sleep(350);
 		assert.equal(h.sentMessages.length, 0);
-		await h.emit("agent_settled", { type: "agent_settled" });
+		const settled = h.emit("agent_settled", { type: "agent_settled" });
 		assert.ok(await waitFor(() => h.sentMessages.length === 1), "retry at agent_settled");
+		await h.emit("agent_start", { type: "agent_start" });
+		await h.emit("agent_settled", { type: "agent_settled" });
+		await settled;
 		await h.call("write_stdin", { session_id: r1.details.session_id, yield_time_ms: 5000 });
-	});
+});
 });
 
 describe("on_output consumption", () => {
@@ -1088,6 +1107,8 @@ describe("on_output delivery", () => {
 		assert.ok(await waitFor(() => h.sentMessages.length === 1), "first wake");
 		assert.equal(h.sentMessages[0].message.customType, "runbg-matched");
 		assert.match(String(h.sentMessages[0].message.details?.sessions?.[0]?.matchExcerpt), new RegExp(t1));
+		await h.emit("agent_start", { type: "agent_start" });
+		await h.emit("agent_settled", { type: "agent_settled" });
 		// The second banner prints at ~1.0s — re-arm before it lands.
 		const rearm = await h.call("set_on_exit", { session_id: sid, on_output: { pattern: t2 } });
 		assert.equal(rearm.details.status_match, "armed");

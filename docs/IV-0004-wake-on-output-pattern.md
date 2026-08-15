@@ -136,8 +136,10 @@ on_output: { pattern: string, case_sensitive?: boolean }   // default false
   a second customType with the same `{content, display, details}` shape
   needs only docs/tests/UPSTREAM updates.
 - **Batching by wake kind.** The coordinator batches all eligible records
-  into one `buildWakeMessage` (`src/completion.ts:391-420`) while the send
-  wrapper hardcodes `customType: "runbg-completed"`. A mixed debounce window
+  into one `buildWakeMessage`/`buildMatchWakeMessage` batch in the coordinator's
+  `flushPending` path while the send wrapper hardcodes
+  `customType: "runbg-completed"` for exit wakes.
+  A mixed debounce window
   (exit wake for session A + match wake for session B) is therefore split:
   **flush groups by wake kind and emits at most one message per kind per
   flush** (max two). Per-session first-event-wins already guarantees no

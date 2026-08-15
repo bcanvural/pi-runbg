@@ -793,6 +793,159 @@ describe("CompletionCoordinator match arm (IV-0004)", () => {
 	});
 });
 
+describe("CompletionCoordinator settled-gated delivery (IV-0005)", () => {
+	function lifecycleCoordinator(send: (message: WakeMessage) => void | Promise<void>) {
+		return new CompletionCoordinator({ send, debounceMs: 1, lifecycleAware: true });
+	}
+
+	it("keeps fired exit and match wakes pending while an agent is active", () => {
+		const sent: WakeMessage[] = [];
+		const coordinator = lifecycleCoordinator((message) => {
+			sent.push(message);
+		});
+		coordinator.setAgentStarted();
+		const exit = new FakeSession(101);
+		const match = new FakeSession(102);
+		coordinator.register(exit);
+		coordinator.register(match, { onExit: false, onOutput: { pattern: "ready", caseSensitive: false } });
+		exit.exit(0);
+		match.fireMatch("ready");
+		assert.deepEqual(coordinator.flushPending(), { accepted: 0, outstanding: 0 });
+		assert.equal(sent.length, 0);
+		coordinator.shutdown();
+	});
+
+	it("settled flush releases orphan leases and delivers without consuming them", async () => {
+		const sent: WakeMessage[] = [];
+		const coordinator = lifecycleCoordinator((message) => {
+			sent.push(message);
+		});
+		coordinator.setAgentStarted();
+		const session = new FakeSession(103);
+		coordinator.register(session, { onExit: false, onOutput: { pattern: "ready", caseSensitive: false } });
+		coordinator.beginObservation(session.id, "orphan-call");
+		session.fireMatch("ready");
+		coordinator.stageMatchConsumption("orphan-call", session.id, "ready");
+		const firstSettled = coordinator.setAgentSettled();
+		assert.equal(sent.length, 1, "settlement must fail-open the abandoned lease");
+		assert.equal(sent[0].kind, "match");
+		coordinator.setAgentStarted();
+		await coordinator.setAgentSettled();
+		await firstSettled;
+		assert.equal(coordinator.recordCount, 0);
+	});
+
+	it("gives direct observation precedence over a deferred exit wake", async () => {
+		const sent: WakeMessage[] = [];
+		const coordinator = lifecycleCoordinator((message) => {
+			sent.push(message);
+		});
+		coordinator.setAgentStarted();
+		const session = new FakeSession(104);
+		coordinator.register(session);
+		coordinator.beginObservation(session.id, "poll");
+		session.exit(0);
+		assert.deepEqual(coordinator.flushPending(), { accepted: 0, outstanding: 0 });
+		coordinator.markPendingTerminal(session.id, "poll");
+		coordinator.handleToolExecutionEnd("poll", false);
+		await coordinator.setAgentSettled();
+		assert.equal(sent.length, 0);
+	});
+
+	it("holds one settled barrier through a mixed-kind wake chain", async () => {
+		const sent: WakeMessage[] = [];
+		const coordinator = lifecycleCoordinator((message) => {
+			sent.push(message);
+		});
+		coordinator.setAgentStarted();
+		const exit = new FakeSession(105);
+		const match = new FakeSession(106);
+		coordinator.register(exit);
+		coordinator.register(match, { onExit: false, onOutput: { pattern: "ready", caseSensitive: false } });
+		exit.exit(0);
+		match.fireMatch("ready");
+		const barrier = coordinator.setAgentSettled();
+		assert.equal(sent.length, 2, "one selected batch may contain both wake kinds");
+		let resolved = false;
+		void barrier.then(() => {
+			resolved = true;
+		});
+		await Promise.resolve();
+		assert.equal(resolved, false, "barrier remains open after an accepted handoff");
+		coordinator.setAgentStarted();
+		await coordinator.setAgentSettled();
+		await barrier;
+		assert.equal(resolved, true);
+	});
+
+	it("restores idle and the reservation after an async settled-send rejection", async () => {
+		const sent: WakeMessage[] = [];
+		let reject!: (error: unknown) => void;
+		let attempts = 0;
+		const coordinator = lifecycleCoordinator((message) => {
+			attempts++;
+			if (attempts === 1) {
+				return new Promise<void>((_resolve, rejectPromise) => {
+					reject = rejectPromise;
+				});
+			}
+			sent.push(message);
+		});
+		coordinator.setAgentStarted();
+		const session = new FakeSession(107);
+		coordinator.register(session);
+		session.exit(1);
+		const barrier = coordinator.setAgentSettled();
+		assert.equal(coordinator.phase, "handoff");
+		reject(new Error("alternate sender failed"));
+		await barrier;
+		assert.equal(coordinator.phase, "idle");
+		const retry = coordinator.flushPending();
+		assert.deepEqual(retry, { accepted: 1, outstanding: 0 });
+		assert.equal(sent.length, 1);
+	});
+
+	it("runs one guarded no-start retry and resolves after all synchronous throws", async () => {
+		let sends = 0;
+		const coordinator = lifecycleCoordinator(() => {
+			sends++;
+			if (sends === 1) {
+				void coordinator.setAgentSettled();
+				return;
+			}
+			throw new Error("retry failure");
+		});
+		coordinator.setAgentStarted();
+		const session = new FakeSession(108);
+		coordinator.register(session);
+		session.exit(2);
+		const barrier = coordinator.setAgentSettled();
+		await barrier;
+		assert.equal(sends, 2, "the retry is one-shot and runs after the nested settle");
+		assert.equal(coordinator.phase, "idle");
+	});
+
+	it("reset resolves the shared barrier and invalidates a pending sender", async () => {
+		let release!: () => void;
+		const coordinator = lifecycleCoordinator(
+			() => new Promise<void>((resolve) => {
+				release = resolve;
+			}),
+		);
+		coordinator.setAgentStarted();
+		const session = new FakeSession(109);
+		coordinator.register(session);
+		session.exit(0);
+		const barrier = coordinator.setAgentSettled();
+		coordinator.reset();
+		await barrier;
+		release();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		assert.equal(coordinator.phase, "idle");
+		assert.equal(coordinator.recordCount, 0);
+	});
+});
+
 describe("buildMatchWakeMessage", () => {
 	it("frames match wakes with metadata, the sanitized excerpt, and re-arm guidance", () => {
 		const snapshots: MatchSnapshot[] = [
@@ -874,6 +1027,55 @@ describe("buildMatchWakeMessage", () => {
 		assert.match(msg.content, /40 background sessions matched/);
 		assert.match(msg.content, /and 24 more/);
 		assert.ok(msg.details.sessions.length <= 16);
+	});
+
+	it("sanitizes and bounds persisted metadata details", () => {
+		const osc = "\x1b]52;c;clipboard-secret\x07";
+		const match = buildMatchWakeMessage([
+			{
+				sessionId: 9,
+				command: `${osc}${"c".repeat(500)}`,
+				cwd: `${osc}${"d".repeat(200)}`,
+				startedAtMs: 0,
+				elapsedMs: 1000,
+				running: true,
+				logPath: `${osc}${"l".repeat(300)}`,
+				matchPattern: `${osc}${"p".repeat(300)}`,
+				matchExcerpt: `${osc}Server started\n`,
+				toolTimeUtc: "2026-08-15T12:00:00.000Z",
+				failureMessage: `${osc}${"f".repeat(300)}`,
+			},
+		]);
+		if (match.kind !== "match") throw new Error("expected a match wake");
+		const snapshot = match.details.sessions[0]!;
+		assert.ok(!JSON.stringify(snapshot).includes("\x1b"));
+		assert.ok(!JSON.stringify(snapshot).includes("clipboard-secret"));
+		assert.ok(snapshot.command.length <= 160);
+		assert.ok(snapshot.cwd.length <= 120);
+		assert.ok(snapshot.logPath!.length <= 200);
+		assert.ok(snapshot.matchPattern.length <= 120);
+		assert.equal(snapshot.matchExcerpt, "Server started\n");
+		assert.ok(snapshot.failureMessage!.length <= 200);
+
+		const exit = buildWakeMessage([
+			{
+				sessionId: 10,
+				command: `${osc}${"c".repeat(300)}`,
+				cwd: osc,
+				startedAtMs: 0,
+				elapsedMs: 1000,
+				exitCode: 1,
+				signal: null,
+				failureMessage: `${osc}${"f".repeat(300)}`,
+				logPath: `${osc}${"l".repeat(300)}`,
+			},
+		]);
+		if (exit.kind !== "exit") throw new Error("expected an exit wake");
+		const exitSnapshot = exit.details.sessions[0]!;
+		assert.ok(!JSON.stringify(exitSnapshot).includes("\x1b"));
+		assert.ok(!JSON.stringify(exitSnapshot).includes("clipboard-secret"));
+		assert.ok(exitSnapshot.command.length <= 160);
+		assert.ok(exitSnapshot.logPath!.length <= 200);
 	});
 });
 

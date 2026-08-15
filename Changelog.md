@@ -10,6 +10,17 @@ its names.
 
 
 ### Added
+- **Settled-gated wake delivery (IV-0005, implemented).** Lifecycle-aware
+  runtimes now keep fired exit/readiness wakes pending during an active agent
+  run and flush them at `agent_settled`, with one shared settled-chain barrier
+  held through finite wake chains. The coordinator tracks `idle`/`active`/
+  `handoff` phases, monotonic owner tokens, coordinator-wide pending sender
+  counts, guarded no-start retry, fail-open release of abandoned observation
+  leases/staged containment, and reset/shutdown invalidation. Registration of
+  `agent_start` and `agent_settled` is all-or-nothing; hosts without both keep
+  the previous immediate-flush fallback. Pi's production `sendMessage` remains
+  fire-and-forget, so async rejection handling is limited to alternate/test
+  senders that expose a promise.
 
 - **`on_output` — the readiness wake (IV-0004, implemented).**
   `exec_command` gains `on_output: { pattern, case_sensitive? }` and
@@ -35,6 +46,9 @@ its names.
   four-branch wait-mode decision, per-arm disarm (`on_output: null` /
   `on_exit: "none"` / combined), one-shot + re-arm, distinctive-substring
   matching, and the elapsed staleness hint.
+- Synthetic wake `details.sessions` now carries bounded, terminal-inert copies
+  of command, cwd, log path, failure, pattern, and excerpt metadata; raw
+  control sequences remain recoverable only in the session log.
 
 - **`write_stdin` guidance teaches the resumable log read** (IV-0003's v0):
   `output_bytes_total` equals the log file's byte length while the log is
@@ -176,16 +190,11 @@ its names.
   so a test pins the contract instead of a 30-second sleep.
   Prompted by comparing against oh-my-pi, which blocks 300 s by default and
   up to 3600 s in a single call.
-- **`on_exit: "wake"` is now recommended, not rationed.** Guidance previously
-  said to arm it *only* when the human explicitly asked, which left the agent
-  ending its turn and hoping someone checked back. It is now the default move
-  for a long job that **terminates**: the result is delivered on completion,
-  so the turn ends instead of blocking. The prohibition that matters is
-  narrower and unchanged — never for processes that do not exit on their own
-  (dev servers, watchers, `tail -f`), where it would simply never fire.
-  oh-my-pi treats push-delivery as the normal way to background work
-  (`async: true` → *"result will be delivered automatically"*), with no poll
-  surface at all.
+- **Wake guidance is lifecycle-aware and explicit-opt-in.** The shipped policy
+  keeps `on_exit` at its default `"none"` and arms `"wake"` only when the
+  human explicitly wants auto-resume for a terminating job; non-terminating
+  readiness uses `on_output`. Lifecycle-aware hosts hold unobserved wakes
+  until `agent_settled`, while a finalized direct observation consumes first.
 - **Pi's built-in `bash` tool is kept by default** (divergence #1,
   `UPSTREAM.md`): upstream removes it unless `--keep-builtin-bash`; runbg
   keeps it unless asked, via `/runbg replace-bash on` (below) or
@@ -248,20 +257,32 @@ its names.
 
 ### Docs
 
-- **IV-0004 — wake on output pattern (readiness wake), scoped spec.** New
-  design doc proposing an `on_output: { pattern, case_sensitive? }` arm on
-  `exec_command` (+ re-arm/disarm via `set_on_exit`) so backgrounded dev
-  servers and watchers — which never exit, so `on_exit: "wake"` can never
-  fire for them — can push-deliver a wake on first output match instead of
-  burning a turn blocked or polling. Literal-substring match on the push
-  path (drains never run in the background case), one-shot, first-event-wins
-  against `on_exit` when both arms are armed, bounded sanitized excerpt in
-  the wake payload, per-arm wake-policy state with arm generations, batching
-  grouped by wake kind, and a concrete guidance-carrier inventory (append-
-  vs replace-mode templates; modified-pi.md edits). Two independent design
-  reviews and two independent implementation reviews complete. Prompted by
-  oh-my-pi's hub `wait` pattern op. The implementation in this release
-  followed the spec as written (see Added and Changed above).
+- **IV-0004 — wake on output pattern (readiness wake), implemented design.**
+ New design doc and shipped implementation add an `on_output: { pattern,
+ case_sensitive? }` arm on `exec_command` (+ re-arm/disarm via `set_on_exit`)
+ so backgrounded dev servers and watchers — which never exit, so
+ `on_exit: "wake"` can never fire for them — can push-deliver a wake on first
+ output match instead of burning a turn blocked or polling. Literal-substring
+ match on the push path (drains never run in the background case), one-shot,
+ first-event-wins against `on_exit` when both arms are armed, bounded sanitized
+ excerpt in the wake payload, per-arm wake-policy state with arm generations,
+ batching grouped by wake kind, and a concrete guidance-carrier inventory
+ (append- vs replace-mode templates; modified-pi.md edits). Two independent
+ design reviews and two independent implementation reviews complete. Prompted
+ by oh-my-pi's hub `wait` pattern op; see Added and Changed above for the
+ shipped contract.
+
+- **IV-0005 — settled-gated wake delivery, implemented.** New design doc and
+ shipped implementation defer exit/readiness wake handoff while an agent run
+ is active, so a later `write_stdin` observation can consume the event instead
+ of receiving a redundant synthetic follow-up. The lifecycle-aware contract
+ flushes at `agent_settled`, holds the settled callback open through finite
+ wake chains for headless print mode, releases abandoned observation leases
+ fail-open, and hardens re-entrant/no-start paths with owner tokens, dispatch
+ counters, and a guarded post-event retry. Fallback behavior is explicitly
+ the old immediate-flush path when both lifecycle events cannot be registered.
+ Design and implementation reviewed and accepted in three adversarial rounds
+ (df-worker, dp-worker, worker-sol).
 
 ### Fixed
 

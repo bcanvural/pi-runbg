@@ -147,7 +147,7 @@ Runs a command in a persistent session.
 | `cols` | number | `120` | PTY width in columns (`tty: true` only; ignored for pipes). Clamped to [20, 500]. |
 | `rows` | number | `30` | PTY height in rows (`tty: true` only; ignored for pipes). Clamped to [5, 300]. |
 | `yield_time_ms` | number | `10_000` | How long this call stays attached waiting for output (an attachment window, not the command's lifetime), clamped to [250, 290_000] (divergence #9 — upstream capped at 30_000). |
-| `on_exit` | `"none"` \| `"wake"` | `"none"` | Persistent per-session policy for exits nobody is observing. `"wake"`: one synthetic follow-up prompt resumes the agent when the process exits — the right choice for a long job that **terminates**, so the agent can end its turn instead of blocking it. Never for processes that do not exit on their own (dev servers, watchers): it would never fire — use `on_output` for readiness there, and arm both arms if crash-before-ready matters. Change later with `set_on_exit`. |
+| `on_exit` | `"none"` \| `"wake"` | `"none"` | Persistent per-session policy for exits nobody is observing. Use `"wake"` **only when the human explicitly wants** an automatic resume for a job that terminates; then the agent can end its turn instead of blocking it. Never for processes that do not exit on their own (dev servers, watchers): it would never fire — use `on_output` for readiness there, and arm both arms if crash-before-ready matters. Change later with `set_on_exit`. |
 | `on_output` | `{ pattern: string, case_sensitive?: boolean }` | — | Readiness wake: ONE follow-up prompt on the **first output match** while the process runs. `pattern` is a **literal substring (not a regex)**, 1–256 characters (validated in encoded bytes); default case-insensitive via an ASCII-only fold (A–Z/a–z; non-ASCII matched byte-exact). Match a distinctive banner substring (`"Server started on :3000"`, `"listening on"`) — never a common word: `"ready"` is a substring of `"already"` and wakes early. Set `case_sensitive: true` when the banner is not distinctive. Composes with `on_exit: "wake"` — "wake me when ready, and wake me if it dies instead" — first event wins; exit wins only when **both** arms are armed. One-shot: re-arm via `set_on_exit` for a later signal. |
 
 Response body (short output, no truncation):
@@ -207,6 +207,7 @@ Drives or polls an existing session.
    command. Do **not** use it just to bypass the 290 s cap. Omit
    `yield_time_ms` and pass a future UTC timestamp ending in `Z` (compute
    from `tool_time_utc`). The call still returns immediately when the
+   process exits, is cancelled, or the deadline arrives.
 3. `on_exit` defaults to `"none"`. Use `"wake"` **only when the human
    explicitly wants** auto-resume on unobserved completion. Disarm is
    per-arm and does not kill: `set_on_exit(session_id, on_exit: "none")`
@@ -214,8 +215,10 @@ Drives or polls an existing session.
    clears only the match arm, and the combined call is full cleanup — do
    it promptly when wake was armed by mistake or the job is abandoned.
 4. Combining wake with an observing `write_stdin` is safe: a completion
-   observed directly by a tool result consumes the wake; a deadline or
-   cancellation leaves the wake armed until disarmed or delivered.
+   observed directly by a finalized tool result consumes the wake; a deadline
+   or cancellation leaves the wake armed until disarmed or delivered. On a
+   lifecycle-aware host, an unobserved wake may wait until the active agent run
+   reaches `agent_settled`; it is not injected into the active turn.
 5. `on_output: { pattern }` arms a **readiness wake** for processes that
    do not exit (dev servers, watchers, migrations that stay up): arm it at
    spawn, end the turn, and one wake arrives on the first output match.
@@ -337,10 +340,10 @@ Mechanics:
   leaves the wake armed; when the process later exits, exactly one
   follow-up prompt is sent.
 - The prompt is delivered via `pi.sendMessage(…, { triggerTurn: true,
-  deliverAs: "followUp" })`: it starts a turn if pi is idle and is queued
-  as a follow-up if a run is active — it never steers or interrupts the
-  current turn. Simultaneous completions are debounced into **one** bounded
-  prompt.
+  deliverAs: "followUp" })`: it starts a turn if pi is idle. Lifecycle-aware
+  hosts hold it while an agent run is active and flush it at `agent_settled`,
+  so it never steers or interrupts the current turn. Simultaneous completions
+  are debounced into **one** bounded prompt.
 - The prompt contains bounded execution metadata only (session id, exit
   code/signal, sanitized one-line command, cwd, elapsed time, log path,
   failure info) — never raw stdout/stderr. The exited session remains

@@ -188,6 +188,9 @@ mistaken / abandoned wake   → per-arm: set_on_exit(session_id, on_exit: "none"
 kill_session                → kill process AND suppress both wake arms
 list_sessions               → audit (wake_armed = exit arm, match_armed = match arm); consumes
                               pending exit wakes for exited sessions, never match wakes
+wake delivery (lifecycle-aware host) → hold an unobserved wake during an active
+                              agent run; flush at `agent_settled`; a finalized
+                              direct observation wins and consumes it first
 ```
 
 Session hygiene the template must teach:

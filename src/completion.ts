@@ -167,6 +167,67 @@ export type WakeMessage =
 	| { kind: "exit"; content: string; details: { sessions: CompletionSnapshot[] } }
 	| { kind: "match"; content: string; details: { sessions: MatchSnapshot[] } };
 
+export type AgentPhase = "idle" | "active" | "handoff";
+export type FlushSource = "timer" | "settled" | "settled-retry";
+
+/** Dispatch progress reported by a flush. Promise senders update this object when they settle. */
+export interface DispatchOutcome {
+	accepted: number;
+	outstanding: number;
+}
+
+interface SettledBarrier {
+	promise: Promise<void>;
+	resolve: () => void;
+	ownerToken: number | undefined;
+	accepted: number;
+	outstanding: number;
+	synchronousSettledDepth: number;
+	retryScheduled: boolean;
+	settled: boolean;
+	transition: SettledTransition | undefined;
+}
+
+interface SettledTransition {
+	barrier: SettledBarrier;
+	owner: HandoffOwner | undefined;
+	accepted: number;
+	outstanding: number;
+	noStart: boolean;
+}
+
+interface HandoffOwner {
+	token: number;
+	source: FlushSource;
+	awaitingStart: boolean;
+	accepted: number;
+	outstanding: number;
+	terminalNoStart: boolean;
+	barrier: SettledBarrier | undefined;
+	transition: SettledTransition | undefined;
+}
+
+interface DispatchBatch {
+	outcome: DispatchOutcome;
+	owner: HandoffOwner | undefined;
+	inFlight: number;
+	finalized: boolean;
+}
+
+interface DispatchReservation {
+	record: CompletionRecord;
+	arm: "exit" | "match";
+	generation: number;
+}
+
+interface PendingDispatch {
+	owner: HandoffOwner;
+	batch: DispatchBatch;
+	reservations: DispatchReservation[];
+	epoch: number;
+	accounted: boolean;
+}
+
 export interface CompletionCoordinatorOptions {
 	/** Deliver one synthetic model prompt (pi.sendMessage wrapper). May throw. */
 	send: (message: WakeMessage) => void | Promise<void>;
@@ -174,6 +235,10 @@ export interface CompletionCoordinatorOptions {
 	debounceMs?: number;
 	/** Optional error sink for failed sends (ui.notify wrapper). */
 	onSendError?: (error: unknown) => void;
+	/** Diagnostic for hosts that cannot register both lifecycle events. */
+	onLifecycleUnavailable?: () => void;
+	/** Direct test/alternate-host configuration; extension wiring should use setLifecycleHandlersRegistered. */
+	lifecycleAware?: boolean;
 	/** Injectable timers. Test hooks. */
 	setTimeoutFn?: (cb: () => void, ms: number) => unknown;
 	clearTimeoutFn?: (handle: unknown) => void;
@@ -182,10 +247,55 @@ export interface CompletionCoordinatorOptions {
 
 const DEFAULT_DEBOUNCE_MS = 250;
 const MAX_COMMAND_CHARS = 160;
+const MAX_CWD_CHARS = 120;
+const MAX_LOG_PATH_CHARS = 200;
 const MAX_FAILURE_CHARS = 200;
+const MAX_MATCH_PATTERN_CHARS = 120;
+const MAX_MATCH_EXCERPT_CHARS = 400;
+const MAX_TOOL_TIME_CHARS = 64;
 const MAX_SESSIONS_PER_WAKE = 16;
 const EMPTY_BYTES = new Uint8Array(0);
 const textDecoder = new TextDecoder("utf-8", { fatal: false });
+
+/** Strip terminal control sequences and bound untrusted persisted metadata. */
+function boundedSafe(raw: string, max: number): string {
+	const safe = sanitizeOutputText(raw);
+	return safe.length <= max ? safe : `${safe.slice(0, max - 1)}…`;
+}
+
+/** Return a terminal-inert, bounded copy for Pi's persisted wake details. */
+function safeCompletionSnapshot(snapshot: CompletionSnapshot): CompletionSnapshot {
+	return {
+		...snapshot,
+		command: boundedSafe(snapshot.command, MAX_COMMAND_CHARS),
+		cwd: boundedSafe(snapshot.cwd, MAX_CWD_CHARS),
+		signal: snapshot.signal === null ? null : boundedSafe(snapshot.signal, MAX_CWD_CHARS),
+		failureMessage:
+			snapshot.failureMessage === null ? null : boundedSafe(snapshot.failureMessage, MAX_FAILURE_CHARS),
+		logPath: snapshot.logPath === undefined ? undefined : boundedSafe(snapshot.logPath, MAX_LOG_PATH_CHARS),
+	};
+}
+
+/** Return a terminal-inert, bounded copy for Pi's persisted match details. */
+function safeMatchSnapshot(snapshot: MatchSnapshot): MatchSnapshot {
+	const safe: MatchSnapshot = {
+		...snapshot,
+		command: boundedSafe(snapshot.command, MAX_COMMAND_CHARS),
+		cwd: boundedSafe(snapshot.cwd, MAX_CWD_CHARS),
+		logPath: snapshot.logPath === undefined ? undefined : boundedSafe(snapshot.logPath, MAX_LOG_PATH_CHARS),
+		matchPattern: boundedSafe(snapshot.matchPattern, MAX_MATCH_PATTERN_CHARS),
+		matchExcerpt: boundedSafe(snapshot.matchExcerpt, MAX_MATCH_EXCERPT_CHARS),
+		toolTimeUtc: boundedSafe(snapshot.toolTimeUtc, MAX_TOOL_TIME_CHARS),
+	};
+	if (snapshot.exitCode !== undefined) safe.exitCode = snapshot.exitCode;
+	if (snapshot.signal !== undefined) {
+		safe.signal = snapshot.signal === null ? null : boundedSafe(snapshot.signal, MAX_CWD_CHARS);
+	}
+	if (snapshot.failureMessage !== undefined) {
+		safe.failureMessage = snapshot.failureMessage === null ? null : boundedSafe(snapshot.failureMessage, MAX_FAILURE_CHARS);
+	}
+	return safe;
+}
 
 /** Strip terminal control characters from untrusted interpolated strings. */
 export function sanitizeMeta(raw: string): string {
@@ -206,9 +316,283 @@ export class CompletionCoordinator {
 		CompletionCoordinatorOptions;
 	private debounceHandle: unknown;
 	private stopped = false;
+	private lifecycleEnabled: boolean;
+	private agentPhase: AgentPhase = "idle";
+	private ownerCounter = 0;
+	private currentOwner: HandoffOwner | undefined;
+	private readonly owners = new Map<number, HandoffOwner>();
+	private pendingDispatches = 0;
+	private settledDepth = 0;
+	private settledBarrier: SettledBarrier | undefined;
+	private activeTransition: SettledTransition | undefined;
+	private retryEpoch = 0;
+	private stateEpoch = 0;
+	private retryScheduled = false;
+	private retryPendingOwner: HandoffOwner | undefined;
+	private lifecycleWarningEmitted = false;
 
 	constructor(options: CompletionCoordinatorOptions) {
 		this.opts = { debounceMs: DEFAULT_DEBOUNCE_MS, ...options };
+		this.lifecycleEnabled = options.lifecycleAware === true;
+	}
+
+	/** True when both lifecycle hooks were successfully registered by the host. */
+	get lifecycleAware(): boolean {
+		return this.lifecycleEnabled;
+	}
+
+	/** Current coordinator-level delivery phase (primarily useful to test hosts). */
+	get phase(): AgentPhase {
+		return this.agentPhase;
+	}
+
+	/** Configure lifecycle capability atomically after attempting both registrations. */
+	setLifecycleHandlersRegistered(agentStartRegistered: boolean, agentSettledRegistered: boolean): void {
+		const enabled = agentStartRegistered && agentSettledRegistered;
+		if (!enabled && !this.lifecycleWarningEmitted) {
+			this.lifecycleWarningEmitted = true;
+			try {
+				this.opts.onLifecycleUnavailable?.();
+			} catch {
+				// Diagnostics must never break extension initialization.
+			}
+		}
+		this.setLifecycleCapability(enabled);
+	}
+
+	/** Configure lifecycle gating for tests and alternate hosts. */
+	setLifecycleCapability(enabled: boolean): void {
+		if (this.lifecycleEnabled === enabled) return;
+		this.lifecycleEnabled = enabled;
+		if (!enabled) this.invalidateLifecycleState();
+	}
+
+	/** Enter the active phase when a lifecycle-aware agent run starts. */
+	setAgentStarted(): void {
+		if (this.stopped || !this.lifecycleEnabled) return;
+		const owner = this.currentOwner;
+		if (this.agentPhase === "handoff" && owner?.awaitingStart) {
+			owner.awaitingStart = false;
+			owner.terminalNoStart = false;
+			this.agentPhase = "active";
+			this.cancelNoStartRetry();
+			return;
+		}
+		this.agentPhase = "active";
+	}
+
+	/**
+	 * Settle an agent run. Lifecycle fallback deliberately preserves the old
+	 * immediate-flush behavior: no phase, orphan, token, or barrier state is
+	 * touched when capability is unavailable.
+	 */
+	setAgentSettled(): Promise<void> {
+		if (this.stopped) return Promise.resolve();
+		if (!this.lifecycleEnabled) {
+			this.flushPending("settled");
+			return Promise.resolve();
+		}
+
+		const barrier = this.armSettledBarrier();
+		const epoch = this.stateEpoch;
+		const owner = this.currentOwner;
+		const transition: SettledTransition = {
+			barrier,
+			owner: undefined,
+			accepted: 0,
+			outstanding: 0,
+			noStart: false,
+		};
+		barrier.transition = transition;
+		this.settledDepth++;
+		barrier.synchronousSettledDepth++;
+		let failed = false;
+		let failure: unknown;
+
+		try {
+			this.releaseOrphanedObservations();
+			if (this.agentPhase === "handoff" && owner?.awaitingStart) {
+				// A settled callback before agent_start is a terminal no-start event.
+				// Keep handoff closed and defer any retry until this callback unwinds.
+				transition.owner = owner;
+				transition.noStart = true;
+				owner.terminalNoStart = true;
+			} else {
+				// The previous wake turn has reported its start and settled. Retire
+				// its completed owner before selecting another wake for this turn.
+				if (owner && !owner.awaitingStart && owner.outstanding === 0) this.retireOwner(owner);
+				this.agentPhase = "idle";
+				this.activeTransition = transition;
+				try {
+					const outcome = this.flushPending("settled");
+					transition.accepted = outcome.accepted;
+					transition.outstanding = outcome.outstanding;
+					transition.owner = this.currentOwner?.transition === transition ? this.currentOwner : undefined;
+				} finally {
+					if (this.activeTransition === transition) this.activeTransition = undefined;
+				}
+			}
+		} catch (error) {
+			failed = true;
+			failure = error;
+		} finally {
+			// reset()/shutdown() already zeroes these fields and resolves the
+			// barrier; never decrement a newer lifecycle epoch.
+			if (this.stateEpoch === epoch) {
+				if (this.activeTransition === transition) this.activeTransition = undefined;
+				barrier.synchronousSettledDepth--;
+				this.settledDepth--;
+				if (failed) {
+					const strandedOwner = transition.owner ?? this.currentOwner;
+					if (strandedOwner?.transition === transition && strandedOwner.outstanding === 0) {
+						this.retireOwner(strandedOwner);
+					}
+					this.resolveSettledBarrier(barrier);
+				} else {
+					if (this.retryPendingOwner) this.maybeScheduleNoStartRetry(this.retryPendingOwner, barrier);
+					if (transition.noStart) this.maybeScheduleNoStartRetry(owner, barrier);
+					else this.maybeResolveBarrier(barrier, transition);
+				}
+			}
+		}
+
+		if (failed) throw failure;
+		return barrier.promise;
+	}
+
+	private armSettledBarrier(): SettledBarrier {
+		if (this.settledBarrier) return this.settledBarrier;
+		let resolve!: () => void;
+		const promise = new Promise<void>((r) => {
+			resolve = r;
+		});
+		const barrier: SettledBarrier = {
+			promise,
+			resolve,
+			ownerToken: undefined,
+			accepted: 0,
+			outstanding: 0,
+			synchronousSettledDepth: 0,
+			retryScheduled: false,
+			settled: false,
+			transition: undefined,
+		};
+		this.settledBarrier = barrier;
+		return barrier;
+	}
+
+	private resolveSettledBarrier(barrier = this.settledBarrier): void {
+		if (!barrier || barrier.settled) return;
+		barrier.settled = true;
+		if (this.settledBarrier === barrier) this.settledBarrier = undefined;
+		try {
+			barrier.resolve();
+		} catch {
+			// Native Promise resolvers do not throw; keep teardown defensive.
+		}
+	}
+
+	private releaseOrphanedObservations(): void {
+		for (const record of this.records.values()) {
+			record.observers.clear();
+			record.pendingTerminal.clear();
+		}
+		// Staged containment is a lease too. Fail open without consuming the arm.
+		this.stagedMatch.clear();
+	}
+
+	private maybeResolveBarrier(barrier: SettledBarrier, transition: SettledTransition): void {
+		if (this.stopped || this.settledBarrier !== barrier || barrier.settled) return;
+		if (this.settledDepth !== 0 || barrier.synchronousSettledDepth !== 0) return;
+		// A nested settled event owns the newest transition. The outer event must
+		// not resolve its barrier underneath that newer owner/retry decision.
+		if (barrier.transition !== transition) return;
+		if (transition.noStart) {
+			this.maybeScheduleNoStartRetry(transition.owner, barrier);
+			return;
+		}
+		if (transition.outstanding > 0 || this.pendingDispatches > 0) return;
+		if (transition.accepted > 0) return;
+		this.resolveSettledBarrier(barrier);
+	}
+
+	private maybeScheduleNoStartRetry(owner: HandoffOwner | undefined, barrier: SettledBarrier): void {
+        if (!owner || !owner.terminalNoStart || !owner.awaitingStart) return;
+		if (owner.outstanding > 0) {
+			this.retryPendingOwner = owner;
+			return;
+		}
+		if (this.settledDepth !== 0 || barrier.synchronousSettledDepth !== 0) {
+			this.retryPendingOwner = owner;
+			return;
+		}
+		if (this.retryScheduled) return;
+		if (this.currentOwner === owner) this.retireOwner(owner);
+		const epoch = this.stateEpoch;
+		const retryEpoch = ++this.retryEpoch;
+		this.retryPendingOwner = undefined;
+		this.retryScheduled = true;
+		barrier.retryScheduled = true;
+		queueMicrotask(() => {
+			const retryIsCurrent =
+				!this.stopped &&
+				this.stateEpoch === epoch &&
+				this.retryEpoch === retryEpoch &&
+				this.retryScheduled;
+			if (!retryIsCurrent) {
+				// A stale microtask must not clear a newer retry, but it must not
+				// leave its own guard permanently wedged either.
+				if (this.retryEpoch === retryEpoch) {
+					this.retryScheduled = false;
+					barrier.retryScheduled = false;
+				}
+				return;
+			}
+			if (this.currentOwner !== undefined || this.agentPhase !== "idle") {
+				this.retryScheduled = false;
+				barrier.retryScheduled = false;
+				return;
+			}
+			this.retryScheduled = false;
+			barrier.retryScheduled = false;
+			const transition: SettledTransition = {
+				barrier,
+				owner: undefined,
+				accepted: 0,
+				outstanding: 0,
+				noStart: false,
+			};
+			barrier.transition = transition;
+			this.activeTransition = transition;
+			const outcome = this.flushPending("settled-retry");
+			this.activeTransition = undefined;
+			transition.accepted = outcome.accepted;
+			transition.outstanding = outcome.outstanding;
+			const ownerAfterFlush = this.currentOwner as HandoffOwner | undefined;
+			transition.owner = ownerAfterFlush?.transition === transition ? ownerAfterFlush : undefined;
+			this.maybeResolveBarrier(barrier, transition);
+		});
+	}
+
+	private cancelNoStartRetry(): void {
+		this.retryEpoch++;
+		this.retryScheduled = false;
+		this.retryPendingOwner = undefined;
+		if (this.settledBarrier) this.settledBarrier.retryScheduled = false;
+	}
+
+	private invalidateLifecycleState(): void {
+		this.stateEpoch++;
+		this.cancelNoStartRetry();
+		this.currentOwner = undefined;
+		this.owners.clear();
+		this.pendingDispatches = 0;
+		this.agentPhase = "idle";
+		this.activeTransition = undefined;
+		this.settledDepth = 0;
+		const barrier = this.settledBarrier;
+		this.settledBarrier = undefined;
+		this.resolveSettledBarrier(barrier);
 	}
 
 	private now(): number {
@@ -427,8 +811,9 @@ export class CompletionCoordinator {
 			// real change and falls through to re-arm below.
 			return "already_armed";
 		}
-		// Re-arm: fresh generation (stale staged/reserved decisions cannot
-		// touch the new arm) and a fresh session matcher + ring + fire latch.
+		// Re-arm the transport matcher first; coordinator state alone would
+		// advertise a live arm while the session continued using its old latch.
+		s.setMatchArm?.(policy.pattern, policy.caseSensitive);
 		existing.matchGenerationCounter += 1;
 		existing.match = {
 			armed: true,
@@ -677,6 +1062,7 @@ export class CompletionCoordinator {
 			this.clearTimer(this.debounceHandle);
 			this.debounceHandle = undefined;
 		}
+		this.invalidateLifecycleState();
 		for (const r of this.records.values()) {
 			r.unsubscribeExit();
 			r.unsubscribeMatch?.();
@@ -739,28 +1125,25 @@ export class CompletionCoordinator {
 		for (const [toolCallId, staged] of this.stagedMatch) {
 			if (staged.sessionId === sessionId) this.stagedMatch.delete(toolCallId);
 		}
-	}
-	// ---------------- Wake delivery ----------------
-
+    }
 	private scheduleFlush(): void {
 		if (this.stopped) return;
 		if (this.debounceHandle !== undefined) return;
 		this.debounceHandle = this.setTimer(() => {
 			this.debounceHandle = undefined;
-			this.flushPending();
+			this.flushPending("timer");
 		}, this.opts.debounceMs);
 	}
 
 	/**
-	 * Deliver pending wakes, grouped BY KIND: exit-eligible records batch
-	 * into one buildWakeMessage ("exit"), match-eligible records into one
-	 * buildMatchWakeMessage ("match") — at most one message per kind per
-	 * flush. Safe to call from any flush trigger (debounce timer,
-	 * agent_settled, tool_execution_end); reservation via wakeQueued plus a
-	 * per-arm generation re-check guarantees at most one prompt per arm.
+	 * Deliver pending wakes, grouped by kind. Lifecycle-aware flushes are gated
+	 * before reservation; fallback mode intentionally follows the pre-IV-0005
+	 * immediate path exactly.
 	 */
-	flushPending(): void {
-		if (this.stopped) return;
+	flushPending(source: FlushSource = "timer"): DispatchOutcome {
+		const empty: DispatchOutcome = { accepted: 0, outstanding: 0 };
+		if (this.stopped) return empty;
+		if (this.lifecycleEnabled && this.agentPhase !== "idle") return empty;
 		const exitEligible: CompletionRecord[] = [];
 		const matchEligible: { record: CompletionRecord; generation: number }[] = [];
 		for (const r of this.records.values()) {
@@ -775,8 +1158,7 @@ export class CompletionCoordinator {
 				r.snapshot
 			) {
 				// First-event-wins at flush time: when the exit arm wins the
-				// session, a fired-but-unflushed match arm is suppressed too —
-				// one session never produces two wakes.
+				// session, a fired-but-unflushed match arm is suppressed too.
 				if (r.match?.snapshot && !r.match.suppressed) r.match.suppressed = true;
 				exitEligible.push(r);
 			} else if (
@@ -789,11 +1171,8 @@ export class CompletionCoordinator {
 				r.observers.size === 0 &&
 				!this.hasPendingStage(r.sessionId)
 			) {
-				// Belt-and-braces exit-first (IV-0004): an exited session with
-				// an armed, unsuppressed, unobserved exit arm prefers the exit
-				// snapshot — readiness is moot once the process is dead. This
-				// covers the exit arm already being wakeQueued (reserved),
-				// which the exit branch above does not see.
+				// Belt-and-braces exit-first: readiness is moot once the
+				// process is dead while its exit arm remains eligible.
 				if (r.exited && r.armed && !r.suppressed && !r.observed) {
 					r.match.suppressed = true;
 					continue;
@@ -801,15 +1180,13 @@ export class CompletionCoordinator {
 				matchEligible.push({ record: r, generation: r.match.generation });
 			}
 		}
-		if (exitEligible.length === 0 && matchEligible.length === 0) return;
+		if (exitEligible.length === 0 && matchEligible.length === 0) return empty;
 
-		// Reserve BEFORE sending so a re-entrant flush cannot double-schedule.
+		// Reserve before sending so a re-entrant flush cannot double-schedule.
 		for (const r of exitEligible) r.wakeQueued = true;
 		for (const e of matchEligible) e.record.match!.wakeQueued = true;
 
-		// Mid-flight deliver filter: a disarm/re-arm racing a reserved wake
-		// must not still send. Re-check per-arm suppression AND generation
-		// (reservations carry the generation they were taken against).
+		// Deliver-time checks remain authoritative for disarm/re-arm races.
 		const deliverExit = exitEligible.filter(
 			(r) =>
 				r.armed &&
@@ -834,62 +1211,203 @@ export class CompletionCoordinator {
 				const m = e.record.match;
 				if (m && m.generation === e.generation) m.wakeQueued = false;
 			}
-			return;
+			return empty;
 		}
 
+		const owner = this.lifecycleEnabled ? this.createOwner(source) : undefined;
+		const batch: DispatchBatch = { outcome: { accepted: 0, outstanding: 0 }, owner, inFlight: 0, finalized: false };
 		if (deliverExit.length > 0) {
-			const message = buildWakeMessage(deliverExit.map((r) => r.snapshot!));
-			this.dispatchExit(deliverExit, message);
+			this.dispatchExit(deliverExit, buildWakeMessage(deliverExit.map((r) => r.snapshot!)), batch);
 		}
 		if (deliverMatch.length > 0) {
-			// Refresh per-flush truth (elapsed/running/exit fields) so the
-			// wake is honest about a process that died during the debounce.
 			for (const e of deliverMatch) this.refreshMatchSnapshot(e.record);
-			const message = buildMatchWakeMessage(deliverMatch.map((e) => e.record.match!.snapshot!));
-			this.dispatchMatch(deliverMatch, message);
+			this.dispatchMatch(deliverMatch, buildMatchWakeMessage(deliverMatch.map((e) => e.record.match!.snapshot!)), batch);
+		}
+		batch.finalized = true;
+		if (owner) this.maybeFinishOwner(owner, batch);
+		return batch.outcome;
+	}
+
+	private createOwner(source: FlushSource): HandoffOwner {
+		const transition = this.activeTransition;
+		const barrier = transition && (source === "settled" || source === "settled-retry") ? transition.barrier : undefined;
+		const owner: HandoffOwner = {
+			token: ++this.ownerCounter,
+			source,
+			awaitingStart: true,
+			accepted: 0,
+			outstanding: 0,
+			terminalNoStart: false,
+			barrier,
+			transition,
+		};
+		this.owners.set(owner.token, owner);
+		this.currentOwner = owner;
+		this.agentPhase = "handoff";
+		if (barrier) barrier.ownerToken = owner.token;
+		if (transition) transition.owner = owner;
+		return owner;
+	}
+
+	private maybeFinishOwner(owner: HandoffOwner, batch?: DispatchBatch): void {
+		if (batch && (!batch.finalized || batch.inFlight > 0)) return;
+		if (owner.outstanding > 0) return;
+		if (owner.awaitingStart) {
+			if (owner.terminalNoStart) {
+				this.maybeScheduleNoStartRetry(owner, owner.barrier ?? this.settledBarrier!);
+				return;
+			}
+			if (owner.accepted === 0) {
+				this.retireOwner(owner);
+				if (owner.barrier && owner.transition) this.maybeResolveBarrier(owner.barrier, owner.transition);
+			}
 		}
 	}
 
-	private dispatchExit(records: CompletionRecord[], message: WakeMessage): void {
-		const reservations = records.map((r) => ({ record: r, arm: "exit" as const, generation: r.generation }));
-		let sendResult: void | Promise<void>;
+	private retireOwner(owner: HandoffOwner): void {
+		if (this.currentOwner === owner) {
+			this.currentOwner = undefined;
+			this.agentPhase = "idle";
+		}
+		if (owner.outstanding === 0) this.owners.delete(owner.token);
+	}
+
+	private dispatchExit(records: CompletionRecord[], message: WakeMessage, batch: DispatchBatch): void {
+		this.dispatchReservations(
+			records.map((r) => ({ record: r, arm: "exit" as const, generation: r.generation })),
+			message,
+			batch,
+		);
+	}
+
+	private dispatchMatch(
+		entries: { record: CompletionRecord; generation: number }[],
+		message: WakeMessage,
+		batch: DispatchBatch,
+	): void {
+		this.dispatchReservations(
+			entries.map((e) => ({ record: e.record, arm: "match" as const, generation: e.generation })),
+			message,
+			batch,
+		);
+	}
+
+	private dispatchReservations(
+		reservations: DispatchReservation[],
+		message: WakeMessage,
+		batch: DispatchBatch,
+	): void {
+		const owner = batch.owner;
+        if (!owner) {
+            let result: void | Promise<void>;
+            try {
+                result = this.opts.send(message);
+            } catch (err) {
+                this.recoverFailedSend(reservations, err);
+                return;
+            }
+            const epoch = this.stateEpoch;
+            if (result && typeof (result as Promise<void>).then === "function") {
+                batch.outcome.outstanding++;
+                Promise.resolve(result).then(
+                    () => {
+                        if (epoch !== this.stateEpoch) return;
+                        batch.outcome.outstanding--;
+                        batch.outcome.accepted++;
+                        for (const res of reservations) this.resolveAfterSend(res);
+                    },
+                    (err) => {
+                        if (epoch !== this.stateEpoch) return;
+                        batch.outcome.outstanding--;
+                        this.recoverFailedSend(reservations, err);
+                    },
+                );
+            } else {
+                batch.outcome.accepted++;
+                for (const res of reservations) this.resolveAfterSend(res);
+            }
+            return;
+        }
+
+		const pending: PendingDispatch = {
+			owner,
+			batch,
+			reservations,
+			epoch: this.stateEpoch,
+			accounted: true,
+		};
+		owner.outstanding++;
+		this.pendingDispatches++;
+		batch.inFlight++;
+		if (owner.transition) {
+			owner.transition.outstanding++;
+			owner.barrier!.outstanding++;
+		}
+		let result: void | Promise<void>;
 		try {
-			sendResult = this.opts.send(message);
+			// pendingDispatches is incremented before this invocation: a
+			// synchronous re-entrant settled callback cannot resolve the barrier.
+			result = this.opts.send(message);
 		} catch (err) {
-			this.recoverFailedSend(reservations, err);
+			this.completeDispatch(pending, false, err);
 			return;
 		}
-		if (sendResult && typeof (sendResult as Promise<void>).then === "function") {
-			(sendResult as Promise<void>)
-				.then(() => {
-					for (const res of reservations) this.resolveAfterSend(res);
-				})
-				.catch((err) => this.recoverFailedSend(reservations, err));
-		} else {
-			for (const res of reservations) this.resolveAfterSend(res);
-		}
-	}
-
-	private dispatchMatch(entries: { record: CompletionRecord; generation: number }[], message: WakeMessage): void {
-		const reservations = entries.map((e) => ({ record: e.record, arm: "match" as const, generation: e.generation }));
-		let sendResult: void | Promise<void>;
 		try {
-			sendResult = this.opts.send(message);
+			if (result && typeof (result as Promise<void>).then === "function") {
+				batch.outcome.outstanding++;
+				Promise.resolve(result).then(
+					() => this.completeDispatch(pending, true),
+					(err) => this.completeDispatch(pending, false, err),
+				);
+			} else {
+				this.completeDispatch(pending, true);
+			}
 		} catch (err) {
-			this.recoverFailedSend(reservations, err);
-			return;
-		}
-		if (sendResult && typeof (sendResult as Promise<void>).then === "function") {
-			(sendResult as Promise<void>)
-				.then(() => {
-					for (const res of reservations) this.resolveAfterSend(res);
-				})
-				.catch((err) => this.recoverFailedSend(reservations, err));
-		} else {
-			for (const res of reservations) this.resolveAfterSend(res);
+			this.completeDispatch(pending, false, err);
 		}
 	}
 
+    private completeDispatch(pending: PendingDispatch, accepted: boolean, err?: unknown): void {
+        if (!pending.accounted) return;
+        pending.accounted = false;
+        // reset()/shutdown() invalidates the state epoch; old callbacks must
+        // not decrement a newer transition or touch newly reused session ids.
+        if (pending.epoch !== this.stateEpoch || !this.owners.has(pending.owner.token)) return;
+        const { owner, batch } = pending;
+        owner.outstanding--;
+        this.pendingDispatches--;
+        batch.inFlight--;
+        if (batch.outcome.outstanding > 0) batch.outcome.outstanding--;
+        if (owner.transition) {
+            owner.transition.outstanding--;
+            if (owner.barrier) owner.barrier.outstanding--;
+        }
+		if (accepted) {
+			owner.accepted++;
+			batch.outcome.accepted++;
+			if (owner.transition) owner.transition.accepted++;
+			if (owner.barrier) owner.barrier.accepted++;
+			// A synchronous/re-entrant settled event marks this handoff as a
+			// no-start terminal. The sender did not produce a run, so keep the
+			// generation reservation pending for the guarded retry rather than
+			// consuming a wake that may never have reached Pi.
+			if (owner.terminalNoStart) this.releaseReservations(pending.reservations);
+			else for (const res of pending.reservations) this.resolveAfterSend(res);
+		} else {
+			this.recoverFailedSend(pending.reservations, err);
+		}
+        if (batch.finalized) this.maybeFinishOwner(owner, batch);
+        if (owner.barrier && owner.transition && !owner.terminalNoStart) {
+            this.maybeResolveBarrier(owner.barrier, owner.transition);
+        } else if (!owner.barrier && this.settledBarrier?.transition) {
+            // An old timer sender can still settle while a newer settled
+            // barrier is waiting; success keeps that barrier alive, failure
+            // allows its no-dispatch transition to resolve.
+            if (accepted) this.settledBarrier.transition.accepted++;
+            this.maybeResolveBarrier(this.settledBarrier, this.settledBarrier.transition);
+        }
+        if (owner.outstanding === 0 && this.currentOwner !== owner) this.owners.delete(owner.token);
+    }
 	/** Resolve an arm whose wake was handed to the sender (idempotent). */
 	private resolveAfterSend(res: { record: CompletionRecord; arm: "exit" | "match"; generation: number }): void {
 		const r = res.record;
@@ -904,16 +1422,12 @@ export class CompletionCoordinator {
 		this.resolveMatchArm(r);
 	}
 
-	private recoverFailedSend(
+	private releaseReservations(
 		reservations: { record: CompletionRecord; arm: "exit" | "match"; generation: number }[],
-		err: unknown,
 	): void {
-		// A rejection arriving after shutdown/reset must neither touch state
-		// (already cleared) nor emit a stale UI warning.
 		if (this.stopped) return;
-		// Un-reserve (generation-carrying) so the wake is retried at the next
-		// self-rescheduling tight loop. Never clear a NEWER arm's reservation:
-		// a re-arm mid-flight owns its own state.
+		// Un-reserve (generation-carrying) so the wake can be retried. Never
+		// clear a newer arm's reservation: a re-arm owns its own state.
 		for (const res of reservations) {
 			if (res.arm === "exit") {
 				if (res.record.generation === res.generation) res.record.wakeQueued = false;
@@ -922,6 +1436,16 @@ export class CompletionCoordinator {
 				if (m && m.generation === res.generation) m.wakeQueued = false;
 			}
 		}
+	}
+
+	private recoverFailedSend(
+		reservations: { record: CompletionRecord; arm: "exit" | "match"; generation: number }[],
+		err: unknown,
+	): void {
+		// A rejection arriving after shutdown/reset must neither touch state
+		// (already cleared) nor emit a stale UI warning.
+		if (this.stopped) return;
+		this.releaseReservations(reservations);
 		try {
 			this.opts.onSendError?.(err);
 		} catch {
@@ -978,7 +1502,7 @@ export class CompletionCoordinator {
  * treated as untrusted and stripped of control characters.
  */
 export function buildWakeMessage(snapshots: CompletionSnapshot[]): WakeMessage {
-	const shown = snapshots.slice(0, MAX_SESSIONS_PER_WAKE);
+	const shown = snapshots.slice(0, MAX_SESSIONS_PER_WAKE).map(safeCompletionSnapshot);
 	const lines: string[] = [];
 	lines.push(
 		`[runbg] ${snapshots.length} background ${snapshots.length === 1 ? "session" : "sessions"} exited. ` +
@@ -1026,7 +1550,7 @@ export function buildWakeMessage(snapshots: CompletionSnapshot[]): WakeMessage {
  * The excerpt is bounded (ring cap) and control-stripped either way.
  */
 export function buildMatchWakeMessage(snapshots: MatchSnapshot[]): WakeMessage {
-	const shown = snapshots.slice(0, MAX_SESSIONS_PER_WAKE);
+	const shown = snapshots.slice(0, MAX_SESSIONS_PER_WAKE).map(safeMatchSnapshot);
 	const lines: string[] = [];
 	lines.push(
 		`[runbg] ${snapshots.length} background ${snapshots.length === 1 ? "session" : "sessions"} matched ` +
