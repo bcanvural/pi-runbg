@@ -8,95 +8,33 @@ its names.
 
 ## Unreleased — 0.10.0 (fork: pi-runbg)
 
-### Changed
-
-- **Attached waits now reach 290 s, not 30 s** (divergence #9). `exec_command`
-  — and `write_stdin` with input — were capped at 30 s, a constant inherited
-  under a "mirror codex" banner with no recorded rationale while the constant
-  beside it carried an argued one. The cost was structural: every job in the
-  30 s–5 min band (test suites, builds, installs, migrations) needed **two**
-  calls, a short yield to obtain a `session_id` and then an empty poll of the
-  same length. An empty poll blocks the same turn for the same time, so the
-  asymmetry bought nothing but a wasted round trip. Both paths now share the
-  cache-friendly ceiling, for the same reason it exists: stay inside the
-  5-minute prompt-cache window. Defaults are untouched (10 s / 250 ms), so
-  this widens the ceiling only — nothing waits longer unless a call asks it
-  to. `PI_RUNBG_MAX_EMPTY_POLL_MS` deliberately does *not* lower it: the var
-  names the empty-poll path, and silently shrinking attached waits for anyone
-  who had set it would be a surprising regression. `clampYield` is exported
-  so a test pins the contract instead of a 30-second sleep.
-  Prompted by comparing against oh-my-pi, which blocks 300 s by default and
-  up to 3600 s in a single call.
-- **`on_exit: "wake"` is now recommended, not rationed.** Guidance previously
-  said to arm it *only* when the human explicitly asked, which left the agent
-  ending its turn and hoping someone checked back. It is now the default move
-  for a long job that **terminates**: the result is delivered on completion,
-  so the turn ends instead of blocking. The prohibition that matters is
-  narrower and unchanged — never for processes that do not exit on their own
-  (dev servers, watchers, `tail -f`), where it would simply never fire.
-  oh-my-pi treats push-delivery as the normal way to background work
-  (`async: true` → *"result will be delivered automatically"*), with no poll
-  surface at all.
-- **Pi's built-in `bash` tool is kept by default** (divergence #1,
-  `UPSTREAM.md`): upstream removes it unless `--keep-builtin-bash`; runbg
-  keeps it unless asked, via `/runbg replace-bash on` (below) or
-  `--replace-builtin-bash`. Templates that never mention the session tools
-  keep a working shell, and `bash`-guarding extensions are not silently
-  bypassed. Covered by `tests/builtin-bash.test.ts`.
-- **`--replace-builtin-bash` is now a one-invocation force-on, not the only
-  switch.** The persisted `replace-bash` setting is the primary control; the
-  flag can only turn removal *on*, because pi reports a boolean flag's
-  default for "absent" and so cannot distinguish `--replace-builtin-bash=false`
-  from an absent flag. `/runbg status` names the flag whenever it — rather
-  than the stored setting — is the reason `bash` is gone, and
-  `/runbg replace-bash off` warns instead of silently failing when the flag
-  overrules it.
-- **`exec_command` guidance now states the wait-mode decision rule.** The
-  guidelines explained polling mechanics but never said *how to choose*, so
-  the expensive mistakes were unaddressed. Added, informed by comparing
-  against codex's current `wait` tool:
-  - **A duration ladder, chosen before starting.** Under ~30 s: one
-    `exec_command` with a covering `yield_time_ms` (the clamp is 30 s, so a
-    longer sleep silently hands back a `session_id` instead). 30 s–5 min: a
-    short yield for the `session_id`, then *one* long empty poll. Over
-    ~5 min: do not hold the turn — report the `session_id` and end it.
-  - **Why one long poll beats several short ones**: a poll returns only
-    output new since the last one, so its cost is the *turn*, not the
-    payload — and 290 s returns inside the prompt-cache window (codex uses
-    300 s; ours sits deliberately under it).
-  - **Compose multi-step waits in the shell.** codex's answer to composition
-    is a V8 isolate where the model writes JavaScript calling tools; we have
-    no isolate, but the shell is the same scripting layer. Anything needing
-    no model judgment between steps is one command, not five turns. Prefer
-    waiting on a *condition* over sleeping a fixed duration.
-  - **Filter at the source.** Results are bounded by a head/tail buffer, so
-    an unfiltered 900-line run loses its *middle* — usually where the failure
-    is. Truncation is a safety net, not a filtering strategy; `log_path`
-    holds the full stream.
-  - **Session hygiene**: never end a turn with an unnamed live session, and
-    `kill_session` what you have abandoned — it still counts toward the cap.
-
-  Deduplicated against the existing polling guideline rather than appended,
-  since these strings are injected every turn: net ~910 tokens for the seven
-  `exec_command` guidelines.
-- **`exec_command` guidance now tells the model not to background inside
-  `cmd`.** Reaching for `nohup cmd &` is the correct habit with a one-shot
-  `bash` tool and the wrong one here — the session already *is* the
-  background. Double-backgrounding hides the real process from its session,
-  and if the hidden child inherits the session's output pipe (which a
-  backgrounded compound list does, since bash keeps a subshell around to run
-  it) the session keeps reporting `[still running]` long after `cmd`
-  finished. Observed in the wild: an agent spent a debugging round on exactly
-  this. The completion signal is `close`, not `exit`, deliberately — see the
-  comment at `src/pty.ts:363`; the alternative loses trailing output from
-  short commands on macOS, and would also report a wrapper script's
-  backgrounded server as finished, so the guidance is the fix, not the
-  liveness rule. Two facts worth knowing either way: `kill_session` SIGTERMs
-  the whole process group, which `nohup` does not survive, and whether a
-  fire-and-forget child outlives pi depends on whether its session was
-  already reaped at shutdown — i.e. on the same shell-syntax accident.
 
 ### Added
+
+- **`on_output` — the readiness wake (IV-0004, implemented).**
+  `exec_command` gains `on_output: { pattern, case_sensitive? }` and
+  `set_on_exit` gains `on_output` for re-arm/disarm (`null` disarms the
+  match arm; omitted = unchanged). `pattern` is a literal substring, not a
+  regex (no ReDoS surface), 1–256 characters validated in encoded bytes,
+  matched in the push path on transport units (pipe bytes / PTY strings);
+  default case-insensitive via an ASCII-only fold (length-preserving;
+  non-ASCII byte-exact), `case_sensitive: true` for non-distinctive
+  banners. The first match while the process runs delivers one follow-up
+  wake with `customType: "runbg-matched"` (exit wakes keep
+  `"runbg-completed"`), carrying a sanitized, best-effort line-bounded
+  `match_excerpt` (≤ 400 bytes raw) and an `elapsed` staleness hint
+  (`MatchSnapshot`, completion.ts). Wake
+  policy is per-arm state (`armed` / `suppressed` / `wakeQueued` /
+  `generation` per arm) with `match_armed` on `list_sessions`; exit and
+  match arms compose — first event wins, exit wins only when both arms are
+  armed — and flush batching groups by wake kind (≤ 1 message per kind per
+  flush). Consumption is containment-based and fail-closed: a match wake
+  is observed iff a successfully finalized tool result's bounded body
+  contains the sanitized excerpt; `list_sessions` never consumes. Tool
+  descriptions/guidelines, design §6 template, and the README teach the
+  four-branch wait-mode decision, per-arm disarm (`on_output: null` /
+  `on_exit: "none"` / combined), one-shot + re-arm, distinctive-substring
+  matching, and the elapsed staleness hint.
 
 - **`write_stdin` guidance teaches the resumable log read** (IV-0003's v0):
   `output_bytes_total` equals the log file's byte length while the log is
@@ -210,6 +148,120 @@ its names.
     complete fix belongs in pi, deferring pending tool calls batch-wide for
     every tool rather than these five. Modelled on oh-my-pi, which skips the
     pending call outright.
+
+### Changed
+
+- **`set_on_exit`'s `on_exit` parameter is now optional** (divergence #12).
+  Omitted = that arm is left unchanged, so a match-only re-arm no longer
+  has to pass a field it is not touching. The parameter controls **only the
+  exit arm**; the new `on_output` parameter (Added below) controls **only
+  the match arm**; `(on_exit: "none", on_output: null)` is full cleanup,
+  and a both-omitted call is a valid no-op audit that returns the current
+  armed state. The relaxation is loud: UPSTREAM.md divergence row #12.
+
+- **Attached waits now reach 290 s, not 30 s** (divergence #9). `exec_command`
+  — and `write_stdin` with input — were capped at 30 s, a constant inherited
+  under a "mirror codex" banner with no recorded rationale while the constant
+  beside it carried an argued one. The cost was structural: every job in the
+  30 s–5 min band (test suites, builds, installs, migrations) needed **two**
+  calls, a short yield to obtain a `session_id` and then an empty poll of the
+  same length. An empty poll blocks the same turn for the same time, so the
+  asymmetry bought nothing but a wasted round trip. Both paths now share the
+  cache-friendly ceiling, for the same reason it exists: stay inside the
+  5-minute prompt-cache window. Defaults are untouched (10 s / 250 ms), so
+  this widens the ceiling only — nothing waits longer unless a call asks it
+  to. `PI_RUNBG_MAX_EMPTY_POLL_MS` deliberately does *not* lower it: the var
+  names the empty-poll path, and silently shrinking attached waits for anyone
+  who had set it would be a surprising regression. `clampYield` is exported
+  so a test pins the contract instead of a 30-second sleep.
+  Prompted by comparing against oh-my-pi, which blocks 300 s by default and
+  up to 3600 s in a single call.
+- **`on_exit: "wake"` is now recommended, not rationed.** Guidance previously
+  said to arm it *only* when the human explicitly asked, which left the agent
+  ending its turn and hoping someone checked back. It is now the default move
+  for a long job that **terminates**: the result is delivered on completion,
+  so the turn ends instead of blocking. The prohibition that matters is
+  narrower and unchanged — never for processes that do not exit on their own
+  (dev servers, watchers, `tail -f`), where it would simply never fire.
+  oh-my-pi treats push-delivery as the normal way to background work
+  (`async: true` → *"result will be delivered automatically"*), with no poll
+  surface at all.
+- **Pi's built-in `bash` tool is kept by default** (divergence #1,
+  `UPSTREAM.md`): upstream removes it unless `--keep-builtin-bash`; runbg
+  keeps it unless asked, via `/runbg replace-bash on` (below) or
+  `--replace-builtin-bash`. Templates that never mention the session tools
+  keep a working shell, and `bash`-guarding extensions are not silently
+  bypassed. Covered by `tests/builtin-bash.test.ts`.
+- **`--replace-builtin-bash` is now a one-invocation force-on, not the only
+  switch.** The persisted `replace-bash` setting is the primary control; the
+  flag can only turn removal *on*, because pi reports a boolean flag's
+  default for "absent" and so cannot distinguish `--replace-builtin-bash=false`
+  from an absent flag. `/runbg status` names the flag whenever it — rather
+  than the stored setting — is the reason `bash` is gone, and
+  `/runbg replace-bash off` warns instead of silently failing when the flag
+  overrules it.
+- **`exec_command` guidance now states the wait-mode decision rule.** The
+  guidelines explained polling mechanics but never said *how to choose*, so
+  the expensive mistakes were unaddressed. Added, informed by comparing
+  against codex's current `wait` tool:
+  - **A duration ladder, chosen before starting.** Under ~30 s: one
+    `exec_command` with a covering `yield_time_ms` (the clamp is 30 s, so a
+    longer sleep silently hands back a `session_id` instead). 30 s–5 min: a
+    short yield for the `session_id`, then *one* long empty poll. Over
+    ~5 min: do not hold the turn — report the `session_id` and end it.
+  - **Why one long poll beats several short ones**: a poll returns only
+    output new since the last one, so its cost is the *turn*, not the
+    payload — and 290 s returns inside the prompt-cache window (codex uses
+    300 s; ours sits deliberately under it).
+  - **Compose multi-step waits in the shell.** codex's answer to composition
+    is a V8 isolate where the model writes JavaScript calling tools; we have
+    no isolate, but the shell is the same scripting layer. Anything needing
+    no model judgment between steps is one command, not five turns. Prefer
+    waiting on a *condition* over sleeping a fixed duration.
+  - **Filter at the source.** Results are bounded by a head/tail buffer, so
+    an unfiltered 900-line run loses its *middle* — usually where the failure
+    is. Truncation is a safety net, not a filtering strategy; `log_path`
+    holds the full stream.
+  - **Session hygiene**: never end a turn with an unnamed live session, and
+    `kill_session` what you have abandoned — it still counts toward the cap.
+
+  Deduplicated against the existing polling guideline rather than appended,
+  since these strings are injected every turn: net ~910 tokens for the seven
+  `exec_command` guidelines.
+- **`exec_command` guidance now tells the model not to background inside
+  `cmd`.** Reaching for `nohup cmd &` is the correct habit with a one-shot
+  `bash` tool and the wrong one here — the session already *is* the
+  background. Double-backgrounding hides the real process from its session,
+  and if the hidden child inherits the session's output pipe (which a
+  backgrounded compound list does, since bash keeps a subshell around to run
+  it) the session keeps reporting `[still running]` long after `cmd`
+  finished. Observed in the wild: an agent spent a debugging round on exactly
+  this. The completion signal is `close`, not `exit`, deliberately — see the
+  comment at `src/pty.ts:363`; the alternative loses trailing output from
+  short commands on macOS, and would also report a wrapper script's
+  backgrounded server as finished, so the guidance is the fix, not the
+  liveness rule. Two facts worth knowing either way: `kill_session` SIGTERMs
+  the whole process group, which `nohup` does not survive, and whether a
+  fire-and-forget child outlives pi depends on whether its session was
+  already reaped at shutdown — i.e. on the same shell-syntax accident.
+
+
+### Docs
+
+- **IV-0004 — wake on output pattern (readiness wake), scoped spec.** New
+  design doc proposing an `on_output: { pattern, case_sensitive? }` arm on
+  `exec_command` (+ re-arm/disarm via `set_on_exit`) so backgrounded dev
+  servers and watchers — which never exit, so `on_exit: "wake"` can never
+  fire for them — can push-deliver a wake on first output match instead of
+  burning a turn blocked or polling. Literal-substring match on the push
+  path (drains never run in the background case), one-shot, first-event-wins
+  against `on_exit` when both arms are armed, bounded sanitized excerpt in
+  the wake payload, per-arm wake-policy state with arm generations, batching
+  grouped by wake kind, and a concrete guidance-carrier inventory (append-
+  vs replace-mode templates; modified-pi.md edits). Two independent design
+  reviews and two independent implementation reviews complete. Prompted by
+  oh-my-pi's hub `wait` pattern op. The implementation in this release
+  followed the spec as written (see Added and Changed above).
 
 ### Fixed
 

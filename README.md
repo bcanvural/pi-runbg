@@ -57,9 +57,13 @@ purpose, and says so. Every deviation is recorded with its reasoning in
   (default is `"none"`) delivers exactly one follow-up model prompt (bounded
   exit metadata, no raw output) when a backgrounded process exits while
   nothing is observing it — completions seen directly by a tool result
-  consume the wake instead. `set_on_exit` disarms or re-arms wake without
-  killing the process (including coordinator tombstones after eviction);
-  `list_sessions` and the running-session UI surface `wake_armed` / `[wake]`.
+  consume the wake instead. `exec_command(on_output: { pattern })` adds a
+  **readiness wake** for processes that never exit (dev servers, watchers):
+  one follow-up (`customType: "runbg-matched"`) on the first output match,
+  carrying a sanitized excerpt. `set_on_exit` disarms or re-arms each arm
+  independently without killing the process (including coordinator
+  tombstones after eviction); `list_sessions` and the running-session UI
+  surface `wake_armed` / `match_armed` (`[wake]` / `[match]`).
 - **Compact, bounded output with complete recovery.** Every output-bearing
   result—including `kill_session`—is tail-capped at 50 KiB / 2000 lines before
   it reaches model context or persisted details. All five tools have explicit
@@ -143,7 +147,8 @@ Runs a command in a persistent session.
 | `cols` | number | `120` | PTY width in columns (`tty: true` only; ignored for pipes). Clamped to [20, 500]. |
 | `rows` | number | `30` | PTY height in rows (`tty: true` only; ignored for pipes). Clamped to [5, 300]. |
 | `yield_time_ms` | number | `10_000` | How long this call stays attached waiting for output (an attachment window, not the command's lifetime), clamped to [250, 290_000] (divergence #9 — upstream capped at 30_000). |
-| `on_exit` | `"none"` \| `"wake"` | `"none"` | Persistent per-session policy for exits nobody is observing. `"wake"`: one synthetic follow-up prompt resumes the agent when the process exits — the right choice for a long job that **terminates**, so the agent can end its turn instead of blocking it. Never for processes that do not exit on their own (dev servers, watchers): it would never fire. Change later with `set_on_exit`. |
+| `on_exit` | `"none"` \| `"wake"` | `"none"` | Persistent per-session policy for exits nobody is observing. `"wake"`: one synthetic follow-up prompt resumes the agent when the process exits — the right choice for a long job that **terminates**, so the agent can end its turn instead of blocking it. Never for processes that do not exit on their own (dev servers, watchers): it would never fire — use `on_output` for readiness there, and arm both arms if crash-before-ready matters. Change later with `set_on_exit`. |
+| `on_output` | `{ pattern: string, case_sensitive?: boolean }` | — | Readiness wake: ONE follow-up prompt on the **first output match** while the process runs. `pattern` is a **literal substring (not a regex)**, 1–256 characters (validated in encoded bytes); default case-insensitive via an ASCII-only fold (A–Z/a–z; non-ASCII matched byte-exact). Match a distinctive banner substring (`"Server started on :3000"`, `"listening on"`) — never a common word: `"ready"` is a substring of `"already"` and wakes early. Set `case_sensitive: true` when the banner is not distinctive. Composes with `on_exit: "wake"` — "wake me when ready, and wake me if it dies instead" — first event wins; exit wins only when **both** arms are armed. One-shot: re-arm via `set_on_exit` for a later signal. |
 
 Response body (short output, no truncation):
 
@@ -202,14 +207,27 @@ Drives or polls an existing session.
    command. Do **not** use it just to bypass the 290 s cap. Omit
    `yield_time_ms` and pass a future UTC timestamp ending in `Z` (compute
    from `tool_time_utc`). The call still returns immediately when the
-   process exits; Esc never kills the process.
 3. `on_exit` defaults to `"none"`. Use `"wake"` **only when the human
-   explicitly wants** auto-resume on unobserved completion. If you armed
-   wake by mistake or the job is abandoned, call
-   `set_on_exit(session_id, on_exit: "none")` promptly (does not kill).
+   explicitly wants** auto-resume on unobserved completion. Disarm is
+   per-arm and does not kill: `set_on_exit(session_id, on_exit: "none")`
+   clears only the exit arm, `set_on_exit(session_id, on_output: null)`
+   clears only the match arm, and the combined call is full cleanup — do
+   it promptly when wake was armed by mistake or the job is abandoned.
 4. Combining wake with an observing `write_stdin` is safe: a completion
    observed directly by a tool result consumes the wake; a deadline or
    cancellation leaves the wake armed until disarmed or delivered.
+5. `on_output: { pattern }` arms a **readiness wake** for processes that
+   do not exit (dev servers, watchers, migrations that stay up): arm it at
+   spawn, end the turn, and one wake arrives on the first output match.
+   Match a distinctive banner substring, never a common word (`"ready"`
+   matches inside `"already"`); set `case_sensitive: true` when the banner
+   is not distinctive. Composes with `on_exit: "wake"` ("wake me when
+   ready, and wake me if it dies instead") — first event wins, and a
+   match-only arm yields **no** wake if the process dies before matching,
+   so arm both if crash-before-ready matters. The match arm is one-shot:
+   re-arm with a new pattern via `set_on_exit` for a later signal. After a
+   match wake, output beyond the excerpt has **not** been consumed — poll
+   `write_stdin` (no chars) or read `log_path`.
 
 **Never** use `yield_until` for REPLs, `sudo`, `ssh`, password prompts,
 dev servers, file watchers, debuggers, or any indefinite/interactive
@@ -271,20 +289,29 @@ Malformed base64 also rejects.
 
 ### `set_on_exit`
 
-Change `on_exit` policy **without killing the process**.
+Change wake policy **without killing the process**, per arm. Both
+parameters are optional: omitted = that arm is left unchanged, so a
+both-omitted call is a valid no-op audit that returns the current armed
+state.
 
 | Param | Type | Default | Notes |
 |---|---|---|---|
 | `session_id` | number | — | Required. |
-| `on_exit` | `"none"` \| `"wake"` | — | `"none"`: disarm pending wake (process keeps running; also works for coordinator tombstones after store eviction). `"wake"`: arm auto-resume if still running in the store. Too late once the session has already exited unregistered / already notified. |
+| `on_exit` | `"none"` \| `"wake"` | unchanged | Controls **only the exit arm**. `"none"`: disarm pending wake (process keeps running; also works for coordinator tombstones after store eviction). `"wake"`: arm auto-resume if still running in the store. Too late once the session has already exited unregistered / already notified. |
+| `on_output` | `{ pattern: string, case_sensitive?: boolean }` \| `null` | unchanged | Controls **only the match arm**. Object: arm or replace the one-shot readiness wake with a fresh generation (`pattern` rules identical to `exec_command`'s `on_output`). `null`: disarm the match arm. Full cleanup is the combined call `(on_exit: "none", on_output: null)`. |
 
 Status tokens in the result: `disarmed`, `already_none`, `armed`,
-`already_armed`, `too_late`. Unknown ids return `found: false`.
+`already_armed`, `replaced`, `unchanged`, `too_late` (per arm — the exit
+arm keeps the legacy `status` field, the match arm adds `status_match`).
+Unknown ids return `found: false`. The result also echoes
+`match_armed: boolean` and the sanitized, truncated `match_pattern` so the
+model can audit what it armed.
 
 Use this when wake was armed by mistake, the approach was abandoned, or the
-human no longer wants auto-resume. **Disarm cannot recall a follow-up that
+human no longer wants auto-resume, and to re-arm the match arm with a new
+pattern after it fired (one-shot). **Disarm cannot recall a follow-up that
 was already queued to pi.** `kill_session` still both kills and suppresses
-wake.
+both arms.
 
 ### `on_exit: "wake"` — completion notifications
 
@@ -331,6 +358,47 @@ Mechanics:
 Requires pi ≥ 0.80.5 (`agent_settled` extension event, used as a safe flush
 point for pending/retried notifications).
 
+### `on_output` — readiness wake (match) notifications
+
+`exec_command(on_output: { pattern, case_sensitive? })` arms a per-session
+**match arm** for processes that do not exit (dev servers, watchers,
+migrations that stay up). `pattern` is a **literal substring, not a
+regex**, 1–256 characters (validated in encoded bytes), matched against
+the output stream in the push path; default case-insensitive via an
+ASCII-only fold (A–Z/a–z; non-ASCII matched byte-exact). Match a
+distinctive banner substring — never a common word (`"ready"` is a
+substring of `"already"` and wakes early) — and set `case_sensitive: true`
+when the banner is not distinctive. The first match while the process is
+running delivers **one** wake; the arm is then consumed, so re-arm via
+`set_on_exit(session_id, on_output: { pattern })` for a later signal.
+
+The wake arrives as a follow-up prompt with `customType: "runbg-matched"`
+(the exit wake keeps `customType: "runbg-completed"`) and carries:
+
+- `match_excerpt` — the sanitized, best-effort line-bounded excerpt of the
+  matched line (≤ 400 bytes raw, full terminal-control stripping; the
+  window may include a completed previous line when lines arrive
+  mid-chunk);
+- `elapsed` — time since spawn, e.g. "matched after 4h12m", so a late fire
+  is self-evidently stale: verify the signal is still relevant before
+  acting (the IV-0001 stale-resume lesson applies to match wakes too);
+- the usual session metadata (`session_id`, command, `running`, `log_path`,
+  `tool_time_utc`). Output beyond the excerpt has **not** been consumed —
+  poll `write_stdin` (no chars) or read `log_path`.
+
+Composition with `on_exit: "wake"` is allowed — "wake me when ready, and
+wake me if it dies instead" — **first event wins**, and exit wins over a
+match only when **both** arms are armed. A match-only arm yields **no**
+wake if the process dies before matching (death coverage is the exit arm's
+job), so arm both if crash-before-ready matters.
+
+Consumption is containment-based: a match wake is observed (and thus not
+delivered) **iff** a successfully finalized tool result's bounded body
+contains the sanitized `match_excerpt` string — the check tests model
+knowledge, fails closed to delivery on any ambiguity, and
+`list_sessions` **never** consumes a match wake (it shows arm booleans,
+never the excerpt).
+
 ### `kill_session`
 
 Pi-flavor. Not in codex.
@@ -358,9 +426,13 @@ Pi-flavor. Not in codex. Prunes exited sessions from the in-memory store, but
 reports each of them one final time (with `running: false`, `exit_code` /
 `signal`, and `log_path`) so exit information is never silently lost.
 
-Each entry includes **`wake_armed: boolean`** (and the text listing marks
-live armed sessions with `[wake]`) so the model can audit which sessions will
-auto-resume on unobserved exit.
+Each entry includes **`wake_armed: boolean`** — defined as the **exit arm**
+only (the text listing marks live armed sessions with `[wake]`) — and
+**`match_armed: boolean`** for the match arm (marked `[match]` in the text
+listing), so the model can audit which sessions will auto-resume on
+unobserved exit or on output match. A match-only arm never lights
+`[wake]`. Listing shows arm booleans, never the excerpt, and never
+consumes a match wake.
 
 The response also carries **`tool_time_utc`** (text trailer + details) so the
 model can compute a `yield_until` deadline from the trustworthy host clock

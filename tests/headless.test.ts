@@ -185,4 +185,28 @@ describe("headless acceptance", () => {
 		await h.shutdown();
 		assert.equal(h.sentMessages.length, 1, "shutdown must not emit further wakes");
 	});
+
+	it("match wake delivery is a core sendMessage with followUp+triggerTurn, no UI involved", async () => {
+		const h = makeHeadlessHarness();
+		await h.emit("session_start");
+
+		const token = `headless-token-${Math.random().toString(36).slice(2, 8)}`;
+		const r = await h.call("exec_command", {
+			cmd: `sleep 0.5; printf '%s' "startup: ${token}"; sleep 30`,
+			yield_time_ms: 250,
+			on_output: { pattern: token },
+		});
+		assert.ok(typeof r.details.session_id === "number", JSON.stringify(r.details));
+
+		assert.ok(await waitFor(() => h.sentMessages.length > 0), "expected a match wake sendMessage");
+		assert.equal(h.sentMessages.length, 1);
+		const { message, options } = h.sentMessages[0];
+		assert.equal(message.customType, "runbg-matched");
+		assert.equal(options.triggerTurn, true);
+		assert.equal(options.deliverAs, "followUp");
+		assert.ok(String(message.content).includes(token), `wake body should carry the excerpt: ${message.content}`);
+
+		await h.shutdown();
+		assert.equal(h.sentMessages.length, 1, "shutdown must not emit further wakes");
+	});
 });

@@ -176,10 +176,18 @@ write_stdin, chars omitted  → poll it (yield_time_ms ≤ 290 s; repeat OK, cac
 write_stdin, chars set      → drive it (input / \x03 Ctrl-C / …)
 yield_until                 → ONLY if human explicitly asks for a long attach / UTC deadline
 on_exit default             → "none"
-on_exit "wake"              → ONLY if human explicitly wants auto-resume
-mistaken / abandoned wake   → set_on_exit(session_id, "none")   # does not kill
-kill_session                → kill process AND suppress wake
-list_sessions               → audit (wake_armed); consumes pending wakes for exited sessions
+on_exit "wake"              → ONLY if human explicitly wants auto-resume (exiting jobs only)
+on_output {pattern}         → readiness wake for non-terminating jobs (dev servers, watchers,
+                              migrations that stay up): arm at spawn, END THE TURN, woken on the
+                              first match — a distinctive banner substring, not a common word
+                              ("ready" ⊂ "already"); one-shot, re-arm via set_on_exit; compose
+                              with on_exit: "wake" for crash-before-ready coverage (first wins)
+mistaken / abandoned wake   → per-arm: set_on_exit(session_id, on_exit: "none") disarms the exit
+                              arm, on_output: null disarms the match arm, the combined call is
+                              full cleanup — none of them kill the process
+kill_session                → kill process AND suppress both wake arms
+list_sessions               → audit (wake_armed = exit arm, match_armed = match arm); consumes
+                              pending exit wakes for exited sessions, never match wakes
 ```
 
 Session hygiene the template must teach:
@@ -390,14 +398,18 @@ Draft "Long-running tasks" section for codex-pi (param names corrected):
 > with `yield_time_ms` up to 290000. Repeat polls are fine, but never
 > tight-loop: if it's still running and nothing else needs doing, end the
 > turn and tell the user the `session_id` and how to resume. Full history is
-> recoverable with `read` on the session's `log_path`. Use `yield_until`
-> (absolute UTC) or `on_exit: "wake"` only when the user explicitly asks to
-> stay attached or be auto-resumed; disarm an unwanted wake with
-> `set_on_exit(session_id, "none")` (does not kill). Clean up with
-> `kill_session`; audit with `list_sessions`. Sessions die with the pi
-> process (`/new`, restart): after a restart, `list_sessions` is ground
-> truth — ids from earlier transcript are dead. Quick one-shot commands still
-> go through `bash`.
+> recoverable with `read` on the session's `log_path`. For a process that
+> does not exit (dev server, watcher), arm a readiness wake instead:
+> `exec_command` with `on_output: {pattern}` — a distinctive banner
+> substring, not a common word — then end the turn; you are woken on the
+> first match. Use `yield_until` (absolute UTC) or `on_exit: "wake"` only
+> when the user explicitly asks to stay attached or be auto-resumed;
+> disarm an unwanted wake per arm with `set_on_exit(session_id, on_exit:
+> "none")` (exit arm) or `set_on_exit(session_id, on_output: null)` (match
+> arm) — does not kill. Clean up with `kill_session`; audit with
+> `list_sessions`. Sessions die with the pi process (`/new`, restart):
+> after a restart, `list_sessions` is ground truth — ids from earlier
+> transcript are dead. Quick one-shot commands still go through `bash`.
 
 Reminder (verified in pi source): pi injects `promptSnippet` /
 `promptGuidelines` only in the default (non-custom) prompt branch — custom

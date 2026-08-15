@@ -123,6 +123,8 @@ interface SessionListItem {
 	elapsed_ms: number;
 	running: boolean;
 	wake_armed: boolean;
+	/** Match arm (on_output) armed. A match-only arm never lights the exit-arm [wake] label. */
+	match_armed?: boolean;
 	exit_code?: number | null;
 	signal?: string;
 	failure_message?: string;
@@ -176,7 +178,7 @@ function safeOneLine(value: string, max = 120): string {
 // ---------------- renderCall ----------------
 
 export function renderExecCommandCall(
-	args: { cmd?: string; workdir?: string; tty?: boolean; yield_time_ms?: number; on_exit?: unknown },
+	args: { cmd?: string; workdir?: string; tty?: boolean; yield_time_ms?: number; on_exit?: unknown; on_output?: unknown },
 	theme: Theme,
 	context: ToolRenderContext<RenderState, typeof args>,
 ): Component {
@@ -190,9 +192,11 @@ export function renderExecCommandCall(
 	const effectiveCwd = args?.workdir || context.cwd;
 	if (effectiveCwd) parts.push(`cwd: ${safeOneLine(tildify(effectiveCwd))}`);
 	if (args?.tty) parts.push("tty");
+	if (args?.on_output && typeof args.on_output === "object") parts.push(formatOutputPattern(args.on_output));
 	const suffix = parts.length ? theme.fg("muted", ` (${parts.join(" · ")})`) : "";
 	const wake = args?.on_exit === "wake" ? theme.fg("warning", " [wake]") : "";
-	const banner = theme.fg("toolTitle", theme.bold(`$ ${cmd}`)) + suffix + wake;
+	const match = args?.on_output && typeof args.on_output === "object" ? theme.fg("warning", " [match]") : "";
+	const banner = theme.fg("toolTitle", theme.bold(`$ ${cmd}`)) + suffix + wake + match;
 
 	const text = context.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
 	text.setText(banner);
@@ -228,15 +232,30 @@ export function renderWriteStdinCall(
 	return text;
 }
 
+/** `{pattern: "listening", case_sensitive: true}` → `on_output={pattern: "listening", cs}`. */
+function formatOutputPattern(value: unknown): string {
+	if (typeof value !== "object" || value === null) return "on_output=?";
+	const { pattern, case_sensitive } = value as { pattern?: unknown; case_sensitive?: unknown };
+	const p = typeof pattern === "string" ? sanitizeOutputText(safeOneLine(pattern, 64)) : "?";
+	return `on_output=${p}${case_sensitive === true ? " (cs)" : ""}`;
+}
+
 export function renderSetOnExitCall(
-	args: { session_id?: number; on_exit?: unknown },
+	args: { session_id?: number; on_exit?: unknown; on_output?: unknown },
 	theme: Theme,
 	context: ToolRenderContext<RenderState, typeof args>,
 ): Component {
 	const sid = args?.session_id !== undefined ? args.session_id : "?";
-	const policy = typeof args?.on_exit === "string" ? safeOneLine(args.on_exit) : "?";
+	const parts: string[] = [];
+	if (args?.on_exit !== undefined) {
+		parts.push(`on_exit=${typeof args.on_exit === "string" ? safeOneLine(args.on_exit) : "?"}`);
+	}
+	if (args?.on_output !== undefined) {
+		parts.push(args.on_output === null ? "on_output=null" : formatOutputPattern(args.on_output));
+	}
 	const banner =
-		theme.fg("toolTitle", theme.bold("set_on_exit")) + theme.fg("muted", ` session_id=${sid} → ${policy}`);
+		theme.fg("toolTitle", theme.bold("set_on_exit")) +
+		theme.fg("muted", ` session_id=${sid}${parts.length ? ` → ${parts.join(", ")}` : ""}`);
 	const text = context.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
 	text.setText(banner);
 	return text;
@@ -496,7 +515,21 @@ export function renderSetOnExitResult(
 	const found = result.details?.found;
 	const message = sanitizeOutputText(getContentText(result));
 	const color = found === false ? "error" : "muted";
-	return new Text(message ? `\n${theme.fg(color, message)}` : "", 0, 0);
+	// Match-arm echo (details.match_armed / match_pattern, sanitized+truncated by
+	// the tool): show the pattern and armed state so the model can audit what it
+	// armed (IV-0002: every tool has a renderer). Sanitize again defensively.
+	const matchArmed = result.details?.match_armed;
+	const matchPattern = result.details?.match_pattern;
+	let matchLine = "";
+	if (typeof matchArmed === "boolean" || typeof matchPattern === "string") {
+		const echo =
+			typeof matchPattern === "string" && matchPattern !== ""
+				? `pattern: ${sanitizeOutputText(safeOneLine(matchPattern, 64))}`
+				: "no pattern";
+		matchLine = `\n${theme.fg("muted", `match arm: ${matchArmed === true ? "armed" : "not armed"} · ${echo}`)}`;
+	}
+	const messagePart = message ? `\n${theme.fg(color, message)}` : "";
+	return new Text(`${messagePart}${matchLine}`, 0, 0);
 }
 
 class ListResultContainer extends Container {}
@@ -544,8 +577,9 @@ export function renderListSessionsResult(
 									: `signal=${safeOneLine(session.signal ?? "?")}`,
 							);
 					const wake = session.wake_armed ? theme.fg("warning", " [wake]") : "";
+					const match = session.match_armed ? theme.fg("warning", " [match]") : "";
 					const command = safeOneLine(session.command, 100);
-					const line = `#${session.session_id} pid=${session.pid ?? "?"} ${session.tty ? "tty" : "pipe"} ${(session.elapsed_ms / 1000).toFixed(1)}s ${state}${wake} ${command}`;
+					const line = `#${session.session_id} pid=${session.pid ?? "?"} ${session.tty ? "tty" : "pipe"} ${(session.elapsed_ms / 1000).toFixed(1)}s ${state}${wake}${match} ${command}`;
 					lines.push(truncateToWidth(line, width, "..."));
 					if (options.expanded) {
 						lines.push(

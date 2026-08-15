@@ -25,6 +25,7 @@ import {
 } from "./log-archive.ts";
 import { Gate, Notify } from "./notify.ts";
 import { type SpawnedChild, spawnChild } from "./pty.ts";
+import { captureMatchWindow, IncrementalMatcher, MatchLineRing } from "./wake-match.ts";
 
 /** Default per-session output retention. */
 export const DEFAULT_HEAD_TAIL_MAX_BYTES = 1024 * 1024; // 1 MiB
@@ -93,6 +94,8 @@ export interface SessionSpawnOptions {
 	streamTailBytes?: number;
 	/** Mirror-size cap for the on-disk log; defaults to PI_RUNBG_MAX_LOG_BYTES / 256 MiB. */
 	maxLogBytes?: number;
+	/** Readiness-match arm (IV-0004): matcher + excerpt ring armed from spawn. */
+	match?: { pattern: string; caseSensitive: boolean };
 	displayCommand?: string; // human-readable command for list_sessions/UI
 	shell?: string; // raw `shell` arg recorded for introspection
 	windowsVerbatimArguments?: boolean; // Windows cmd.exe quoting (see shell.ts)
@@ -147,6 +150,19 @@ export class ExecSession {
 		failureMessage: null,
 	};
 	private readonly exitListeners = new Set<(session: ExecSession) => void>();
+	/** Readiness-match arm state (IV-0004); allocated only when a match is armed. */
+	private matchArm:
+		| undefined
+		| {
+				matcher: IncrementalMatcher;
+				ring: MatchLineRing;
+				pattern: string;
+				caseSensitive: boolean;
+				fired: boolean;
+				/** Ring snapshot frozen at fire time; the excerpt source for the coordinator. */
+				frozen: Uint8Array | undefined;
+		  };
+	private readonly matchListeners = new Set<(session: ExecSession) => void>();
 	private lastUsedAt: number;
 	private child!: SpawnedChild;
 
@@ -163,6 +179,19 @@ export class ExecSession {
 		this.maxLogBytes = opts.maxLogBytes ?? resolveMaxLogBytes();
 		this.pid = undefined; // set in `start`
 		this.logPath = join(tmpdir(), `pi-runbg-${id}-${randomBytes(4).toString("hex")}.log`);
+		if (opts.match) {
+			// Armed from spawn: pre-commit bytes (a fast banner landing during
+			// exec_command's attach window) must match, not be ignored — the
+			// coordinator adopts the fired event at the arm-commit point.
+			this.matchArm = {
+				matcher: new IncrementalMatcher(opts.match.pattern, opts.match.caseSensitive),
+				ring: new MatchLineRing(),
+				pattern: opts.match.pattern,
+				caseSensitive: opts.match.caseSensitive,
+				fired: false,
+				frozen: undefined,
+			};
+		}
 	}
 
 	static spawn(id: number, opts: SessionSpawnOptions): ExecSession {
@@ -241,6 +270,7 @@ export class ExecSession {
 			// listener, which nulls `logStream` out.
 			self.mirrorToLog(chunk);
 			self.outputNotify.notifyAll();
+			self.pushMatchArm(chunk);
 		});
 
 		self.child.onExit((exitCode, signal, failureMessage) => {
@@ -283,6 +313,106 @@ export class ExecSession {
 
 	private appendStreamTail(chunk: Uint8Array): void {
 		this.streamTail.append(chunk);
+	}
+
+	/**
+	 * Feed a transport chunk to the readiness matcher (IV-0004 § Semantics).
+	 * Runs ONLY while a match arm exists and has not fired — unarmed sessions
+	 * pay nothing per chunk. The `hasExited` check is the spec's "trailing
+	 * post-exit bytes never wake" guard: for current transports it is
+	 * defensive (pipes deliver data before `close`; PTY disposes its data
+	 * subscription synchronously at exit) but must hold for future ones.
+	 *
+	 * The matcher runs FIRST: when it fires, the ring still holds the
+	 * PRE-chunk line context, which `captureMatchWindow` composes with this
+	 * chunk around the match position (±200 bytes extended to enclosing
+	 * newlines, hard cap 400) — a naive current-line tail can scroll the
+	 * match out when it lands near the start of a >400-byte chunk. On a
+	 * non-firing push the ring records the chunk as context.
+	 */
+	private pushMatchArm(chunk: Uint8Array): void {
+		const arm = this.matchArm;
+		if (!arm || arm.fired || this.hasExited) return;
+		if (arm.matcher.push(chunk)) {
+			// One-shot: freeze the position-aware raw window now, then leave
+			// matcher and ring idle forever. Sanitization is the
+			// coordinator's job at snapshot build time (output-safety.ts
+			// sanitizeOutputText).
+			arm.fired = true;
+			arm.frozen = captureMatchWindow(
+				arm.ring.snapshot(),
+				chunk,
+				arm.matcher.matchEndInChunk,
+				arm.matcher.needleByteLength,
+			);
+			for (const listener of this.matchListeners) {
+				try {
+					listener(this);
+				} catch {
+					// ignore listener failures
+				}
+			}
+		} else {
+			arm.ring.push(chunk);
+		}
+	}
+
+	/** Register a listener fired when the armed match pattern first matches. */
+	onMatch(listener: (session: ExecSession) => void): () => void {
+		this.matchListeners.add(listener);
+		if (this.matchHasFired) {
+			queueMicrotask(() => {
+				if (this.matchListeners.has(listener)) listener(this);
+			});
+		}
+		return () => this.matchListeners.delete(listener);
+	}
+
+	/** True while a match arm is armed and has not yet fired (one-shot). */
+	get matchArmed(): boolean {
+		return !!this.matchArm && !this.matchArm.fired;
+	}
+
+	/** The armed pattern (string) for audit echo, or null when no arm exists. */
+	get matchPattern(): string | null {
+		return this.matchArm ? this.matchArm.pattern : null;
+	}
+
+	/** True after the armed pattern matched (latched until re-arm/disarm). */
+	get matchHasFired(): boolean {
+		return !!this.matchArm && this.matchArm.fired;
+	}
+
+	/** Raw ring bytes frozen at fire time; the coordinator sanitizes these. */
+	get matchExcerptBytes(): Uint8Array | undefined {
+		return this.matchArm?.frozen;
+	}
+
+	/**
+	 * Re-arm or disarm the readiness matcher on a live session (set_on_exit's
+	 * match arm). Re-arming installs a FRESH matcher + ring + fire latch, so a
+	 * fired one-shot arm can be replaced with a new pattern; null disarms.
+	 */
+	setMatchArm(
+		pattern: string | null,
+		caseSensitive: boolean,
+	): "armed" | "replaced" | "disarmed" | "already_fired" | "not_armed" {
+		if (pattern === null) {
+			if (!this.matchArm) return "not_armed";
+			if (this.matchArm.fired) return "already_fired";
+			this.matchArm = undefined;
+			return "disarmed";
+		}
+		const replaced = this.matchArm !== undefined;
+		this.matchArm = {
+			matcher: new IncrementalMatcher(pattern, caseSensitive),
+			ring: new MatchLineRing(),
+			pattern,
+			caseSensitive,
+			fired: false,
+			frozen: undefined,
+		};
+		return replaced ? "replaced" : "armed";
 	}
 
 	/** Recoverability of the on-disk log (divergence #3, log-archive.ts). */

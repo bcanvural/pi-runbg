@@ -64,6 +64,7 @@ import {
 	type ProcessResultDetails,
 } from "./tool-result.ts";
 import { unescapeChars } from "./unescape.ts";
+import { validateMatchPattern } from "./wake-match.ts";
 
 // ---------------- Constants (mirror codex) ----------------
 
@@ -840,6 +841,7 @@ type ExecCommandArgs = {
 	rows?: number;
 	yield_time_ms?: number;
 	on_exit?: OnExitPolicy;
+	on_output?: { pattern: string; case_sensitive?: boolean };
 };
 
 type WriteStdinArgs = {
@@ -906,11 +908,21 @@ async function runExecCommand(
 	args: ExecCommandArgs,
 	signal: AbortSignal | undefined,
 	onUpdate: ((partial: { content: [{ type: "text"; text: string }]; details: unknown }) => void) | undefined,
+	toolCallId: string,
 	cwd: string,
 	eventCtx: SteerHost,
 ): Promise<ResponseShape> {
-	const finalizeResponse = (input: FinalizeInput): ResponseShape =>
-		finalizeProcessResult({ ...input, operation: "exec_command" });
+	const finalizeResponse = (input: FinalizeInput, stageFor?: number): ResponseShape => {
+		const shape = finalizeProcessResult({ ...input, operation: "exec_command" });
+		// Terminal results carry no session_id (the session left the store),
+		// but their bounded body can still contain the excerpt — stage with
+		// the ORIGINAL observed id so containment consumes the wake.
+		const observedId = stageFor ?? input.sessionId;
+		if (observedId !== undefined) {
+			ctx.coordinator.stageMatchConsumption(toolCallId, observedId, shape.output ?? "");
+		}
+		return shape;
+	};
 	if (ctx.shuttingDown) {
 		throw new Error("runbg: session is shutting down; not starting new commands.");
 	}
@@ -965,6 +977,17 @@ async function runExecCommand(
 	const effectiveCwd = args.workdir && args.workdir.length > 0 ? args.workdir : cwd;
 	const yieldTimeMs = clampYield(args.yield_time_ms, DEFAULT_EXEC_YIELD_MS);
 	const wantsWake = args.on_exit === "wake";
+	// Readiness wake (IV-0004): validate BEFORE spawn — an invalid pattern is
+	// an actionable error and must never start a process.
+	const onOutput = args.on_output
+		? { pattern: args.on_output.pattern, caseSensitive: args.on_output.case_sensitive === true }
+		: undefined;
+	if (onOutput) {
+		const validation = validateMatchPattern(onOutput.pattern);
+		if (!validation.ok) {
+			throw new Error(validation.error);
+		}
+	}
 
 	const id = ctx.store.allocateId();
 	const session = ExecSession.spawn(id, {
@@ -977,6 +1000,7 @@ async function runExecCommand(
 		displayCommand: args.cmd,
 		shell: shellBin,
 		windowsVerbatimArguments: shellCommand.windowsVerbatimArguments,
+		...(onOutput ? { match: onOutput } : {}),
 	});
 
 	if (session.failureMessage) {
@@ -1038,7 +1062,7 @@ async function runExecCommand(
 					// satisfied directly without ever being armed.
 					...(wantsWake ? { completion_delivery: "direct" as const, tool_time_utc: nowUtcIso() } : {}),
 				},
-			});
+			}, session.id);
 		}
 
 		// The child outlived the grace window. Re-check both refusal conditions
@@ -1158,11 +1182,14 @@ async function runExecCommand(
 		const wallSec = (Date.now() - start) / 1000;
 
 		if (stillAlive) {
-			// COMMIT POINT for on_exit: "wake" — we are now returning a background
-			// session_id, so arm the wake. If the process exits a moment after this
-			// check, the coordinator's exit listener (which fires even for
-			// already-exited sessions) still delivers the completion exactly once.
-			if (wantsWake) ctx.coordinator.register(session);
+			// COMMIT POINT for the wake arms — we are now returning a background
+			// session_id, so arm on_exit: "wake" and/or on_output. If the
+			// process exits a moment after this check, the coordinator's exit
+			// listener (which fires even for already-exited sessions) still
+			// delivers the completion exactly once; a match that already fired
+			// during the attach window is adopted here (pre-commit adoption)
+			// and containment decides observed-vs-deliver.
+			if (wantsWake || onOutput) ctx.coordinator.register(session, { onExit: wantsWake, onOutput });
 			return finalizeResponse({
 				wallTimeSec: wallSec,
 				collected: collected.bytes,
@@ -1210,7 +1237,7 @@ async function runExecCommand(
 				on_exit: args.on_exit,
 				...(wantsWake ? { completion_delivery: "direct" as const, tool_time_utc: nowUtcIso() } : {}),
 			},
-		});
+		}, session.id);
 	} finally {
 		ctx.pendingSessions.delete(session);
 	}
@@ -1241,8 +1268,14 @@ async function runWriteStdin(
 	toolCallId: string,
 	eventCtx: SteerHost,
 ): Promise<ResponseShape> {
-	const finalizeResponse = (input: FinalizeInput): ResponseShape =>
-		finalizeProcessResult({ ...input, operation: "write_stdin" });
+	const finalizeResponse = (input: FinalizeInput, stageFor?: number): ResponseShape => {
+		const shape = finalizeProcessResult({ ...input, operation: "write_stdin" });
+		const observedId = stageFor ?? input.sessionId;
+		if (observedId !== undefined) {
+			ctx.coordinator.stageMatchConsumption(toolCallId, observedId, shape.output ?? "");
+		}
+		return shape;
+	};
 	// NOTE: the store lookup is deliberately repeated after the lock is held
 	// (below) — a call queued behind the one that observed the exit must see
 	// the reaped state, not the pre-lock snapshot.
@@ -1370,7 +1403,7 @@ async function runWriteStdin(
 					command: session.displayCommand,
 					yieldTimeMs,
 					extra: terminalWaitExtra(undefined, armed),
-				});
+				}, session.id);
 			}
 			const armed = ctx.coordinator.isArmed(session.id);
 			ctx.coordinator.releaseObservation(session.id, toolCallId);
@@ -1436,7 +1469,7 @@ async function runWriteStdin(
 					// This path is only reachable for input writes (never an empty
 					// poll), so no wait_mode is reported — just direct delivery.
 					extra: terminalWaitExtra(undefined, armed),
-				});
+				}, session.id);
 			}
 			// Give the child a small window to react before the poll.
 			await sleep(100, signal);
@@ -1478,7 +1511,7 @@ async function runWriteStdin(
 				command: session.displayCommand,
 				yieldTimeMs,
 				extra: terminalWaitExtra(isEmptyPoll ? "relative" : undefined, armed),
-			});
+			}, session.id);
 		}
 		// Still running: release the lease WITHOUT marking observed — the wake
 		// (if armed) stays eligible.
@@ -1649,8 +1682,14 @@ async function runAbsoluteWait(
 	onUpdate: ((partial: { content: [{ type: "text"; text: string }]; details: unknown }) => void) | undefined,
 	toolCallId: string,
 ): Promise<ResponseShape> {
-	const finalizeResponse = (input: FinalizeInput): ResponseShape =>
-		finalizeProcessResult({ ...input, operation: "write_stdin" });
+	const finalizeResponse = (input: FinalizeInput, stageFor?: number): ResponseShape => {
+		const shape = finalizeProcessResult({ ...input, operation: "write_stdin" });
+		const observedId = stageFor ?? input.sessionId;
+		if (observedId !== undefined) {
+			ctx.coordinator.stageMatchConsumption(toolCallId, observedId, shape.output ?? "");
+		}
+		return shape;
+	};
 	const startMs = Date.now();
 	// Parse/validate the wall-clock instant and compute the remaining duration
 	// ONCE; the wait below runs purely on the monotonic clock.
@@ -1720,7 +1759,7 @@ async function runAbsoluteWait(
 				...terminalWaitExtra("absolute", armed),
 				yield_until: parsed.normalized,
 			},
-		});
+		}, session.id);
 	}
 
 	if (outcome === "cancelled") {
@@ -1862,6 +1901,12 @@ function oneLineCommand(command: string, max = 120): string {
 	return oneLine.length <= max ? oneLine : `${oneLine.slice(0, max - 1)}…`;
 }
 
+/** Sanitized, truncated match-pattern echo for set_on_exit details/text (~48 chars). */
+function echoPattern(pattern: string): string {
+	const flat = sanitizeMeta(pattern).replace(/\s+/g, " ").trim();
+	return flat.length <= 48 ? flat : `${flat.slice(0, 47)}…`;
+}
+
 function formatRunningSessionsWidget(ctx: ExtensionCtx, sessions: ExecSession[]): string[] {
 	const now = Date.now();
 	const shown = sessions.slice(0, 5);
@@ -1875,7 +1920,8 @@ function formatRunningSessionsWidget(ctx: ExtensionCtx, sessions: ExecSession[])
 		`● runbg: ${sessions.length} ${plural(sessions.length, "session")} still running`,
 		...shown.map((s) => {
 			const wake = ctx.coordinator.isArmed(s.id) ? " [wake]" : "";
-			return `  #${s.id} ${formatElapsed(now - s.startedAt)}${wake} ${oneLineCommand(s.displayCommand, 72)} (${s.cwd})`;
+			const match = ctx.coordinator.isMatchArmed(s.id) ? " [match]" : "";
+			return `  #${s.id} ${formatElapsed(now - s.startedAt)}${wake}${match} ${oneLineCommand(s.displayCommand, 72)} (${s.cwd})`;
 		}),
 	];
 	if (sessions.length > shown.length) lines.push(`  … ${sessions.length - shown.length} more; use list_sessions`);
@@ -2070,9 +2116,12 @@ export default function (pi: ExtensionAPI) {
 		send: (message) => {
 			// If pi is idle this starts a model turn; if a run is active it is
 			// queued as a follow-up — never steering/interrupting the current turn.
+			// Match wakes get their own customType ("runbg-matched") so the TUI
+			// and persisted transcript can tell a readiness wake from an exit
+			// wake; the payload shape is identical for both kinds (IV-0004).
 			pi.sendMessage(
 				{
-					customType: "runbg-completed",
+					customType: message.kind === "match" ? "runbg-matched" : "runbg-completed",
 					content: message.content,
 					display: true,
 					details: message.details,
@@ -2383,7 +2432,8 @@ export default function (pi: ExtensionAPI) {
 			const now = Date.now();
 			const labels = sessions.map((s) => {
 				const wake = ctx.coordinator.isArmed(s.id) ? " [wake]" : "";
-				return `#${s.id} ${formatElapsed(now - s.startedAt)}${wake} ${oneLineCommand(s.displayCommand, 60)}`;
+				const match = ctx.coordinator.isMatchArmed(s.id) ? " [match]" : "";
+				return `#${s.id} ${formatElapsed(now - s.startedAt)}${wake}${match} ${oneLineCommand(s.displayCommand, 60)}`;
 			});
 			const KILL_ALL = `Kill all ${sessions.length} ${plural(sessions.length, "session")}`;
 			const choice = await cmdCtx.ui.select(
@@ -2424,18 +2474,20 @@ export default function (pi: ExtensionAPI) {
 			`Run a command in a persistent session. Choose the wait mode FIRST:
 - Finishes within ~5 min → ONE exec_command with yield_time_ms covering it (max ${MAX_YIELD_TIME_MS} ms). Do not split into a short yield plus a poll.
 - Longer or unknown → exec_command, then on_exit: "wake", then END THE TURN. The result is delivered on completion.
+- Non-terminating with a readiness signal (dev servers, watchers, migrations that stay up) → exec_command with on_output: {pattern} armed, then END THE TURN — woken on the first match.
 - Interactive (REPL, ssh, sudo) → exec_command with a short yield, then drive it with write_stdin.
-Returns \`session_id\` if still running or \`exit_code\` if it finished within yield_time_ms. If a separate \`bash\` tool is also available, prefer exec_command for anything that MIGHT run long: only a session yields a handle, so only it can hand control back while the command keeps running — a bash call of the same length blocks until it finishes. Use bash only for commands that are certainly fast. NEVER background inside cmd (\`&\`, \`nohup\`): the session already is the background. NEVER arm on_exit: "wake" for a process that does not exit on its own (dev servers, watchers) — it can only fail to fire. Use set_on_exit to disarm or re-arm a running session.`,
+Returns \`session_id\` if still running or \`exit_code\` if it finished within yield_time_ms. If a separate \`bash\` tool is also available, prefer exec_command for anything that MIGHT run long: only a session yields a handle, so only it can hand control back while the command keeps running — a bash call of the same length blocks until it finishes. Use bash only for commands that are certainly fast. NEVER background inside cmd (\`&\`, \`nohup\`): the session already is the background. NEVER arm on_exit: "wake" for a process that does not exit on its own (dev servers, watchers) — it can only fail to fire; for readiness of those, arm on_output instead, and arm BOTH arms if crash-before-ready matters. Use set_on_exit to disarm or re-arm a running session.`,
 		promptSnippet: "Run a shell command; long-running ones yield a session_id",
 		promptGuidelines: [
 			"Prefer dedicated file tools when available (read/grep/find/ls). Otherwise use exec_command with fast shell tools: rg for content search, fd if available (or find) for file names, and ls for directories.",
 			"When pi\'s built-in `bash` is also available, still route anything that MIGHT run long through exec_command — builds, test suites, installs, migrations, deploys, anything network-bound. Only exec_command yields a session, so only it can hand control back mid-wait when the human types; a bash call of the same length makes them wait it out or press Esc, which kills the command outright. Reach for bash only for commands that are certainly fast.",
-			`Choose how you will wait BEFORE starting, from the job's expected duration. Expected to finish within ~5 minutes: ONE exec_command whose yield_time_ms covers it (~500ms for quick one-shots, ${DEFAULT_EXEC_YIELD_MS} ms default, up to ${MAX_YIELD_TIME_MS} ms) — do not split this into a short yield plus a poll, which costs an extra turn for the same wait. Longer than that, or unknown: start it, then set on_exit: "wake" and END THE TURN — the result is delivered to you automatically when it finishes, which beats holding the turn or hoping someone checks back. Interactive processes (REPLs, ssh, sudo) always return a session_id you then drive with write_stdin. Never end a turn with a live session you have not named to the human, and kill_session anything you have stopped caring about — abandoned sessions still count toward the session cap.`,
+			`Choose how you will wait BEFORE starting, from the job's expected duration. Expected to finish within ~5 minutes: ONE exec_command whose yield_time_ms covers it (~500ms for quick one-shots, ${DEFAULT_EXEC_YIELD_MS} ms default, up to ${MAX_YIELD_TIME_MS} ms) — do not split this into a short yield plus a poll, which costs an extra turn for the same wait. Longer than that, or unknown: start it, then set on_exit: "wake" and END THE TURN — the result is delivered to you automatically when it finishes, which beats holding the turn or hoping someone checks back. Non-terminating with a readiness signal (dev servers, watchers, migrations that stay up): exec_command with on_output: {pattern} armed, then END THE TURN — you are woken on the first match; use a distinctive banner substring, never a common word like "ready". Interactive processes (REPLs, ssh, sudo) always return a session_id you then drive with write_stdin. Never end a turn with a live session you have not named to the human, and kill_session anything you have stopped caring about — abandoned sessions still count toward the session cap.`,
 			"Do not background inside cmd (`&`, `nohup`, `disown`) — the session IS the background: run the long process as cmd itself and poll it with write_stdin. A backgrounded child is not tracked by its session; if it inherits the session's output pipe, the session keeps reporting [still running] long after your cmd finished, and kill_session ends it anyway (SIGTERM goes to the whole process group, which nohup does not survive). Use setsid only when the human explicitly wants a process to outlive pi.",
 			"Compose multi-step waits in the shell, not across tool calls — the shell is your scripting layer, so anything needing no model judgment between steps belongs in one command. `until curl -sf URL; do sleep 2; done && npm test 2>&1 | tail -40` is a single call; polling, checking, then running is five or six. Prefer waiting on a CONDITION over sleeping a fixed duration: it returns the instant the condition holds instead of after a guess, and a bare sleep whose only purpose is to pass time gives you a session with nothing to observe.",
 			"Filter output at the source (tail, grep, wc, --quiet flags) rather than pulling everything into context. Results are bounded by a head/tail buffer, so an unfiltered 900-line run silently loses its MIDDLE — usually where the failure is. Truncation is a safety net, not a filtering strategy. log_path always holds the complete stream: grep or read that when the bounded result is not enough, instead of re-running the job.",
 			`An empty write_stdin poll (no chars) waits for progress and accepts yield_time_ms up to 290 seconds (${DEFAULT_MAX_BACKGROUND_POLL_MS} ms, cache-friendly). Each poll returns only output that is NEW since the last one, never bytes you have already seen, so a poll's cost is the TURN rather than the payload — which is why one long poll beats several short ones. Do NOT use yield_until just to bypass the 290s cap — only when the human explicitly asks for a long attached wait or a wall-clock deadline (finite non-interactive jobs only).`,
-			'on_exit defaults to "none". Arm on_exit: "wake" for any long job that TERMINATES and that you would otherwise wait on — it delivers the result to you on completion, so you can end the turn instead of blocking it. NEVER arm it for something that does not exit on its own (dev servers, watchers, tail -f): it would simply never fire, and a wake left armed on abandoned work interrupts later. If you armed it by mistake, call set_on_exit(session_id, on_exit: "none") promptly (does not kill the process). kill_session both kills and suppresses the wake. Combining wake with an observing write_stdin is safe: direct completion consumes the wake.',
+			'on_exit defaults to "none". Arm on_exit: "wake" for any long job that TERMINATES and that you would otherwise wait on — it delivers the result to you on completion, so you can end the turn instead of blocking it. NEVER arm it for something that does not exit on its own (dev servers, watchers, tail -f): it would simply never fire — for readiness of those, arm on_output: {pattern} instead, and arm BOTH arms (on_exit: "wake" + on_output) if crash-before-ready matters (first event wins; a match-only arm yields NO wake if the process dies before matching). If you armed it by mistake, call set_on_exit(session_id, on_exit: "none") promptly (does not kill the process). kill_session both kills and suppresses the wake. Combining wake with an observing write_stdin is safe: direct completion consumes the wake.',
+			'Wakes are disarmed per arm, and both arms are one-shot. on_exit: "none" disarms ONLY the exit arm; on_output: null disarms ONLY the match arm; the combined call (on_exit: "none", on_output: null) is full cleanup — a both-omitted set_on_exit call is a valid no-op audit that returns the current armed state. After a match wake, output beyond the match_excerpt has NOT been consumed: poll write_stdin (no chars) or read log_path before acting. A match wake with a large elapsed hint ("matched after 4h12m") may be stale — verify the signal is still relevant before acting, and re-arm via set_on_exit(on_output: {...}) for any later signal.',
 		],
 		parameters: Type.Object({
 			cmd: Type.String({ description: "Shell command to execute." }),
@@ -2468,10 +2520,29 @@ Returns \`session_id\` if still running or \`exit_code\` if it finished within y
 					'"none" (default): no auto-resume; poll with write_stdin. "wake": ONE follow-up notification on unobserved exit that resumes the agent — only when the human explicitly wants auto-resume. Change later via set_on_exit. A completion observed directly by a tool result consumes the wake.',
 				),
 			),
+			on_output: Type.Optional(
+				Type.Object(
+					{
+						pattern: Type.String({
+							description:
+								'Literal substring (NOT a regex) matched against the session\'s output stream; 1–256 characters, validated in encoded bytes (malformed surrogates rejected). Default matching is case-INSENSITIVE via an ASCII-only fold (A–Z/a–z; non-ASCII matched byte-exact). Match a distinctive banner substring ("Server started on :3000", "listening on") — never a common word like "ready", which also matches inside "already" and wakes early; set case_sensitive: true when the banner is not distinctive.',
+						}),
+						case_sensitive: Type.Optional(
+							Type.Boolean({
+								description: 'Default false (case-insensitive, ASCII-only fold). Set true for exact-case matching — recommended when the banner substring is not distinctive enough to stand alone.',
+							}),
+						),
+					},
+					{
+						description:
+							'Readiness wake: ONE follow-up prompt on the FIRST output match while the process runs (woken on "runbg-matched" with a sanitized excerpt). Use for processes that do not exit (dev servers, watchers): arm it, END THE TURN, get woken when ready. One-shot — re-arm via set_on_exit(on_output: {...}) for a later signal. Composes with on_exit: "wake" ("wake me when ready, and wake me if it dies instead") — first event wins; exit wins only when BOTH arms are armed.',
+					},
+				),
+			),
 		}),
-		async execute(_toolCallId, params, signal, onUpdate, eventCtx) {
+		async execute(toolCallId, params, signal, onUpdate, eventCtx) {
 			ctx.ui ??= eventCtx.ui;
-			const shape = await runExecCommand(ctx, params as ExecCommandArgs, signal, onUpdate as any, eventCtx.cwd, eventCtx);
+			const shape = await runExecCommand(ctx, params as ExecCommandArgs, signal, onUpdate as any, toolCallId, eventCtx.cwd, eventCtx);
 			updateRunningSessionsUi(ctx);
 			return {
 				content: [{ type: "text", text: renderProcessResultText(shape) }],
@@ -2492,7 +2563,7 @@ Returns \`session_id\` if still running or \`exit_code\` if it finished within y
 			`Use yield_time_ms for interaction or an empty progress poll of at most 290 seconds (${DEFAULT_MAX_BACKGROUND_POLL_MS} ms, cache-friendly). Larger values are rejected, not clamped. Repeat polls as needed instead of bypassing the cap.`,
 			'Use yield_until ONLY when the human explicitly asks for a long attached wait or an explicit UTC deadline. Omit yield_time_ms and pass a future UTC timestamp ending in "Z" (compute it from tool_time_utc in tool results). Finite non-interactive sessions only. Do NOT use yield_until just to bypass the 290s cap. The call returns immediately when the process exits.',
 			"NEVER use yield_until for REPLs, sudo, ssh, password prompts, dev servers, file watchers, debuggers, or any indefinite/interactive session — it is only for finite commands that will exit on their own.",
-			'on_exit wake is set via exec_command or set_on_exit, not write_stdin. Observing an exit here consumes an armed wake (direct result). To disarm wake without killing, call set_on_exit(session_id, on_exit: "none").',
+			'on_exit wake and on_output match arms are set via exec_command or set_on_exit, not write_stdin — polls stay passive (no on_output on write_stdin). Observing an exit here consumes an armed exit wake (direct result). Disarm per arm without killing: set_on_exit(session_id, on_exit: "none") for the exit arm only, set_on_exit(session_id, on_output: null) for the match arm only, or the combined call for full cleanup.',
 			"In tty sessions, submit lines with \\r (the Enter key) rather than \\n: POSIX terminals accept both, but Windows console programs only execute input on \\r.",
 			"To interrupt a running command, send chars \\x03 on its own (never via chars_b64, which is always literal bytes): in a pipes session that is delivered as a real SIGINT to the process group, and in a tty session the terminal turns it into Ctrl-C.",
 			'Poll one session at a time. Concurrent calls against the same session_id are serialized, so a progress poll may return early with wait_status "preempted" (and possibly no new output) when another call wants that session — that is not an error; poll again if you still need output.',
@@ -2543,34 +2614,93 @@ Returns \`session_id\` if still running or \`exit_code\` if it finished within y
 		name: "set_on_exit",
 		label: "set_on_exit",
 		description:
-			'Change on_exit policy for a session without killing it. on_exit: "none" disarms a pending wake (including coordinator tombstones after eviction). on_exit: "wake" arms auto-resume if the process is still running. Cannot recall a follow-up already queued to the agent. kill_session both kills and suppresses.',
-		promptSnippet: "Disarm or re-arm on_exit wake for a session",
+			'Set wake policy for a session without killing it — per arm. The exit arm: on_exit "none" disarms a pending wake (including coordinator tombstones after eviction); "wake" arms auto-resume if the process is still running. The match arm: on_output {pattern, case_sensitive?} arms or replaces the one-shot readiness wake with a fresh generation; on_output null disarms only the match arm. Either parameter omitted = that arm is left unchanged, so a both-omitted call is a valid no-op audit returning the current armed state. ("none", null) together is full cleanup. Cannot recall a follow-up already queued to the agent. kill_session both kills and suppresses both arms.',
+		promptSnippet: "Disarm or re-arm wake arms (exit and output-match) for a session",
 		promptGuidelines: [
-			'Default on_exit is "none". If you set "wake" and no longer need auto-resume (wrong command, user moved on, abandoned approach), call set_on_exit with "none" promptly — do not leave stale wakes armed.',
-			"This does not stop the process. Use kill_session to terminate.",
-			"Prefer arming wake only when the human explicitly asked for auto-resume.",
+			'Default on_exit is "none". If you set "wake" and no longer need auto-resume (wrong command, user moved on, abandoned approach), call set_on_exit(session_id, on_exit: "none") promptly — do not leave stale arms armed.',
+			'The match arm is one-shot: after a match wake fires, re-arm with a NEW pattern via set_on_exit(session_id, on_output: {pattern}) if a later signal matters. For a dev server, arm both arms at spawn (on_exit: "wake" + on_output) — "wake me when ready, and wake me if it dies instead"; first event wins.',
+			'Disarm per arm: on_output: null clears only the match arm; on_exit: "none" clears only the exit arm; the combined call is full cleanup. Omitted parameters are left unchanged, so a match-only re-arm never touches on_exit.',
+			"This does not stop the process. Use kill_session to terminate (kills and suppresses both arms).",
 			"Disarm cannot recall a completion follow-up that was already delivered to pi.",
 		],
 		parameters: Type.Object({
 			session_id: Type.Number({ description: "Session id from exec_command." }),
-			on_exit: StringEnum(
-				["none", "wake"] as const,
-				'"none": disarm wake (process keeps running). "wake": arm auto-resume if still running.',
+			on_exit: Type.Optional(
+				StringEnum(
+					["none", "wake"] as const,
+					'Controls ONLY the exit arm; omitted = unchanged. "none": disarm the exit wake (process keeps running; also works for coordinator tombstones after store eviction). "wake": arm auto-resume if still running in the store. Too late once the session has already exited unregistered / already notified.',
+				),
+			),
+			on_output: Type.Optional(
+				Type.Union(
+					[
+						Type.Object(
+							{
+								pattern: Type.String({
+									description:
+										'Literal substring (NOT a regex) matched against the session\'s output stream; 1–256 characters, validated in encoded bytes. Default case-INSENSITIVE via an ASCII-only fold (A–Z/a–z; non-ASCII byte-exact). Match a distinctive banner substring ("Server started on", "listening on") — never a common word like "ready", which also matches inside "already"; set case_sensitive: true when the banner is not distinctive.',
+								}),
+								case_sensitive: Type.Optional(
+									Type.Boolean({
+										description: 'Default false (case-insensitive, ASCII-only fold). Set true for exact-case matching — recommended when the banner substring is not distinctive enough to stand alone.',
+									}),
+								),
+							},
+							{
+								description: 'Re-arm or replace the match arm (fresh one-shot generation): ONE wake on the next output match while the process runs, carrying a sanitized excerpt. Re-arm with a new pattern for a later signal.',
+							},
+						),
+						Type.Null(),
+					],
+					{
+						description: 'Controls ONLY the match arm; omitted = unchanged. Object: arm/replace the one-shot readiness wake. null: disarm the match arm. Full cleanup = on_exit: "none" + on_output: null.',
+					},
+				),
 			),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, eventCtx) {
 			ctx.ui ??= eventCtx.ui;
-			const { session_id: sid, on_exit: policy } = params as { session_id: number; on_exit: OnExitPolicy };
+			const { session_id: sid, on_exit: onExitArg, on_output: onOutputArg } = params as {
+				session_id: number;
+				on_exit?: OnExitPolicy;
+				on_output?: { pattern: string; case_sensitive?: boolean } | null;
+			};
+			const onOutput =
+				onOutputArg === undefined
+					? undefined
+					: onOutputArg === null
+						? null
+						: { pattern: onOutputArg.pattern, caseSensitive: onOutputArg.case_sensitive === true };
 			const session = ctx.store.get(sid);
-			if (policy === "wake" && !session) {
+			// Wake-class arms need a still-running store session (coordinator
+			// tombstones can only be disarmed by id). Session existence wins
+			// over pattern validity so a stale id gets the session error.
+			if ((onExitArg === "wake" || onOutput) && !session) {
 				return {
 					content: [{ type: "text", text: `No such session: ${sid}` }],
 					details: { session_id: sid, found: false },
 				};
 			}
-			const status = ctx.coordinator.setOnExit(sid, policy, session);
+			if (onOutput) {
+				const validation = validateMatchPattern(onOutput.pattern);
+				if (!validation.ok) {
+					throw new Error(validation.error);
+				}
+			}
+			const status = ctx.coordinator.setWakePolicy(
+				sid,
+				{
+					...(onExitArg !== undefined ? { onExit: onExitArg } : {}),
+					...(onOutput !== undefined ? { onOutput } : {}),
+				},
+				session,
+			);
 			// unknown id: no store session and nothing to disarm
-			if (!session && status === "already_none") {
+			if (
+				!session &&
+				(status.exit === "already_none" || status.exit === "unchanged") &&
+				(status.match === "already_none" || status.match === "unchanged")
+			) {
 				return {
 					content: [{ type: "text", text: `No such session: ${sid}` }],
 					details: { session_id: sid, found: false },
@@ -2578,19 +2708,29 @@ Returns \`session_id\` if still running or \`exit_code\` if it finished within y
 			}
 			const running = session ? !session.hasExited : false;
 			const armed = ctx.coordinator.isArmed(sid);
+			const matchArmed = ctx.coordinator.isMatchArmed(sid);
+			const matchInfo = ctx.coordinator.matchArmInfo(sid);
+			const matchPatternEcho = matchInfo.pattern ? echoPattern(matchInfo.pattern) : null;
 			const text =
-				`set_on_exit session_id=${sid} on_exit=${policy} → ${status}` +
+				`set_on_exit session_id=${sid}` +
+				(onExitArg !== undefined ? ` on_exit=${onExitArg} → ${status.exit}` : "") +
+				(onOutput !== undefined ? ` on_output=${onOutput === null ? "null" : "…"} → ${status.match}` : "") +
 				(session ? (running ? " (process still running)" : " (process already exited)") : " (no store session; coordinator only)") +
-				(armed ? "; wake armed" : "; wake not armed");
+				`; exit wake ${armed ? "armed" : "not armed"}` +
+				`; match arm ${matchArmed ? "armed" : "not armed"}` +
+				(matchPatternEcho ? ` (pattern: ${matchPatternEcho})` : "");
 			return {
 				content: [{ type: "text", text }],
 				details: {
 					session_id: sid,
 					found: true,
-					on_exit: policy,
-					status,
+					...(onExitArg !== undefined ? { on_exit: onExitArg } : {}),
+					status: status.exit,
+					status_match: status.match,
 					running,
 					wake_armed: armed,
+					match_armed: matchArmed,
+					match_pattern: matchPatternEcho,
 					command: session?.displayCommand,
 					log_path: session?.logPath,
 					tool_time_utc: nowUtcIso(),
@@ -2605,7 +2745,7 @@ Returns \`session_id\` if still running or \`exit_code\` if it finished within y
 		name: "kill_session",
 		label: "kill_session",
 		description:
-			"Terminate a session (SIGTERM, escalates to SIGKILL after 2s; on Windows any signal force-kills the process tree). Use when the process won't exit via Ctrl-C. session_id is invalid after. Also suppresses any armed on_exit wake.",
+			"Terminate a session (SIGTERM, escalates to SIGKILL after 2s; on Windows any signal force-kills the process tree). Use when the process won't exit via Ctrl-C. session_id is invalid after. Also suppresses BOTH wake arms — an armed on_exit wake and an armed on_output (match) wake.",
 		promptSnippet: "Terminate a session",
 		parameters: Type.Object({
 			session_id: Type.Number({ description: "Session to terminate." }),
@@ -2709,6 +2849,7 @@ Returns \`session_id\` if still running or \`exit_code\` if it finished within y
 					elapsed_ms: now - s.startedAt,
 					running: !s.hasExited,
 					wake_armed: ctx.coordinator.isArmed(s.id),
+					match_armed: ctx.coordinator.isMatchArmed(s.id),
 					exit_code: s.hasExited ? s.exitCode : undefined,
 					signal: s.hasExited ? (s.signal ?? undefined) : undefined,
 					failure_message: s.failureMessage ?? undefined,
@@ -2722,9 +2863,10 @@ Returns \`session_id\` if still running or \`exit_code\` if it finished within y
 							? ""
 							: `  [exited${s.exit_code !== undefined && s.exit_code !== null ? ` exit_code=${s.exit_code}` : ""}${s.signal ? ` signal=${s.signal}` : ""}; removed from store]`;
 						const wake = s.wake_armed ? " [wake]" : "";
+						const match = s.match_armed ? " [match]" : "";
 						return `  ${String(s.session_id).padStart(3)}  pid=${String(s.pid ?? "?").padStart(6)}  ${
 							s.tty ? "tty" : "pipe"
-						}  ${((s.elapsed_ms / 1000).toFixed(1) + "s").padStart(8)}${wake}  ${oneLineCommand(s.command, 60)}${exitedSuffix}\n        log: ${s.log_path}`;
+						}  ${((s.elapsed_ms / 1000).toFixed(1) + "s").padStart(8)}${wake}${match}  ${oneLineCommand(s.command, 60)}${exitedSuffix}\n        log: ${s.log_path}`;
 					})
 				: ["  (no live sessions)"];
 			const header = reaped.length
