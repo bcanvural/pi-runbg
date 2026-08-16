@@ -343,6 +343,15 @@ its names.
 
 ### Fixed
 
+- **chars-encoding capture fixture hardened against loaded CI runners.**
+  The `finish()` helper read the capture file 50 ms after `kill_session`;
+  on a loaded Node 24 ubuntu runner the file was read empty once
+  (write_stdin chars encoding — "an embedded 0x03 …"). The kill is now
+  confirmed via the session leaving the store (bounded poll) and the read
+  retries within a bounded window instead of trusting a fixed settle.
+  Test-only change; the lone-0x03 interrupt tests still expect and get an
+  empty capture.
+
 - **Held-open test fixed on Windows (IV-0006 suite).**
   `list_sessions … reaped entries stay clean` assumed `kill_session`
   removes a held-open session on every platform: the POSIX group kill

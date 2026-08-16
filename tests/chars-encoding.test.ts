@@ -106,9 +106,29 @@ async function spawnCapture() {
 		async finish(): Promise<Buffer> {
 			// Force-kill the cat session so the tmpfile is closed and flushed.
 			await h.call("kill_session", { session_id: sid });
-			// Brief settle.
-			await new Promise((r) => setTimeout(r, 50));
-			const buf = readFileSync(out);
+			// Kill is confirmed when the session leaves the store — no fixed
+			// settle: on a loaded CI runner teardown can outlive a fixed 50ms.
+			const deadline = Date.now() + 5000;
+			for (;;) {
+				const ls = await h.call("list_sessions", {});
+				if (!ls.details.sessions.some((s: any) => s.session_id === sid)) break;
+				if (Date.now() >= deadline) break;
+				await new Promise((r) => setTimeout(r, 25));
+			}
+			// The capture file can still be mid-flush after the kill (observed
+			// once on a loaded Node 24 ubuntu runner: file read empty). Read-
+			// retry within a bounded window instead of trusting a fixed settle.
+			let buf = Buffer.alloc(0);
+			const readDeadline = Date.now() + 300;
+			while (Date.now() < readDeadline) {
+				try {
+					buf = readFileSync(out);
+					if (buf.length > 0) break;
+				} catch {
+					// not flushed/closed yet — retry
+				}
+				await new Promise((r) => setTimeout(r, 25));
+			}
 			await h.emit("session_shutdown");
 			rmSync(dir, { recursive: true, force: true });
 			return buf;
