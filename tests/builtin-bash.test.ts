@@ -86,7 +86,7 @@ function makeHarness(
 }
 
 describe("builtin bash divergence", () => {
-	it("keeps pi's built-in bash by default (no setActiveTools call when nothing changes)", async () => {
+	it("a dormant runbg (no settings, no flag) leaves pi's bash untouched", async () => {
 		const h = makeHarness();
 		await h.emit("session_start");
 		assert.deepEqual(h.setActiveToolsCalls, []);

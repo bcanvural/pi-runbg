@@ -244,16 +244,18 @@ describe("/runbg settings command", () => {
 });
 
 describe("/runbg replace-bash setting (divergence #1 without the startup flag)", () => {
-	it("off by default: enabling runbg alone keeps pi's bash", async () => {
+	it("on by default: enabling runbg alone removes pi's bash (upstream parity)", async () => {
 		const h = makeHarness(["bash", "read", ...RUNBG_TOOLS]);
 		await h.emit("session_start");
 		await h.invokeCommand("runbg", "on");
-		assert.ok(h.activeTools().includes("bash"), "bash must survive a plain /runbg on");
-		assert.equal(JSON.parse(readFileSync(SETTINGS, "utf8")).replaceBuiltinBash, false);
+		assert.ok(!h.activeTools().includes("bash"), "a plain /runbg on must remove bash (default)");
+		assert.equal(JSON.parse(readFileSync(SETTINGS, "utf8")).replaceBuiltinBash, true);
 		await h.shutdown();
 	});
 
 	it("toggles bash removal mid-session and persists both directions", async () => {
+		// Start from bash kept (explicit off) so the toggle below is a real change.
+		writeFileSync(SETTINGS, JSON.stringify({ replaceBuiltinBash: false }));
 		const h = makeHarness(["bash", "read", ...RUNBG_TOOLS]);
 		await h.emit("session_start");
 		await h.invokeCommand("runbg", "on");
@@ -313,6 +315,8 @@ describe("/runbg replace-bash setting (divergence #1 without the startup flag)",
 	});
 
 	it("accepts the long alias, reports a bare setting name, and rejects a bad value", async () => {
+		// Off first, so the alias toggle below is a real change (default is on).
+		writeFileSync(SETTINGS, JSON.stringify({ replaceBuiltinBash: false }));
 		const h = makeHarness(["bash", ...RUNBG_TOOLS]);
 		await h.emit("session_start");
 
@@ -382,7 +386,7 @@ describe("/runbg replace-bash setting (divergence #1 without the startup flag)",
 
 describe("steer coverage disclosure", () => {
 	it("says so when steer is enabled but pi's bash can still block", async () => {
-		writeFileSync(SETTINGS, JSON.stringify({ enabled: true, steerYield: false }));
+		writeFileSync(SETTINGS, JSON.stringify({ enabled: true, steerYield: false, replaceBuiltinBash: false }));
 		const h = makeHarness(["bash", "read", ...RUNBG_TOOLS]);
 		await h.emit("session_start");
 		await h.invokeCommand("runbg", "steer on");

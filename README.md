@@ -24,8 +24,8 @@ purpose, and says so. Every deviation is recorded with its reasoning in
 > The package, env vars, log prefix, and slash command are renamed to `runbg`.
 > Divergences are deliberate and documented in
 > [UPSTREAM.md](./UPSTREAM.md) — the headline one: **pi's built-in `bash`
-> tool is kept by default** (upstream removes it); `/runbg replace-bash on`
-> opts into the codex-parity behavior.
+> tool is removed while runbg is enabled** (matching upstream's default);
+> `/runbg replace-bash off` keeps it.
 > Design rationale lives in [docs/design.md](./docs/design.md).
 > Do not install this alongside `pi-unified-exec` — both register the same
 > tool names.
@@ -55,8 +55,8 @@ purpose, and says so. Every deviation is recorded with its reasoning in
   **the process keeps running untouched**. That is safe only because the
   session owns the process — the wait stops, the work does not. `/runbg steer
   off` to disable. Note this covers commands that run through runbg; a `bash`
-  call still blocks, which is a further argument for `/runbg replace-bash on`
-  if you care about staying in control.
+  call still blocks, which is why runbg removes `bash` by default while
+  enabled — `/runbg replace-bash off` if you need it back.
 - **Completion can resume the agent (opt-in).** `exec_command(on_exit: "wake")`
   (default is `"none"`) delivers exactly one follow-up model prompt (bounded
   exit metadata, no raw output) when a backgrounded process exits while
@@ -459,7 +459,7 @@ without an extra probing call.
   session tools, disable it when you switch away.
   - Settings: `/runbg on|off` is the primary switch (shorthand for
     `/runbg enabled on|off`); `/runbg replace-bash on|off` removes or keeps
-    pi's built-in `bash` (see below; off by default); `/runbg steer on|off`
+    pi's built-in `bash` (see below; on by default); `/runbg steer on|off`
     toggles the human-input cut-short for attached waits (on by default —
     divergence #10; see Highlights). Every setting also answers
     `/runbg <setting>` on its own to report just that value.
@@ -470,16 +470,18 @@ without an extra probing call.
 
 ## Replacing pi's built-in `bash`
 
-By default, this extension **keeps pi's built-in `bash` tool** alongside the
-session tools — quick one-shot commands stay on `bash`, long-lived or
-interactive work goes through `exec_command` / `write_stdin`. (This inverts
-the upstream default — divergence #1 in [UPSTREAM.md](./UPSTREAM.md):
-prompts and guard extensions that only know `bash` must keep working.)
+While runbg is enabled, this extension **removes pi's built-in `bash` tool**
+— the session tools are the only shell (upstream pi-unified-exec's default,
+codex parity), so prompts written for codex's `unified_exec`-only surface
+work as-is. (Divergence #1 in [UPSTREAM.md](./UPSTREAM.md): the fork adds
+guardrails to that default — removal never fires while runbg is dormant,
+and the setting is reversibly opt-out.)
 
-- `/runbg replace-bash on|off` — **off by default.** `on` removes the
-  built-in `bash` so the session tools are the only shell (upstream
-  pi-unified-exec's default, codex parity). Use it with prompts written for
-  codex's `unified_exec`-only surface. Persisted in `runbg.json` and
+- `/runbg replace-bash on|off` — **on by default.** `off` keeps the
+  built-in `bash` alongside the session tools — quick one-shot commands
+  stay on `bash`, long-lived or interactive work goes through
+  `exec_command` / `write_stdin`. Use it with prompts whose guard
+  extensions only know `bash`. Persisted in `runbg.json` and
   toggleable mid-session, so you can flip it in the same breath as
   `/sysprompt`.
 - `--replace-builtin-bash` — the same thing for **one invocation**, for

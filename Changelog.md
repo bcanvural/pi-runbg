@@ -191,6 +191,19 @@ its names.
 
 ### Changed
 
+- **`replace-bash` is now on by default** (upstream parity). While runbg
+  is enabled, pi's built-in `bash` is removed unless `/runbg replace-bash
+  off` says otherwise (persisted; the `--replace-builtin-bash` startup
+  flag remains a force-on for one invocation). The guardrails stay:
+  removal only acts while runbg is enabled (a dormant runbg never leaves
+  a prompt shell-less), and the latch only restores a `bash` runbg
+  removed itself. Previously the fork kept `bash` by default (the old
+  divergence #1); the persisted opt-out setting is the fork's
+  contribution, and the removal default itself now matches upstream.
+  Normalization flipped with the default: `replaceBuiltinBash` reads
+  `!== false` like `steerYield` (an explicit `false` restores bash).
+  `steer` was already on by default — unchanged.
+
 - **`set_on_exit`'s `on_exit` parameter is now optional** (divergence #12).
   Omitted = that arm is left unchanged, so a match-only re-arm no longer
   has to pass a field it is not touching. The parameter controls **only the

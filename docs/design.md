@@ -220,15 +220,18 @@ they are the only carrier that reaches the model in **every** configuration.
 Fork hygiene rule: divergences are fine but **loud** — each gets a Changelog
 entry, a README note, and a line in `UPSTREAM.md` (§10). Never silent.
 
-1. **Keep pi's built-in `bash` by default.** Upstream removes it
-   (codex-parity: `exec_command` becomes the shell). For us that would break
-   the whole §14 gating model — opencode templates that never mention session
-   tools would be left with *no shell at all* — and would silently bypass the
-   user-side `bash-guard` extension. Flip the default; offer
-   `/runbg replace-bash on` (persisted, off by default) — plus
-   `--replace-builtin-bash` as a one-invocation force-on — for codex-parity
-   setups. This change alone justifies forking over pinning (upstream accepts
-   no PRs).
+1. **Remove pi's built-in `bash` by default — gated on `enabled`, reversibly
+   opt-out.** Upstream removes it unconditionally (codex-parity:
+   `exec_command` becomes the shell). The fork keeps the removal default but
+   adds guardrails: it only acts while runbg is enabled (a dormant runbg
+   never leaves a prompt shell-less), `/runbg replace-bash off` (persisted)
+   restores bash, and a latch ensures runbg only restores a `bash` it
+   removed itself. `--replace-builtin-bash` remains a one-invocation
+   force-on. This is the compromise for the §14 gating model: templates that
+   never mention session tools pair runbg with a saved `replace-bash off`,
+   and the user-side `bash-guard` extension is bypassed only when the human
+   opts in. The fork's contribution is the guardrails; the removal default
+   itself matches upstream.
 2. **Best-effort crash cleanup.** Register a `process.on("exit")` handler (at
    `session_start`, per the factory constraint) that synchronously
    group-kills live sessions. Covers `uncaughtException`/EIO exits that skip
@@ -379,7 +382,7 @@ description broke frontmatter parsing entirely, hiding the template from
   command that namespace anticipated: a declarative table of boolean settings
   drives its grammar (`/runbg <setting> on|off`, plus bare `/runbg on|off`
   for the primary switch), its argument completions, and its status line, so
-  divergence #1's bash replacement is a peer setting (`replace-bash`, off by
+  divergence #1's bash replacement is a peer setting (`replace-bash`, on by
   default) rather than a startup-only flag. Adding a setting is one table
   entry. *Automatic* template-frontmatter gating
   (`before_agent_start` reads `sysprompt.json` → a re-added `bg:` marker)

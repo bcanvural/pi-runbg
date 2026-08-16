@@ -408,8 +408,12 @@ function warnIfUpstreamPackagePresent(ctx: ExtensionCtx, pi: ExtensionAPI): void
  * verbatim on every write.
  *
  * Known keys are normalized so a hand-edited `"true"` or `1` cannot half-enable
- * anything. Which direction is "safe" depends on the setting: the tool-removal
- * keys use a strict `=== true` (never leave pi shell-less by accident), while
+ * anything. Which direction is "safe" depends on the setting: `enabled` uses a
+ * strict `=== true` (tools stay dormant unless enabled — never enable by
+ * accident), while the two opt-*out* settings — `replaceBuiltinBash` (on by
+ * default, upstream parity) and `steerYield` (on by default) — use `!== false`
+ * (only an explicit `false` turns them off; never let a hand-edit or a stale
+ * file flip a safety default). Each field documents its own choice.
  * `steerYield` uses `!== false` (never make a waiting human sit out a 290 s
  * attach by accident). Each field documents its own choice.
  */
@@ -424,6 +428,10 @@ interface RunbgSettings {
 
 const SETTINGS_FILE_NAME = "runbg.json";
 
+/** Replace-bash is ON by default (upstream parity): an absent key keeps
+ * removal, and only an explicit `false` keeps pi's bash. */
+const REPLACE_BASH_DEFAULT = true;
+
 export function runbgSettingsPath(): string {
 	return join(getAgentDir(), SETTINGS_FILE_NAME);
 }
@@ -436,19 +444,24 @@ export function readRunbgSettings(): RunbgSettings {
 			return {
 				...obj,
 				enabled: obj.enabled === true,
-				replaceBuiltinBash: obj.replaceBuiltinBash === true,
-				// Default TRUE, so normalized with `!== false` rather than the
-				// `=== true` used above. The safe default differs by setting:
-				// for tool removal it is "off" (never leave pi shell-less); for
-				// yielding to a waiting human it is "on" (never make someone
-				// wait out a 290 s attach to be heard).
-				steerYield: obj.steerYield !== false,
+			// Default ON (upstream parity): normalized with `!== false` so an
+			// absent key or a hand-edited `"true"` string keeps removal — only
+			// an explicit `false` restores bash. The safe direction differs by
+			// setting: for `enabled` it is "off" (never enable by accident);
+			// for bash removal it is "on" (opt out deliberately).
+			replaceBuiltinBash: obj.replaceBuiltinBash !== false,
+			// Default TRUE, so normalized with `!== false` rather than the
+			// `=== true` used for `enabled`. The safe default differs by
+			// setting: for `enabled` it is "off" (never enable by accident);
+			// for yielding to a waiting human it is "on" (never make someone
+			// wait out a 290 s attach to be heard).
+			steerYield: obj.steerYield !== false,
 			};
 		}
 	} catch {
 		// missing or corrupt file → defaults
 	}
-	return { enabled: false, replaceBuiltinBash: false, steerYield: true };
+	return { enabled: false, replaceBuiltinBash: REPLACE_BASH_DEFAULT, steerYield: true };
 }
 
 /** State a setting's toast may report on, beyond the value being written. */
@@ -552,8 +565,8 @@ const REPLACE_BASH_SETTING: BooleanSetting = {
 	aliases: ["replace-builtin-bash"],
 	key: "replaceBuiltinBash",
 	offerCompletions: true,
-	onHint: "Remove pi's built-in `bash` so the session tools are the only shell (codex parity)",
-	offHint: "Keep pi's built-in `bash` alongside the session tools (default)",
+	onHint: "Remove pi's built-in `bash` so the session tools are the only shell (codex parity, default)",
+	offHint: "Keep pi's built-in `bash` alongside the session tools",
 	notice: (value, info) => {
 		if (value) {
 			const base = info.already
@@ -2240,7 +2253,7 @@ export default function (pi: ExtensionAPI) {
 	// replaceBuiltinBashRequest for why it can only force ON.
 	pi.registerFlag("replace-builtin-bash", {
 		description:
-			"Force-remove pi's built-in `bash` tool for this run so exec_command/write_stdin are the only shell (upstream pi-unified-exec's default). Persistent equivalent: /runbg replace-bash on. By default runbg keeps bash.",
+			"Force-remove pi's built-in `bash` tool for this run so exec_command/write_stdin are the only shell (upstream pi-unified-exec's default; runbg removes bash by default while enabled). Persistent opt-out: /runbg replace-bash off.",
 		type: "boolean",
 		default: false,
 	});
